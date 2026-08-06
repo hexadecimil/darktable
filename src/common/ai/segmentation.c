@@ -228,14 +228,19 @@ static void _crop_resize_mask(const float *const restrict src,
   DT_OMP_FOR(shared(range_lut))
   for(int y = 0; y < dst_h; y++)
   {
-    const float sy = (dst_h > 1) ? (float)y * (float)(valid_h - 1) / (float)(dst_h - 1) : 0.0f;
+    // must mirror the forward mapping of _preprocess_image(), which samples
+    // the source at src_y = y / scale (plain scaling, no endpoint alignment).
+    // its inverse is therefore sy = y * scale. using an align-corners mapping
+    // here stretched the mask outwards by (1/scale - 1) output pixels at the
+    // far edge, growing linearly from the top-left corner
+    const float sy = (float)y * scale;
     const int y0 = MIN((int)sy, valid_h - 1);
     const int y1 = MIN(y0 + 1, valid_h - 1);
     const float fy = sy - (float)y0;
 
     for(int x = 0; x < dst_w; x++)
     {
-      const float sx = (dst_w > 1) ? (float)x * (float)(valid_w - 1) / (float)(dst_w - 1) : 0.0f;
+      const float sx = (float)x * scale;
       const int x0 = MIN((int)sx, valid_w - 1);
       const int x1 = MIN(x0 + 1, valid_w - 1);
       const float fx = sx - (float)x0;
@@ -255,11 +260,14 @@ static void _crop_resize_mask(const float *const restrict src,
         // reference luma at the output pixel (guide is at dst resolution)
         const int luma_ref = _luma709(&guide_rgb[(y * guide_w + x) * 3]);
 
-        // map the 4 source-grid corners back into guide coords
-        const float gx0 = (valid_w > 1) ? (float)x0 * (float)(dst_w - 1) / (float)(valid_w - 1) : 0.0f;
-        const float gx1 = (valid_w > 1) ? (float)x1 * (float)(dst_w - 1) / (float)(valid_w - 1) : 0.0f;
-        const float gy0 = (valid_h > 1) ? (float)y0 * (float)(dst_h - 1) / (float)(valid_h - 1) : 0.0f;
-        const float gy1 = (valid_h > 1) ? (float)y1 * (float)(dst_h - 1) / (float)(valid_h - 1) : 0.0f;
+        // map the 4 source-grid corners back into guide coords, using the
+        // inverse of the mapping above (sx = x * scale) so that the range
+        // weights are sampled at the guide pixels the mask values come from
+        const float inv_scale = (scale > 1e-6f) ? 1.0f / scale : 0.0f;
+        const float gx0 = (float)x0 * inv_scale;
+        const float gx1 = (float)x1 * inv_scale;
+        const float gy0 = (float)y0 * inv_scale;
+        const float gy1 = (float)y1 * inv_scale;
 
         const int ix00 = MIN(MAX((int)(gx0 + 0.5f), 0), guide_w - 1);
         const int ix01 = MIN(MAX((int)(gx1 + 0.5f), 0), guide_w - 1);
