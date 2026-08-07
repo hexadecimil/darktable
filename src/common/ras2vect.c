@@ -170,12 +170,19 @@ GList *ras2forms(const float *mask,
   }
 
   potrace_param_t *param = potrace_param_default();
-  // finer path possible
-  param->turdsize = turdsize > 0 ? turdsize : 50; // ignore area whose size are < 50
+  // honour the caller's cleanup setting: 0 means "keep everything", so only
+  // floor it at 2 px^2 to drop single-pixel thresholding noise. the previous
+  // fallback forced 50 whenever the user asked for 0, silently erasing every
+  // structure smaller than ~28x28 native pixels on a 24 Mpix file
+  param->turdsize = MAX(turdsize, 2);
   param->alphamax = alphamax;
   param->turnpolicy = POTRACE_TURNPOLICY_MINORITY;
   param->opticurve = 1;
-  param->opttolerance = 0.8;
+  // curve simplification tolerance, in mask pixels: 0.8 allowed the traced
+  // path to drift by ~3 native pixels from the mask it vectorises, which
+  // defeats any upstream refinement. 0.3 keeps the drift close to a single
+  // native pixel at the cost of somewhat more anchor points
+  param->opttolerance = 0.3;
 
   potrace_state_t *st = potrace_trace(param, bm);
 
