@@ -411,22 +411,32 @@ gboolean dt_refine_run_tiled(dt_refine_context_t *ctx,
   float *r56 = dt_alloc_align_float(nplane);
   float *accum = dt_alloc_align_float(nplane);
   float *weight = dt_alloc_align_float(nplane);
-  if(!r224 || !r56 || !accum || !weight)
+  // summed-area table of the positive-coverage plane, with one zeroed border
+  // row and column, so each tile occupancy costs four reads
+  double *sat = g_try_malloc((size_t)(W + 1) * (H + 1) * sizeof(double));
+  int *tile_xs = NULL, *tile_ys = NULL;
+  if(!r224 || !r56 || !accum || !weight || !sat)
   {
     dt_free_align(r224);
     dt_free_align(r56);
     dt_free_align(accum);
     dt_free_align(weight);
+    g_free(sat);
     return FALSE;
   }
   gboolean ok = FALSE;
 
-  // ---- global pass, letterboxed to the graph side. its ramped write-back
-  // into `mask` is kept on purpose: it is the right fallback if the caller
-  // cancels before the tiles complete. the padded network outputs stay in
-  // ctx->o_p224 / o_p56 afterwards -- that is what guides the tiles.
+  if(keep_going && !keep_going(user)) goto cleanup;
+
+  // ---- global pass, letterboxed to the graph side. dt_refine_run writes its
+  // soft result into `mask`; the tile fusion below only overwrites pixels a
+  // kept tile covered, so this write-back is what the final mask keeps over
+  // skipped tiles. the padded network outputs stay in ctx->o_p224 / o_p56
+  // afterwards -- that is what guides the tiles.
   if(!dt_refine_run(ctx, rgb, W, H, mask, threshold, 0, 0, W, H))
     goto cleanup;
+
+  if(keep_going && !keep_going(user)) goto cleanup;
 
   {
     const float scale = (float)s / (float)MAX(W, H);
@@ -446,29 +456,66 @@ gboolean dt_refine_run_tiled(dt_refine_context_t *ctx,
       weight[k] = 0.0f;
     }
 
+    // summed-area table of the positive pixels of r224, so the per-tile
+    // occupancy below is four reads instead of an s^2 scan
+    for(int x = 0; x <= W; x++) sat[x] = 0.0;
+    for(int y = 1; y <= H; y++)
+    {
+      double rowsum = 0.0;
+      sat[(size_t)y * (W + 1)] = 0.0;
+      for(int x = 1; x <= W; x++)
+      {
+        rowsum += (r224[(size_t)(y - 1) * W + (x - 1)] > 0.0f);
+        sat[(size_t)y * (W + 1) + x]
+          = sat[(size_t)(y - 1) * (W + 1) + x] + rowsum;
+      }
+    }
+
     // ---- local pass: overlapping s x s tiles at 1:1 (eval_helper.py:86-157)
     const int padding = 16;
     const int step = s / 2 - 2 * padding;
+    // the load-time check guarantees side >= 48, but only a positive step
+    // makes the tiling loops terminate, so refuse degenerate graphs
+    if(step <= 0) goto cleanup;
     const size_t plane = (size_t)s * s;
     int done = 0, skipped = 0;
 
+    // distinct tile starts per axis: clamping to the far edge collapses the
+    // trailing tiles onto the same start, and each duplicate would cost a
+    // full redundant inference (upstream deduplicates via used_start_idx)
+    const int max_tx = (W + step - 1) / step;
+    const int max_ty = (H + step - 1) / step;
+    tile_xs = g_try_malloc(sizeof(int) * max_tx);
+    tile_ys = g_try_malloc(sizeof(int) * max_ty);
+    if(!tile_xs || !tile_ys) goto cleanup;
+    int n_tx = 0, n_ty = 0;
+    for(int tx = 0; tx * step < W; tx++)
+    {
+      const int start = MIN(tx * step, MAX(0, W - s));
+      if(n_tx == 0 || tile_xs[n_tx - 1] != start) tile_xs[n_tx++] = start;
+    }
     for(int ty = 0; ty * step < H; ty++)
     {
-      for(int tx = 0; tx * step < W; tx++)
+      const int start = MIN(ty * step, MAX(0, H - s));
+      if(n_ty == 0 || tile_ys[n_ty - 1] != start) tile_ys[n_ty++] = start;
+    }
+
+    for(int iy = 0; iy < n_ty; iy++)
+    {
+      const int sy = tile_ys[iy];
+      const int ey = MIN(sy + s, H);
+      for(int ix = 0; ix < n_tx; ix++)
       {
-        int sx = tx * step, sy = ty * step;
-        int ex = sx + s, ey = sy + s;
-        if(ey > H) { ey = H; sy = MAX(0, H - s); }
-        if(ex > W) { ex = W; sx = MAX(0, W - s); }
+        const int sx = tile_xs[ix];
+        const int ex = MIN(sx + s, W);
         const int tw = ex - sx, th = ey - sy;
 
         // skip tiles that are (almost) entirely inside or outside: the
         // network cannot improve them (eval_helper.py:126-130)
-        double occ = 0.0;
-        for(int y = sy; y < ey; y++)
-          for(int x = sx; x < ex; x++)
-            occ += (r224[(size_t)y * W + x] > 0.0f);
-        occ /= (double)tw * th;
+        const double inside
+          = sat[(size_t)ey * (W + 1) + ex] - sat[(size_t)sy * (W + 1) + ex]
+          - sat[(size_t)ey * (W + 1) + sx] + sat[(size_t)sy * (W + 1) + sx];
+        const double occ = inside / ((double)tw * th);
         if(occ > 0.9 || occ < 0.1)
         {
           skipped++;
@@ -527,12 +574,14 @@ gboolean dt_refine_run_tiled(dt_refine_context_t *ctx,
     dt_print(DT_DEBUG_AI, "[refine] tiled pass: %d tiles run, %d skipped",
              done, skipped);
 
-    // fused output; where no tile contributed, keep the global result
+    // fused output: overwrite only the pixels a kept tile covered. where
+    // weight is zero the global pass already wrote the correct soft result
+    // into `mask`, so leave those pixels untouched
     DT_OMP_FOR()
     for(size_t k = 0; k < nplane; k++)
       mask[k] = (weight[k] > 0.0f)
         ? CLAMPF(accum[k] / weight[k], 0.0f, 1.0f)
-        : CLAMPF(r224[k] * 0.5f + 0.5f, 0.0f, 1.0f);
+        : mask[k];
     ok = TRUE;
   }
 
@@ -541,6 +590,9 @@ cleanup:
   dt_free_align(r56);
   dt_free_align(accum);
   dt_free_align(weight);
+  g_free(sat);
+  g_free(tile_xs);
+  g_free(tile_ys);
   return ok;
 }
 

@@ -151,6 +151,13 @@ GList *ras2forms(const float *mask,
   //  create bitmap mask for potrace
 
   potrace_bitmap_t *bm = _bm_new(width, height);
+  if(!bm)
+  {
+    // allocation failure on a large buffer must not crash the caller, an
+    // empty result is already handled everywhere
+    if(out_signs) *out_signs = NULL;
+    return NULL;
+  }
 
   DT_OMP_FOR()
   for(int y=0; y < height; y++)
@@ -171,11 +178,18 @@ GList *ras2forms(const float *mask,
   }
 
   potrace_param_t *param = potrace_param_default();
-  // honour the caller's cleanup setting: 0 means "keep everything", so only
-  // floor it at 2 px^2 to drop single-pixel thresholding noise. the previous
-  // fallback forced 50 whenever the user asked for 0, silently erasing every
-  // structure smaller than ~28x28 native pixels on a 24 Mpix file
-  param->turdsize = MAX(turdsize, 2);
+  if(!param)
+  {
+    _bm_free(bm);
+    if(out_signs) *out_signs = NULL;
+    return NULL;
+  }
+  // honour the caller's cleanup setting: a negative turdsize selects the
+  // historical default of 50, meant for full-resolution masks where every
+  // speckle would otherwise become a form. values >= 0 are only floored at
+  // 2 px^2 to drop single-pixel thresholding noise, so callers working on a
+  // coarse grid can keep small legitimate structures
+  param->turdsize = turdsize < 0 ? 50 : MAX(turdsize, 2);
   param->alphamax = alphamax;
   param->turnpolicy = POTRACE_TURNPOLICY_MINORITY;
   param->opticurve = 1;
@@ -185,6 +199,16 @@ GList *ras2forms(const float *mask,
   param->opttolerance = opttolerance;
 
   potrace_state_t *st = potrace_trace(param, bm);
+  if(!st || st->status != POTRACE_STATUS_OK)
+  {
+    // out of memory inside potrace: bail out with an empty result rather
+    // than dereferencing a NULL or incomplete state
+    if(st) potrace_state_free(st);
+    potrace_param_free(param);
+    _bm_free(bm);
+    if(out_signs) *out_signs = NULL;
+    return NULL;
+  }
 
   //  get all paths, create corresponding path form
 

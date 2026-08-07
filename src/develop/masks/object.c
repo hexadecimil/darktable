@@ -1190,7 +1190,9 @@ static gboolean _write_mask_png16(const char *path,
                PNG_FILTER_TYPE_DEFAULT);
   png_set_compression_level(png, 6);
   png_write_info(png, info);
-  png_set_swap(png);   // little-endian host, PNG wants big-endian samples
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
+  png_set_swap(png);   // PNG wants big-endian samples
+#endif
 
   for(int y = 0; y < h; y++)
   {
@@ -1208,7 +1210,13 @@ static gboolean _write_mask_png16(const char *path,
   png_write_end(png, NULL);
   png_destroy_write_struct(&png, &info);
   g_free(row);
-  fclose(f);
+  if(fclose(f) != 0)
+  {
+    // the final flush can fail on a full disk: a truncated file must never
+    // be reported as success, the caller would wire it into the history
+    g_unlink(path);
+    return FALSE;
+  }
   return TRUE;
 }
 
@@ -1289,6 +1297,7 @@ typedef struct _finalize_job_t
   int cleanup;          // potrace turdsize, working-grid px^2 (scaled inside)
   float smoothing;      // potrace alphamax
   float feather;        // border applied to the resulting path points
+  dt_hash_t distort_hash;  // distortion state at launch; the job revalidates
   // provenance of the mask, captured on the GUI thread at launch. when
   // valid, outpath holds the content-addressed target file name derived
   // from its fingerprint; otherwise the job falls back to a sequential name
@@ -1445,21 +1454,39 @@ typedef struct _finalize_apply_t
   gboolean has_recipe;
 } _finalize_apply_t;
 
-/* GUI thread: activate the external raster mask module on the produced file
- * and connect the target module's blending to it. This is exactly what the
- * user would do by hand in the raster-mask combo (blend_gui.c), automated. */
+// destroy-notify of the apply idle: owns everything the payload carries.
+// runs on source destruction, so the payload is freed exactly once whether
+// the callback ran or the main loop went down before its tick
+static void _finalize_apply_free(gpointer data)
+{
+  _finalize_apply_t *a = data;
+  if(a->forms) g_list_free_full(a->forms, (GDestroyNotify)dt_masks_free_form);
+  g_list_free(a->signs);
+  g_free(a->outpath);
+  g_free(a);
+}
+
+// GUI thread: activate the external raster mask module on the produced file
+// and connect the target module's blending to it. this is exactly what the
+// user would do by hand in the raster-mask combo (blend_gui.c), automated.
+// frees nothing: the payload belongs to _finalize_apply_free
 static gboolean _finalize_apply_idle(gpointer data)
 {
   _finalize_apply_t *a = data;
   dt_develop_t *dev = darktable.develop;
 
-  if(!dev || dev->image_storage.id != a->imgid)
+  // leaving the darkroom does not reset image_storage.id, and it tears
+  // down dev->iop and the form lists this idle works on -- check the
+  // actual view, not just the image
+  if(!dev || dev->image_storage.id != a->imgid
+     || dt_view_get_current() != DT_VIEW_DARKROOM
+     || !dev->form_gui)
   {
     if(a->vectorize)
       dt_control_log(_("image changed, precise paths discarded"));
     else
       dt_control_log(_("precise raster mask saved (image changed, not applied)"));
-    goto out;
+    return G_SOURCE_REMOVE;
   }
 
   if(a->vectorize)
@@ -1470,7 +1497,17 @@ static gboolean _finalize_apply_idle(gpointer data)
     if(!a->forms)
     {
       dt_control_log(_("no mask extracted from AI segmentation"));
-      goto out;
+      return G_SOURCE_REMOVE;
+    }
+
+    // forms were created on the worker thread; their ids are atomic but
+    // unicity against this dev's forms is only checkable here, on the GUI
+    // thread, right before insertion
+    for(GList *l = a->forms; l; l = g_list_next(l))
+    {
+      dt_masks_form_t *f = l->data;
+      while(dt_masks_get_from_id(dev, f->formid))
+        f->formid++;
     }
 
     const char *group_prefix = _("ai object group");
@@ -1536,12 +1573,20 @@ static gboolean _finalize_apply_idle(gpointer data)
       dt_masks_point_group_t *grpt = dt_masks_group_add_form(mod_grp, grp);
       if(grpt)
         grpt->opacity = dt_conf_get_float("plugins/darkroom/masks/opacity");
-      target->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+      // additive: never tear down a conditional blend already configured
+      target->blend_params->mask_mode
+        |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
       dt_dev_add_masks_history_item(dev, target, TRUE);
       if(target->gui_data) dt_iop_gui_update(target);
       dt_control_log(_("precise paths applied to %s"), target->name());
-      dt_masks_set_edit_mode(target, DT_MASKS_EDIT_FULL);
-      dt_masks_iop_update(target);
+      // entering edit mode clears any form_gui in creation -- if the user
+      // started a new mask session while the job ran, leave their session
+      // alone, the group is attached and committed either way
+      if(!dev->form_gui->creation && !dev->form_visible)
+      {
+        dt_masks_set_edit_mode(target, DT_MASKS_EDIT_FULL);
+        dt_masks_iop_update(target);
+      }
     }
     else
     {
@@ -1549,27 +1594,37 @@ static gboolean _finalize_apply_idle(gpointer data)
       dt_control_log(_("precise paths created"));
     }
 
-    a->forms = NULL;   // ownership moved to dev->forms
+    g_list_free(a->forms);   // cells only: ownership moved to dev->forms
+    a->forms = NULL;
     dt_dev_reprocess_all(dev);
     dt_control_queue_redraw_center();
-    goto out;
+    return G_SOURCE_REMOVE;
   }
 
   // ---- source side: the external raster mask module ----
+  // never requisition an instance already serving another mask: take one
+  // whose file is empty, ours already, or that feeds no sink
   dt_iop_module_t *rf = NULL;
+  gchar *want_file = g_path_get_basename(a->outpath);
   for(GList *l = dev->iop; l; l = g_list_next(l))
   {
     dt_iop_module_t *m = l->data;
-    if(!strcmp(m->op, "rasterfile"))
+    if(strcmp(m->op, "rasterfile") || !m->params)
+      continue;
+    dt_iop_rasterfile_params_t *mp = (dt_iop_rasterfile_params_t *)m->params;
+    if(mp->file[0] == '\0'
+       || !strcmp(mp->file, want_file)
+       || g_hash_table_size(m->raster_mask.source.users) == 0)
     {
       rf = m;
       break;
     }
   }
-  if(!rf || !rf->params)
+  g_free(want_file);
+  if(!rf)
   {
-    dt_control_log(_("precise raster mask saved (raster module unavailable)"));
-    goto out;
+    dt_control_log(_("precise raster mask saved (no free raster instance)"));
+    return G_SOURCE_REMOVE;
   }
 
   {
@@ -1590,6 +1645,9 @@ static gboolean _finalize_apply_idle(gpointer data)
       memset(&p->recipe, 0, sizeof(p->recipe));
     rf->enabled = TRUE;
     dt_dev_add_history_item(dev, rf, TRUE);
+    // resync the module's widgets, or the stale combo would re-commit the
+    // previous file on the next interaction
+    if(rf->gui_data) dt_iop_gui_update(rf);
   }
 
   // ---- sink side: the module the mask was created from ----
@@ -1620,7 +1678,15 @@ static gboolean _finalize_apply_idle(gpointer data)
            sizeof(target->blend_params->raster_mask_source));
     target->blend_params->raster_mask_instance = rf->multi_priority;
     target->blend_params->raster_mask_id = BLEND_RASTER_ID;
-    target->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
+    // the raster mask replaces a drawn mask (that is the gesture), but a
+    // conditional blend stays -- and a silent replacement is announced
+    const uint32_t old_mode = target->blend_params->mask_mode;
+    target->blend_params->mask_mode
+      = (old_mode & ~DEVELOP_MASK_MASK)
+        | DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
+    if(old_mode & DEVELOP_MASK_MASK)
+      dt_control_log(_("the drawn mask of %s was replaced by the raster mask"),
+                     target->name());
 
     dt_dev_add_history_item(dev, target, TRUE);
     if(target->gui_data) dt_iop_gui_update(target);
@@ -1631,12 +1697,6 @@ static gboolean _finalize_apply_idle(gpointer data)
 
   dt_dev_reprocess_all(dev);
   dt_control_queue_redraw_center();
-
-out:
-  if(a->forms) g_list_free_full(a->forms, (GDestroyNotify)dt_masks_free_form);
-  g_list_free(a->signs);
-  g_free(a->outpath);
-  g_free(a);
   return G_SOURCE_REMOVE;
 }
 
@@ -1694,6 +1754,17 @@ static int32_t _finalize_job_run(dt_job_t *job)
   if(j->history_end > 0 && j->history_end > dev.history_end)
     dev.history_end = j->history_end;
 
+  // the hint only matches a render made on the exact distortion state it
+  // was computed on; the history can have moved while this job waited in
+  // the queue, and a mismatched render would be silently misaligned
+  if(_compute_distort_hash(&dev) != j->distort_hash)
+  {
+    dt_control_log(_("image geometry changed, precise mask cancelled"));
+    dt_dev_cleanup(&dev);
+    g_atomic_int_set(&_finalize_running, 0);
+    return 1;
+  }
+
   // pipe-input dimensions (sensor incl. borders) and the post-rawprepare
   // frame. the external raster mask module sits after rawprepare (iop order
   // 3.1 vs 1.0) and interprets its file in the post-rawprepare frame, so
@@ -1704,6 +1775,10 @@ static int32_t _finalize_job_run(dt_job_t *job)
   const int ih = dev.image_storage.height;
   const int pw = dev.image_storage.p_width > 0 ? dev.image_storage.p_width : iw;
   const int ph = dev.image_storage.p_height > 0 ? dev.image_storage.p_height : ih;
+  // rawprepare's default sensor crop, from the image metadata. a hand-edited
+  // rawprepare margin is not reflected here -- accepted limitation: the
+  // raster file module reads its file against the same metadata geometry,
+  // so both sides drift together for that (rare) case
   const int cropx = dev.image_storage.crop_x;
   const int cropy = dev.image_storage.crop_y;
 
@@ -1994,9 +2069,13 @@ static int32_t _finalize_job_run(dt_job_t *job)
     for(size_t k = 0; k < (size_t)pw * ph; k++)
       inv[k] = 1.0f - alpha_full[k];
 
+    // cleanup is expressed in working-grid area; scale it by the real
+    // surface ratio between the native frame and the working grid
+    const double area_ratio
+      = ((double)iw * ih) / MAX(1.0, (double)j->hint_w * j->hint_h);
     GList *signs = NULL;
     GList *forms = ras2forms(inv, pw, ph, NULL, 1.0f - j->threshold,
-                             MAX(2, (int)(j->cleanup * 15)),
+                             MAX(2, (int)(j->cleanup * area_ratio)),
                              (double)j->smoothing, 1.2, &signs);
     g_free(inv);
 
@@ -2036,7 +2115,8 @@ static int32_t _finalize_job_run(dt_job_t *job)
     a->has_target = j->has_target;
     memcpy(a->target_op, j->target_op, sizeof(a->target_op));
     a->target_multi_priority = j->target_multi_priority;
-    g_idle_add(_finalize_apply_idle, a);
+    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, _finalize_apply_idle, a,
+                    _finalize_apply_free);
     dt_print(DT_DEBUG_AI,
              "[object mask] precise paths: %d form(s) traced at %dx%d (%.1fs)",
              g_list_length(forms), pw, ph, dt_get_wtime() - t_start);
@@ -2096,7 +2176,8 @@ static int32_t _finalize_job_run(dt_job_t *job)
     a->has_recipe = j->has_recipe;
     if(j->has_recipe)
       a->recipe = j->recipe;
-    g_idle_add(_finalize_apply_idle, a);
+    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, _finalize_apply_idle, a,
+                    _finalize_apply_free);
     ok = TRUE;
   }
   else
@@ -2132,6 +2213,10 @@ static gboolean _launch_native_finalize(_object_data_t *d,
   // the job re-reads the history from the database; unflushed edits
   // (exposure, crop, ...) would silently be missing from the render
   dt_dev_write_history(darktable.develop);
+  // distortion state the hint was made on; the job revalidates it after
+  // loading, since the history can move while the job waits in the queue
+  const dt_hash_t launch_distort_hash
+    = _compute_distort_hash(darktable.develop);
 
   const float thresh
     = CLAMP(dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY), 0.3f, 0.9f);
@@ -2162,6 +2247,7 @@ static gboolean _launch_native_finalize(_object_data_t *d,
   j->cleanup = d->preview_cleanup;
   j->smoothing = d->preview_smoothing;
   j->feather = d->preview_feather;
+  j->distort_hash = launch_distort_hash;
 
   // the raster file gets a provenance recipe: it makes the file
   // recomputable and names it by content. sessions the recipe cannot hold

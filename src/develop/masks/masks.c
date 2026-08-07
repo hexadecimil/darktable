@@ -890,7 +890,10 @@ int dt_masks_legacy_params(dt_develop_t *dev,
   return res;
 }
 
-static dt_mask_id_t form_id = 0;
+// atomic: forms may be created from a worker job (the native mask
+// finalisation traces paths off the GUI thread), two concurrent creations
+// must never share an id
+static gint form_id = 0;
 
 dt_masks_form_t *dt_masks_create(const dt_masks_type_t type)
 {
@@ -899,7 +902,7 @@ dt_masks_form_t *dt_masks_create(const dt_masks_type_t type)
 
   form->type = type;
   form->version = dt_masks_version();
-  form->formid = time(NULL) + form_id++;
+  form->formid = time(NULL) + g_atomic_int_add(&form_id, 1);
 
   if(type & DT_MASKS_CIRCLE)
     form->functions = &dt_masks_functions_circle;

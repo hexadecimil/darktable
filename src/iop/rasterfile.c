@@ -197,8 +197,11 @@ static void _vectorize_button_clicked(GtkWidget *widget,
   dt_pthread_mutex_lock(&cd->lock);
 
   const dt_image_t *const image = &(self->dev->image_storage);
+  // full-resolution file: a negative turdsize selects the historical speckle
+  // cleanup (50) and 0.8 the matching curve tolerance, otherwise every tiny
+  // speckle becomes a form and floods the mask manager with anchors
   GList *forms = ras2forms(cd->mask, cd->width, cd->height, image,
-                           SET_THRESHOLD, 0, 0.0, 0.3, NULL);
+                           SET_THRESHOLD, -1, 0.0, 0.8, NULL);
 
   dt_pthread_mutex_unlock(&cd->lock);
 
