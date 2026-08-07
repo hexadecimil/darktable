@@ -23,6 +23,20 @@
 #include "common/debug.h"
 #include "common/densecrf.h"
 #include "common/guided_filter.h"
+
+// mirror of iop/rasterfile.c's parameter layout, which lives in the module
+// file only. keep in sync; introspection guards the size at history level.
+#define RASTERFILE_MAXFILE 2048
+typedef enum dt_iop_rasterfile_mode_t
+{
+  DT_RASTERFILE_MODE_ALL = 7,
+} dt_iop_rasterfile_mode_t;
+typedef struct dt_iop_rasterfile_params_t
+{
+  dt_iop_rasterfile_mode_t mode;
+  char path[RASTERFILE_MAXFILE];
+  char file[RASTERFILE_MAXFILE];
+} dt_iop_rasterfile_params_t;
 #include "common/distance_transform.h"
 #include "common/mipmap_cache.h"
 #include "common/ras2vect.h"
@@ -1024,7 +1038,115 @@ typedef struct _finalize_job_t
   int hint_w, hint_h;
   int bx, by, bw, bh;   // subject bounding box on the hint grid, margin included
   float threshold;
+  // target module for auto-wiring the produced mask, identified by name --
+  // never by pointer, the job outlives any UI guarantee
+  char target_op[32];
+  int target_multi_priority;
+  gboolean has_target;
 } _finalize_job_t;
+
+/* Payload handed from the worker job to the GUI thread once the file is
+ * written: everything needed to wire the mask into the pipeline. */
+typedef struct _finalize_apply_t
+{
+  dt_imgid_t imgid;
+  gchar *outpath;
+  char target_op[32];
+  int target_multi_priority;
+  gboolean has_target;
+} _finalize_apply_t;
+
+/* GUI thread: activate the external raster mask module on the produced file
+ * and connect the target module's blending to it. This is exactly what the
+ * user would do by hand in the raster-mask combo (blend_gui.c), automated. */
+static gboolean _finalize_apply_idle(gpointer data)
+{
+  _finalize_apply_t *a = data;
+  dt_develop_t *dev = darktable.develop;
+
+  if(!dev || dev->image_storage.id != a->imgid)
+  {
+    // the darkroom moved on; the file exists, it just cannot be auto-wired
+    dt_control_log(_("precise raster mask saved (image changed, not applied)"));
+    goto out;
+  }
+
+  // ---- source side: the external raster mask module ----
+  dt_iop_module_t *rf = NULL;
+  for(GList *l = dev->iop; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *m = l->data;
+    if(!strcmp(m->op, "rasterfile"))
+    {
+      rf = m;
+      break;
+    }
+  }
+  if(!rf || !rf->params)
+  {
+    dt_control_log(_("precise raster mask saved (raster module unavailable)"));
+    goto out;
+  }
+
+  {
+    // params layout of rasterfile: { mode; char path[2048]; char file[2048] }
+    dt_iop_rasterfile_params_t *p = (dt_iop_rasterfile_params_t *)rf->params;
+    gchar *dir = g_path_get_dirname(a->outpath);
+    gchar *base = g_path_get_basename(a->outpath);
+    p->mode = DT_RASTERFILE_MODE_ALL;
+    g_strlcpy(p->path, dir, sizeof(p->path));
+    g_strlcpy(p->file, base, sizeof(p->file));
+    g_free(dir);
+    g_free(base);
+    rf->enabled = TRUE;
+    dt_dev_add_history_item(dev, rf, TRUE);
+  }
+
+  // ---- sink side: the module the mask was created from ----
+  dt_iop_module_t *target = NULL;
+  if(a->has_target)
+    for(GList *l = dev->iop; l; l = g_list_next(l))
+    {
+      dt_iop_module_t *m = l->data;
+      if(!strcmp(m->op, a->target_op)
+         && m->multi_priority == a->target_multi_priority)
+      {
+        target = m;
+        break;
+      }
+    }
+
+  if(target && target->blend_params)
+  {
+    if(target->raster_mask.sink.source)
+      g_hash_table_remove(
+        target->raster_mask.sink.source->raster_mask.source.users, target);
+
+    target->raster_mask.sink.source = rf;
+    target->raster_mask.sink.id = BLEND_RASTER_ID;
+    g_hash_table_add(rf->raster_mask.source.users, target);
+
+    memcpy(target->blend_params->raster_mask_source, rf->op,
+           sizeof(target->blend_params->raster_mask_source));
+    target->blend_params->raster_mask_instance = rf->multi_priority;
+    target->blend_params->raster_mask_id = BLEND_RASTER_ID;
+    target->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
+
+    dt_dev_add_history_item(dev, target, TRUE);
+    if(target->gui_data) dt_iop_gui_update(target);
+    dt_control_log(_("precise raster mask applied to %s"), target->name());
+  }
+  else
+    dt_control_log(_("precise raster mask saved and loaded in the raster module"));
+
+  dt_dev_reprocess_all(dev);
+  dt_control_queue_redraw_center();
+
+out:
+  g_free(a->outpath);
+  g_free(a);
+  return G_SOURCE_REMOVE;
+}
 
 // one finalisation at a time; the job resets this when it completes
 static volatile gint _finalize_running = 0;
@@ -1379,6 +1501,15 @@ static int32_t _finalize_job_run(dt_job_t *job)
              dt_get_wtime() - t_start);
     dt_control_log(_("precise raster mask saved (%.1f MB, %.1fs)"),
                    mo, dt_get_wtime() - t_start);
+
+    // hand over to the GUI thread to wire the mask into the pipeline
+    _finalize_apply_t *a = g_malloc0(sizeof(_finalize_apply_t));
+    a->imgid = j->imgid;
+    a->outpath = g_strdup(outpath);
+    a->has_target = j->has_target;
+    memcpy(a->target_op, j->target_op, sizeof(a->target_op));
+    a->target_multi_priority = j->target_multi_priority;
+    g_idle_add(_finalize_apply_idle, a);
     ok = TRUE;
   }
   else
@@ -1400,7 +1531,8 @@ cleanup:
 }
 
 /* GUI thread: snapshot the working mask and hand it to a worker job. */
-static void _launch_native_finalize(_object_data_t *d)
+static void _launch_native_finalize(_object_data_t *d,
+                                    dt_iop_module_t *target)
 {
   if(!g_atomic_int_compare_and_exchange(&_finalize_running, 0, 1))
   {
@@ -1437,6 +1569,12 @@ static void _launch_native_finalize(_object_data_t *d)
   j->bw = CLAMP((int)br.x - j->bx + 1, 1, d->mask_w - j->bx);
   j->bh = CLAMP((int)br.y - j->by + 1, 1, d->mask_h - j->by);
   j->threshold = thresh;
+  if(target)
+  {
+    g_strlcpy(j->target_op, target->op, sizeof(j->target_op));
+    j->target_multi_priority = target->multi_priority;
+    j->has_target = TRUE;
+  }
 
   dt_job_t *job = dt_control_job_create(_finalize_job_run,
                                         "precise raster mask");
@@ -1787,9 +1925,23 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
     if(d && d->has_selection && d->mask
        && dt_modifier_is(state, GDK_SHIFT_MASK))
     {
-      _launch_native_finalize(d);
-      // stay in creation mode: this gesture must NOT fall through to the
-      // vector path below, which would also vectorise and end the session
+      _launch_native_finalize(d, module);
+
+      // leave creation mode right away: the mask will be wired into the
+      // module automatically when the job lands, there is nothing left to
+      // do here. mirrors the vector path's exit sequence below.
+      gui->creation = FALSE;
+      gui->creation_continuous = FALSE;
+      gui->creation_continuous_module = NULL;
+      _free_data(gui);
+      dt_masks_dynbuf_free(gui->guipoints);
+      dt_masks_dynbuf_free(gui->guipoints_payload);
+      gui->guipoints = NULL;
+      gui->guipoints_payload = NULL;
+      gui->guipoints_count = 0;
+      dt_control_hinter_message("");
+      dt_masks_change_form_gui(NULL);
+      dt_control_queue_redraw_center();
       return 1;
     }
 
