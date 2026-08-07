@@ -22,11 +22,13 @@
 #include "common/colorspaces.h"
 #include "common/debug.h"
 #include "common/densecrf.h"
+#include "common/guided_filter.h"
 #include "common/distance_transform.h"
 #include "common/mipmap_cache.h"
 #include "common/ras2vect.h"
 #include "control/conf.h"
 #include "control/control.h"
+#include "control/jobs.h"
 #include "develop/blend.h"
 #include "develop/imageop.h"
 #include "develop/masks.h"
@@ -949,42 +951,33 @@ static gboolean _write_mask_png16(const char *path,
 }
 
 
-static void _save_raster_mask(const float *mask,
-                              const int w,
-                              const int h,
-                              const float threshold)
+/* Build a unique output path <def_path>/<image>_mask[_N].png. NULL on error.
+ * May be called from a worker job: dt_control_log is thread-safe. */
+static gchar *_build_mask_path(const dt_imgid_t imgid)
 {
-  if(!mask || w <= 0 || h <= 0) return;
+  if(!dt_is_valid_imgid(imgid)) return NULL;
 
-  const dt_imgid_t imgid = darktable.develop->image_storage.id;
-  if(!dt_is_valid_imgid(imgid)) return;
-
-  // get the raster mask root folder from preferences
   gchar *root = dt_conf_get_string("plugins/darkroom/segments/def_path");
   if(!root || !*root)
   {
     g_free(root);
     dt_control_log(_("set raster mask root folder in preferences"));
-    return;
+    return NULL;
   }
-
-  // ensure the directory exists
   if(g_mkdir_with_parents(root, 0755) != 0)
   {
     dt_print(DT_DEBUG_AI, "[object mask] cannot create folder: %s", root);
     dt_control_log(_("cannot create raster mask folder"));
     g_free(root);
-    return;
+    return NULL;
   }
 
-  // get image filename without directory and extension
   char imgpath[PATH_MAX] = { 0 };
   dt_image_full_path(imgid, imgpath, sizeof(imgpath), NULL);
   gchar *basename = g_path_get_basename(imgpath);
   char *dot = g_strrstr(basename, ".");
   if(dot) *dot = '\0';
 
-  // build output path, append _1, _2, ... if file already exists
   gchar *mask_name = g_strdup_printf("%s_mask.png", basename);
   gchar *outpath = g_build_filename(root, mask_name, NULL);
   g_free(mask_name);
@@ -998,43 +991,343 @@ static void _save_raster_mask(const float *mask,
     outpath = g_build_filename(root, mask_name, NULL);
     g_free(mask_name);
   }
-
   g_free(basename);
   g_free(root);
+  return outpath;
+}
 
-  // Write the alpha as a 16-bit PNG rather than a binarised 8-bit one.
-  //
-  // Thresholding threw away everything the refinement produced: the transition
-  // band collapsed to a single bit, so a pixel covered at 40% became either
-  // fully in or fully out. 16 bits give 65536 levels, far beyond what the
-  // refinement can resolve, and the raster mask module already reads that
-  // depth without thresholding (rasterfile.c).
-  //
-  // PNG rather than PFM on purpose: a mask is mostly flat 0 and 1 with a thin
-  // transition band, which deflate compresses extremely well. The same data as
-  // raw float would be 4 bytes per pixel with no compression at all.
-  const gboolean ok = _write_mask_png16(outpath, mask, w, h);
 
-  if(ok)
+/* ------------------- native-resolution mask finalisation -------------------
+ *
+ * The interactive loop works on a render capped at 1536 px, where one pixel
+ * spans ~4 native pixels: whatever the segmentation and its refinement
+ * achieve, the contour position stays quantised to that grid. Finalisation
+ * re-renders only the subject's bounding box at scale 1.0, re-derives the
+ * alpha there with a guided filter -- whose local affine model in RGB is
+ * exactly the inversion of the compositing equation I = a*F + (1-a)*B --
+ * inside a narrow band around the contour, maps the result back to
+ * full-frame *input* space (the space every mask form is normalised to, so
+ * a crop added or changed later keeps working), and writes a 16-bit PNG for
+ * the external raster mask module.
+ *
+ * Runs once, on a worker job, a few seconds. The interactive loop is not
+ * touched. */
+
+typedef struct _finalize_job_t
+{
+  dt_imgid_t imgid;
+  int32_t history_end;
+  float *hint;          // copy of the working-grid mask, owned by the job
+  int hint_w, hint_h;
+  int bx, by, bw, bh;   // subject bounding box on the hint grid, margin included
+  float threshold;
+} _finalize_job_t;
+
+// one finalisation at a time; the job resets this when it completes
+static volatile gint _finalize_running = 0;
+
+static void _finalize_job_destroy(void *p)
+{
+  _finalize_job_t *j = p;
+  if(!j) return;
+  g_free(j->hint);
+  g_free(j);
+}
+
+// bilinear sample of a single-channel plane, pixel-centre convention
+static inline float _sample_plane(const float *const restrict src,
+                                  const int sw,
+                                  const int sh,
+                                  const float fx,
+                                  const float fy)
+{
+  const float x = CLAMP(fx, 0.0f, (float)(sw - 1));
+  const float y = CLAMP(fy, 0.0f, (float)(sh - 1));
+  const int x0 = (int)x, y0 = (int)y;
+  const int x1 = MIN(x0 + 1, sw - 1), y1 = MIN(y0 + 1, sh - 1);
+  const float ax = x - (float)x0, ay = y - (float)y0;
+  return src[(size_t)y0 * sw + x0] * (1.0f - ax) * (1.0f - ay)
+       + src[(size_t)y0 * sw + x1] * ax * (1.0f - ay)
+       + src[(size_t)y1 * sw + x0] * (1.0f - ax) * ay
+       + src[(size_t)y1 * sw + x1] * ax * ay;
+}
+
+static int32_t _finalize_job_run(dt_job_t *job)
+{
+  _finalize_job_t *const j = dt_control_job_get_params(job);
+  gboolean ok = FALSE;
+  float *hint_nat = NULL, *alpha_gf = NULL, *alpha_full = NULL, *grid = NULL;
+  double *sat = NULL;
+  gchar *outpath = NULL;
+  gboolean pipe_ready = FALSE;
+  int rx = 0, ry = 0, gw = 0, gh = 0;
+
+  const double t_start = dt_get_wtime();
+
+  dt_develop_t dev;
+  dt_dev_init(&dev, FALSE);
+  dt_dev_load_image(&dev, j->imgid);
+  if(j->history_end > 0 && j->history_end > dev.history_end)
+    dev.history_end = j->history_end;
+
+  const int iw = dev.image_storage.width;
+  const int ih = dev.image_storage.height;
+
+  dt_dev_pixelpipe_t pipe;
+  dt_mipmap_buffer_t buf;
+  dt_mipmap_cache_get(&buf, j->imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
+  if(!buf.buf || !buf.width || !buf.height)
+  {
+    dt_control_log(_("precise mask: cannot get the image buffer"));
+    goto cleanup;
+  }
+
+  if(!dt_dev_pixelpipe_init_export(&pipe, iw, ih, IMAGEIO_RGB | IMAGEIO_INT8,
+                                   FALSE))
+  {
+    dt_control_log(_("precise mask: cannot init the render pipe"));
+    goto cleanup;
+  }
+  pipe_ready = TRUE;
+
+  dt_dev_pixelpipe_set_icc(&pipe, DT_COLORSPACE_SRGB, NULL,
+                           DT_INTENT_PERCEPTUAL);
+  dt_dev_pixelpipe_set_input(&pipe, &dev, (float *)buf.buf,
+                             buf.width, buf.height, buf.iscale);
+  dt_dev_pixelpipe_create_nodes(&pipe, &dev);
+  dt_dev_pixelpipe_synch_all(&pipe, &dev);
+  dt_dev_pixelpipe_get_dimensions(&pipe, &dev, pipe.iwidth, pipe.iheight,
+                                  &pipe.processed_width,
+                                  &pipe.processed_height);
+
+  {
+    // subject region in native (processed, scale 1.0) coordinates; the two
+    // axis factors are derived independently from the integer grid sizes
+    const double fx = (double)pipe.processed_width / (double)j->hint_w;
+    const double fy = (double)pipe.processed_height / (double)j->hint_h;
+    rx = (int)floor(j->bx * fx);
+    ry = (int)floor(j->by * fy);
+    int rw = (int)ceil((j->bx + j->bw) * fx) - rx;
+    int rh = (int)ceil((j->by + j->bh) * fy) - ry;
+    rx = CLAMP(rx, 0, pipe.processed_width - 8);
+    ry = CLAMP(ry, 0, pipe.processed_height - 8);
+    rw = CLAMP(rw, 8, pipe.processed_width - rx);
+    rh = CLAMP(rh, 8, pipe.processed_height - ry);
+
+    dt_print(DT_DEBUG_AI,
+             "[object mask] finalise: native region %dx%d at (%d,%d) of %dx%d",
+             rw, rh, rx, ry, pipe.processed_width, pipe.processed_height);
+
+    // only the region goes through the pipe: demosaic's modify_roi_in
+    // restricts the sensor read to what the ROI needs
+    dt_dev_pixelpipe_process_no_gamma(&pipe, &dev, rx, ry, rw, rh, 1.0);
+
+    // realign everything on what the pipe actually produced, never on the
+    // requested ROI
+    const float *const guide = (const float *)pipe.backbuf;
+    gw = pipe.backbuf_width;
+    gh = pipe.backbuf_height;
+    if(!guide || gw < 8 || gh < 8)
+    {
+      dt_control_log(_("precise mask: native render failed"));
+      goto cleanup;
+    }
+
+    const size_t npix = (size_t)gw * gh;
+    hint_nat = dt_alloc_align_float(npix);
+    alpha_gf = dt_alloc_align_float(npix);
+    sat = g_try_malloc((size_t)(gw + 1) * (gh + 1) * sizeof(double));
+    if(!hint_nat || !alpha_gf || !sat)
+    {
+      dt_control_log(_("precise mask: out of memory"));
+      goto cleanup;
+    }
+
+    // binarised hint on the native grid, pixel-centre mapping. the band
+    // logic wants a clean step: the soft values of the working grid render
+    // confidence, not coverage
+    for(int y = 0; y < gh; y++)
+    {
+      const float hy = ((float)(ry + y) + 0.5f) / (float)fy - 0.5f;
+      for(int x = 0; x < gw; x++)
+      {
+        const float hx = ((float)(rx + x) + 0.5f) / (float)fx - 0.5f;
+        hint_nat[(size_t)y * gw + x]
+          = (_sample_plane(j->hint, j->hint_w, j->hint_h, hx, hy)
+             > j->threshold) ? 1.0f : 0.0f;
+      }
+    }
+
+    // summed-area table of the binary hint, for the band test below
+    const int R = 8;
+    for(int x = 0; x <= gw; x++) sat[x] = 0.0;
+    for(int y = 1; y <= gh; y++)
+    {
+      double rowsum = 0.0;
+      sat[(size_t)y * (gw + 1)] = 0.0;
+      for(int x = 1; x <= gw; x++)
+      {
+        rowsum += hint_nat[(size_t)(y - 1) * gw + (x - 1)];
+        sat[(size_t)y * (gw + 1) + x]
+          = sat[(size_t)(y - 1) * (gw + 1) + x] + rowsum;
+      }
+    }
+
+    // guided filter: local affine model in RGB -- the inversion of
+    // I = a*F + (1-a)*B that a segmentation confidence lacks. eps is kept
+    // large on purpose: with a tiny eps the covariance determinant test
+    // inside guided_filter degenerates to a plain box blur silently
+    guided_filter(guide, hint_nat, alpha_gf, gw, gh, 4, 6,
+                  1.0f, 100.0f, 0.0f, 1.0f);
+
+    // composition: refined alpha inside a narrow band around the contour
+    // (Chebyshev distance <= R to the binary edge, decided per pixel from
+    // the summed-area table), hard hint outside
+    for(int y = 0; y < gh; y++)
+    {
+      for(int x = 0; x < gw; x++)
+      {
+        const int x0 = MAX(x - R, 0), x1 = MIN(x + R + 1, gw);
+        const int y0 = MAX(y - R, 0), y1 = MIN(y + R + 1, gh);
+        const double area = (double)(x1 - x0) * (y1 - y0);
+        const double inside
+          = sat[(size_t)y1 * (gw + 1) + x1] - sat[(size_t)y0 * (gw + 1) + x1]
+          - sat[(size_t)y1 * (gw + 1) + x0] + sat[(size_t)y0 * (gw + 1) + x0];
+        const gboolean band = inside > 0.5 && inside < area - 0.5;
+        const size_t k = (size_t)y * gw + x;
+        alpha_gf[k] = band ? CLAMP(alpha_gf[k], 0.0f, 1.0f) : hint_nat[k];
+      }
+    }
+
+    // map back to full-frame *input* space through the geometry chain, on a
+    // coarse grid of forward-transformed nodes. this is the space the
+    // external raster mask module interprets the file in (iop order 3.1),
+    // so a crop added, changed or relaxed later keeps working
+    const int G = 8;
+    const int gnx = iw / G + 2, gny = ih / G + 2;
+    grid = g_try_malloc((size_t)gnx * gny * 2 * sizeof(float));
+    alpha_full = g_try_malloc0((size_t)iw * ih * sizeof(float));
+    if(!grid || !alpha_full)
+    {
+      dt_control_log(_("precise mask: out of memory"));
+      goto cleanup;
+    }
+    for(int y = 0; y < gny; y++)
+      for(int x = 0; x < gnx; x++)
+      {
+        grid[((size_t)y * gnx + x) * 2 + 0] = (float)(x * G);
+        grid[((size_t)y * gnx + x) * 2 + 1] = (float)(y * G);
+      }
+    dt_dev_distort_transform_plus(&dev, &pipe, 0.0, DT_DEV_TRANSFORM_DIR_ALL,
+                                  grid, (size_t)gnx * gny);
+
+    for(int y = 0; y < ih; y++)
+    {
+      const int cy = y / G;
+      const float wy = (float)(y - cy * G) / (float)G;
+      for(int x = 0; x < iw; x++)
+      {
+        const int cx = x / G;
+        const float wx = (float)(x - cx * G) / (float)G;
+        const float *n00 = grid + ((size_t)cy * gnx + cx) * 2;
+        const float *n01 = grid + ((size_t)cy * gnx + cx + 1) * 2;
+        const float *n10 = grid + ((size_t)(cy + 1) * gnx + cx) * 2;
+        const float *n11 = grid + ((size_t)(cy + 1) * gnx + cx + 1) * 2;
+        const float px = n00[0] * (1.0f - wx) * (1.0f - wy)
+                       + n01[0] * wx * (1.0f - wy)
+                       + n10[0] * (1.0f - wx) * wy + n11[0] * wx * wy;
+        const float py = n00[1] * (1.0f - wx) * (1.0f - wy)
+                       + n01[1] * wx * (1.0f - wy)
+                       + n10[1] * (1.0f - wx) * wy + n11[1] * wx * wy;
+        const float lx = px - (float)rx;
+        const float ly = py - (float)ry;
+        if(lx > -1.0f && ly > -1.0f && lx < (float)gw && ly < (float)gh)
+          alpha_full[(size_t)y * iw + x]
+            = _sample_plane(alpha_gf, gw, gh, lx, ly);
+      }
+    }
+  }
+
+  outpath = _build_mask_path(j->imgid);
+  if(outpath && _write_mask_png16(outpath, alpha_full, iw, ih))
   {
     size_t soft = 0;
-    for(size_t k = 0; k < (size_t)w * h; k++)
-      if(mask[k] > 0.05f && mask[k] < 0.95f) soft++;
-
+    for(size_t k = 0; k < (size_t)iw * ih; k++)
+      if(alpha_full[k] > 0.05f && alpha_full[k] < 0.95f) soft++;
     GStatBuf st;
     const double mo = (g_stat(outpath, &st) == 0) ? st.st_size / 1048576.0 : 0.0;
     dt_print(DT_DEBUG_AI,
-             "[object mask] raster mask saved: %s (%dx%d, %.1f MB, %.3f%% soft pixels)",
-             outpath, w, h, mo, 100.0 * soft / ((double)w * h));
-    dt_control_log(_("raster mask saved"));
+             "[object mask] precise mask saved: %s (%dx%d, %.1f MB, "
+             "%.3f%% soft, %.1fs)",
+             outpath, iw, ih, mo, 100.0 * soft / ((double)iw * ih),
+             dt_get_wtime() - t_start);
+    dt_control_log(_("precise raster mask saved (%.1f MB, %.1fs)"),
+                   mo, dt_get_wtime() - t_start);
+    ok = TRUE;
   }
   else
+    dt_control_log(_("failed to save the precise raster mask"));
+
+cleanup:
+  g_free(outpath);
+  g_free(grid);
+  g_free(alpha_full);
+  g_free(sat);
+  dt_free_align(alpha_gf);
+  dt_free_align(hint_nat);
+  if(pipe_ready) dt_dev_pixelpipe_cleanup(&pipe);
+  dt_mipmap_cache_release(&buf);
+  dt_dev_cleanup(&dev);
+  g_atomic_int_set(&_finalize_running, 0);
+  return ok ? 0 : 1;
+}
+
+/* GUI thread: snapshot the working mask and hand it to a worker job. */
+static void _launch_native_finalize(_object_data_t *d)
+{
+  if(!g_atomic_int_compare_and_exchange(&_finalize_running, 0, 1))
   {
-    dt_print(DT_DEBUG_AI, "[object mask] failed to write: %s", outpath);
-    dt_control_log(_("failed to save raster mask"));
+    dt_control_log(_("precise mask finalisation already running"));
+    return;
   }
 
-  g_free(outpath);
+  const float thresh
+    = CLAMP(dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY), 0.3f, 0.9f);
+  const float margin
+    = CLAMP(dt_conf_get_float(CONF_OBJECT_AI_REFINE_MARGIN_KEY), 0.0f, 0.5f);
+
+  dt_seg_point_t tl, br;
+  if(!_compute_bbox(d->mask, d->mask_w, d->mask_h, thresh, margin, &tl, &br))
+  {
+    dt_control_log(_("empty mask, nothing to finalise"));
+    g_atomic_int_set(&_finalize_running, 0);
+    return;
+  }
+
+  _finalize_job_t *j = g_malloc0(sizeof(_finalize_job_t));
+  j->imgid = darktable.develop->image_storage.id;
+  j->history_end = darktable.develop->history_end;
+  j->hint_w = d->mask_w;
+  j->hint_h = d->mask_h;
+  j->hint = g_malloc((size_t)d->mask_w * d->mask_h * sizeof(float));
+  memcpy(j->hint, d->mask, (size_t)d->mask_w * d->mask_h * sizeof(float));
+  j->bx = CLAMP((int)tl.x, 0, d->mask_w - 1);
+  j->by = CLAMP((int)tl.y, 0, d->mask_h - 1);
+  j->bw = CLAMP((int)br.x - j->bx + 1, 1, d->mask_w - j->bx);
+  j->bh = CLAMP((int)br.y - j->by + 1, 1, d->mask_h - j->by);
+  j->threshold = thresh;
+
+  dt_job_t *job = dt_control_job_create(_finalize_job_run,
+                                        "precise raster mask");
+  if(!job)
+  {
+    _finalize_job_destroy(j);
+    g_atomic_int_set(&_finalize_running, 0);
+    return;
+  }
+  dt_control_job_set_params(job, j, _finalize_job_destroy);
+  dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
+  dt_control_log(_("computing precise raster mask..."));
 }
 
 // transform mask-space forms to input-normalized coords and register them,
@@ -1366,13 +1659,13 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
     if(d && g_atomic_int_get(&d->encode_state) == ENCODE_RUNNING)
       return 1;
 
-    // shift+right-click: save raster mask before vectorization
+    // shift+right-click: finalise a precise raster mask at native
+    // resolution, on a worker job. separate from the vector path on purpose:
+    // this one has no editable points, and says so by being a distinct gesture
     if(d && d->has_selection && d->mask
        && dt_modifier_is(state, GDK_SHIFT_MASK))
     {
-      const float thresh = CLAMP(
-        dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY), 0.3f, 0.9f);
-      _save_raster_mask(d->mask, d->mask_w, d->mask_h, thresh);
+      _launch_native_finalize(d);
     }
 
     // right-click: finalize mask (prefer cached preview forms)
