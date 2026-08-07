@@ -1430,7 +1430,8 @@ typedef struct _finalize_job_t
   int cleanup;          // potrace turdsize, working-grid px^2 (scaled inside)
   float smoothing;      // potrace alphamax
   float feather;        // border applied to the resulting path points
-  dt_hash_t distort_hash;  // distortion state at launch; the job revalidates
+  dt_hash_t distort_hash;  // distortion state at launch; revalidated at
+                           // APPLY time on the GUI thread (same context)
   // provenance of the mask, captured on the GUI thread at launch. when
   // valid, outpath holds the content-addressed target file name derived
   // from its fingerprint; otherwise the job falls back to a sequential name
@@ -1585,6 +1586,9 @@ typedef struct _finalize_apply_t
   GList *signs;
   dt_rf_recipe_t recipe;  // provenance stored with the raster module params
   gboolean has_recipe;
+  dt_hash_t distort_hash; // distortion state at launch; applying a result
+                          // computed on a since-changed geometry would wire
+                          // a misaligned mask
 } _finalize_apply_t;
 
 // destroy-notify of the apply idle: owns everything the payload carries.
@@ -1619,6 +1623,15 @@ static gboolean _finalize_apply_idle(gpointer data)
       dt_control_log(_("image changed, precise paths discarded"));
     else
       dt_control_log(_("precise raster mask saved (image changed, not applied)"));
+    return G_SOURCE_REMOVE;
+  }
+
+  // same develop, same GUI thread as the launch-time capture: this compares
+  // like with like, and covers the whole job lifetime (queue wait included)
+  if(_compute_distort_hash(dev) != a->distort_hash)
+  {
+    dt_control_log(_("image geometry changed while the precise mask was"
+                     " computed, result discarded"));
     return G_SOURCE_REMOVE;
   }
 
@@ -2249,16 +2262,13 @@ static int32_t _finalize_job_run(dt_job_t *job)
   if(j->history_end > 0 && j->history_end > dev.history_end)
     dev.history_end = j->history_end;
 
-  // the hint only matches a render made on the exact distortion state it
-  // was computed on; the history can have moved while this job waited in
-  // the queue, and a mismatched render would be silently misaligned
-  if(_compute_distort_hash(&dev) != j->distort_hash)
-  {
-    dt_control_log(_("image geometry changed, precise mask cancelled"));
-    dt_dev_cleanup(&dev);
-    g_atomic_int_set(&_finalize_running, 0);
-    return 1;
-  }
+  // geometry drift while the job runs is checked at APPLY time, on the GUI
+  // thread, against the hash captured at launch -- both sides then compute
+  // on the same develop. comparing the launch hash against this headless
+  // dev's hash looked equivalent but is not: the two contexts disagree on
+  // the hash even for an unchanged history (systematic false positive that
+  // cancelled every finalisation), and the apply-time check covers the
+  // whole job lifetime anyway, which this early check never did
 
   const int render_target = dt_conf_key_exists(CONF_OBJECT_RENDER_SIZE_KEY)
     ? MAX(dt_conf_get_int(CONF_OBJECT_RENDER_SIZE_KEY), 1024)
@@ -2346,6 +2356,7 @@ static int32_t _finalize_job_run(dt_job_t *job)
     a->has_target = j->has_target;
     memcpy(a->target_op, j->target_op, sizeof(a->target_op));
     a->target_multi_priority = j->target_multi_priority;
+    a->distort_hash = j->distort_hash;
     g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, _finalize_apply_idle, a,
                     _finalize_apply_free);
     dt_print(DT_DEBUG_AI,
@@ -2394,6 +2405,7 @@ static int32_t _finalize_job_run(dt_job_t *job)
     a->has_recipe = j->has_recipe;
     if(j->has_recipe)
       a->recipe = j->recipe;
+    a->distort_hash = j->distort_hash;
     g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, _finalize_apply_idle, a,
                     _finalize_apply_free);
     ok = TRUE;
@@ -2629,11 +2641,16 @@ dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
   // which the fingerprint does not cover -- divergence is confined to the
   // guide render (the mask lives in input space) and is treated as
   // ONNX-variance-class (T2), see the block comment above
+  // NOTE: the recorded hash was computed on the GUI develop and this one on
+  // a headless develop; the two contexts have been observed to disagree for
+  // an unchanged history, so this trace can be a false positive. purely
+  // informational (the replay proceeds either way) -- root cause of the
+  // cross-context divergence still to be established
   const dt_hash_t cur_hash = _compute_distort_hash(&dev);
   if((dt_hash_t)recipe->distort_hash != cur_hash)
     dt_print(DT_DEBUG_AI,
-             "[object mask] replay: distortion state changed since capture, "
-             "the regenerated mask may be misaligned");
+             "[object mask] replay: distortion state differs from capture"
+             " (may be a cross-context artefact), proceeding");
 
   // reproduce the FIRST capture's state: the original encoding was made
   // before this very mask existed, but the loaded history contains the
