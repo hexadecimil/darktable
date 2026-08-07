@@ -139,7 +139,7 @@ typedef struct _object_data_t
   _decode_job_t *decode_job;        // job of the in-flight compute
   gboolean decode_pending;          // GUI thread only: clicks landed mid-decode
   int decode_launched_count;        // GUI thread only: point count at launch
-  gboolean decode_busy_shown;       // main thread only: busy_enter needs a leave
+  gboolean decode_busy_shown;       // GUI thread only: busy_enter needs a leave
 } _object_data_t;
 
 static _object_data_t *_get_data(dt_masks_form_gui_t *gui)
@@ -210,8 +210,10 @@ static void _free_preview_forms(_object_data_t *d)
   d->preview_signs = NULL;
 }
 
-// free all resources in _object_data_t (must be called after thread has joined),
-// preserves seg+env in persistent statics so the model stays loaded
+// free all resources in _object_data_t. joins any remaining worker thread
+// itself -- never call while a compute is still RUNNING, the join would block
+// the GUI thread. preserves seg+env in persistent statics so the model stays
+// loaded
 static void _destroy_data(_object_data_t *d)
 {
   if(!d)
@@ -256,7 +258,9 @@ static void _destroy_data(_object_data_t *d)
   g_free(d);
 }
 
-// idle callback for deferred cleanup when background thread was still running
+// idle callback for deferred cleanup when background thread was still running.
+// inherited limitation shared with the encode: if the main loop stops before
+// the next tick, the worker thread leaks at exit
 static gboolean _deferred_cleanup(gpointer data)
 {
   _object_data_t *d = data;
@@ -688,15 +692,15 @@ static gboolean _compute_bbox(const float *const restrict mask,
   return TRUE;
 }
 
-/* ---------------------------- interactive decode ----------------------------
- *
- * Split into three parts as groundwork for running the compute off the GUI
- * thread: _launch_decode snapshots every input on the GUI thread into a
- * self-contained job, _decode_thread_func computes from that job alone (its
- * only shared state is d->seg / d->refine / d->env, on which it has exclusive
- * rights while a decode runs), and the result is published back into d->mask
- * on the GUI side. For now the compute is called inline -- behaviour is
- * identical to the previous synchronous code, bit for bit. */
+// ---------------------------- interactive decode ----------------------------
+//
+// three parts: _launch_decode snapshots every input on the GUI thread into a
+// self-contained job and starts the compute thread; _decode_thread_func
+// computes from that job alone -- its shared state is d->seg / d->refine /
+// d->refine_failed / d->env, on which it has exclusive rights while a decode
+// runs, plus the atomic decode_state it sets as its last instruction;
+// _decode_finish joins the thread on the GUI side and publishes the result
+// into d->mask (or drains it)
 
 struct _decode_job_t
 {
@@ -708,7 +712,7 @@ struct _decode_job_t
   int n_prompt_points;
   int n_passes;
   int seed_x, seed_y;        // unclamped; clamped against the mask dims
-  gboolean reset_prev_mask;  // decision taken at snapshot time
+  gboolean reset_prev_mask;  // snapshotted; see _launch_decode
   float threshold;
   gboolean do_crf;
   int crf_iter;
@@ -729,8 +733,8 @@ static void _decode_job_free(_decode_job_t *job)
   g_free(job);
 }
 
-/* The compute. Runs from the job snapshot only; writes its result into the
- * job, never into d->mask. Shaped as a GThreadFunc for the async step. */
+// the compute. runs from the job snapshot only; writes its result into the
+// job, never into d->mask
 static gpointer _decode_thread_func(gpointer data)
 {
   _decode_job_t *job = data;
@@ -867,7 +871,9 @@ static gpointer _decode_thread_func(gpointer data)
   return NULL;
 }
 
-/* GUI thread: snapshot every input into a job and run the compute. */
+// GUI thread: snapshot every input into a job and start the compute thread.
+// coalesces on its own: while a decode is in flight it only flags
+// decode_pending -- the dynbuf holds the clicks and IS the queue
 static void _launch_decode(dt_masks_form_gui_t *gui)
 {
   _object_data_t *d = _get_data(gui);
@@ -911,9 +917,9 @@ static void _launch_decode(dt_masks_form_gui_t *gui)
   _decode_job_t *job = g_malloc0(sizeof(_decode_job_t));
   job->d = d;
   job->n_prompt_points = gui->guipoints_count;
-  // always send all accumulated points; keep the previous mask as boundary
-  // context on follow-up clicks (after a decode, prev_mask carries the
-  // refinement context, don't reset it)
+  // always FALSE from the interactive path today: has_selection is set
+  // before the launch. snapshotted to preserve the historical behaviour bit
+  // for bit -- do not attach first-click semantics to it
   job->reset_prev_mask = (gui->guipoints_count <= 1 && !d->has_selection);
   job->n_passes = CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_PASSES_KEY), 1, 3);
 
@@ -1014,10 +1020,12 @@ static void _update_preview(_object_data_t *d)
   }
 }
 
-/* GUI thread: join a finished decode and either publish its result or drop
- * it. Dropping (publish=FALSE) is the drain used by _clear_selection and the
- * invalidation branch: without it, a posthumous publication would resurrect
- * a mask the user just cleared. Handles the coalesced relaunch. */
+// GUI thread: join a finished decode and either publish its result or drop
+// it. dropping (publish=FALSE) is the drain used by _clear_selection, the
+// invalidation branch and the stale-geometry check in the publication
+// machine: without it, a posthumous publication would resurrect a mask the
+// user just tore down. handles the coalesced relaunch. called from the
+// expose handler like the encode machine -- keep this path light
 static void _decode_finish(dt_masks_form_gui_t *gui, const gboolean publish)
 {
   _object_data_t *d = _get_data(gui);
@@ -1070,21 +1078,46 @@ static void _decode_finish(dt_masks_form_gui_t *gui, const gboolean publish)
 
   if(relaunch && gui->guipoints_count > 0)
     _launch_decode(gui);        // keeps the busy indicator shown
-  else if(d->decode_busy_shown)
+
+  // default branch, not an else: the enter/leave pairing must hold locally,
+  // whatever early-return the relaunch attempt above may have taken
+  if(g_atomic_int_get(&d->decode_state) != DECODE_RUNNING
+     && d->decode_busy_shown)
   {
     dt_control_busy_leave();
     d->decode_busy_shown = FALSE;
   }
 
+  // a failed compute otherwise ends with a silent busy-indicator removal,
+  // and the user is left clicking into the void
+  if(publish && st == DECODE_ERROR
+     && g_atomic_int_get(&d->decode_state) != DECODE_RUNNING)
+    dt_control_log(_("object mask: computation failed"));
+
   if(published)
+  {
+    // dismiss "computing mask..." unless a coalesced relaunch took off
+    if(g_atomic_int_get(&d->decode_state) != DECODE_RUNNING)
+      dt_control_log_ack_all();
     dt_control_queue_redraw_center();
+  }
 }
 
-// save the raster mask as an RGB PNG to the raster mask root folder
-// (compatible with the external raster masks module)
-/* Write a mask as a 16-bit RGB PNG. The external raster mask module reads that
- * depth with a 1/65535 normaliser and no thresholding, so the alpha survives
- * intact. The three channels carry the same value; deflate collapses them. */
+// self-documenting wrappers for the two lifecycle transitions above
+static void _decode_publish(dt_masks_form_gui_t *gui)
+{
+  _decode_finish(gui, TRUE);
+}
+
+static void _decode_drain(dt_masks_form_gui_t *gui)
+{
+  _decode_finish(gui, FALSE);
+}
+
+// write a mask as a 16-bit RGB PNG to the raster mask folder. the external
+// raster mask module reads that depth with a 1/65535 normaliser and no
+// thresholding, so the alpha survives intact; the three channels carry the
+// same value and deflate collapses them
 static gboolean _write_mask_png16(const char *path,
                                   const float *const restrict mask,
                                   const int w,
@@ -2190,12 +2223,17 @@ static int _object_events_mouse_scrolled(dt_iop_module_t *module,
   return 0;
 }
 
-// clear accumulated points, mask preview, and iterative refinement state
+// clear accumulated points, mask preview, and iterative refinement state.
+// must not be called while a decode is RUNNING (the caller's guard ensures
+// that); a finished-but-unpublished result is drained here so a posthumous
+// publication cannot resurrect the mask we are about to clear
 static void _clear_selection(dt_masks_form_gui_t *gui)
 {
   _object_data_t *d = _get_data(gui);
   if(!d)
     return;
+
+  _decode_drain(gui);
 
   if(gui->guipoints)
     dt_masks_dynbuf_reset(gui->guipoints);
@@ -2242,19 +2280,20 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
   if(gui->creation && which == 1
      && dt_modifier_is(state, GDK_CONTROL_MASK | GDK_SHIFT_MASK))
   {
-    // ctrl+shift+click: clear selection (only after first selection).
-    // blocked while a compute runs; a finished-but-unpublished result is
-    // drained first, or its posthumous publication would resurrect the
-    // mask we are about to clear
-    if(d && d->has_selection && d->encode_state == ENCODE_READY
+    // ctrl+shift+click: clear selection (only after first selection),
+    // blocked while a compute runs
+    if(d && d->has_selection
+       && g_atomic_int_get(&d->encode_state) == ENCODE_READY
        && g_atomic_int_get(&d->decode_state) != DECODE_RUNNING)
     {
-      _decode_finish(gui, FALSE);
       _clear_selection(gui);
       if(darktable.develop->proxy.masks.module)
         darktable.develop->proxy.masks.list_change(
           darktable.develop->proxy.masks.module);
     }
+    else if(d && d->has_selection
+            && g_atomic_int_get(&d->decode_state) == DECODE_RUNNING)
+      dt_control_log(_("mask still computing, try again in a moment"));
     return 1;
   }
   else if(gui->creation && which == 1)
@@ -2449,11 +2488,9 @@ static int _object_events_button_released(dt_iop_module_t *module,
   gui->guipoints_count++;
   d->has_selection = TRUE;
 
-  if(g_atomic_int_get(&d->decode_state) != DECODE_IDLE)
-    d->decode_pending = TRUE;   // point already accumulated in the dynbuf
-  else
-    _launch_decode(gui);
-  // the vectorization preview now updates at publication time
+  // coalescing decided inside _launch_decode (single source of truth); the
+  // vectorization preview updates at publication time (_decode_finish)
+  _launch_decode(gui);
 
   // refresh mask properties panel so sliders update for
   // the current creation step (size vs cleanup/smoothing)
@@ -2585,7 +2622,7 @@ static void _object_events_post_expose(cairo_t *cr,
          || d->encoded_distort_hash != _compute_distort_hash(darktable.develop)))
   {
     // no result computed on the old geometry may be published past this
-    _decode_finish(gui, FALSE);
+    _decode_drain(gui);
     if(d->encode_thread)
     {
       g_thread_join(d->encode_thread);
@@ -2683,8 +2720,23 @@ static void _object_events_post_expose(cairo_t *cr,
   {
     const int dst = g_atomic_int_get(&d->decode_state);
     if(dst == DECODE_READY || dst == DECODE_ERROR)
-      _decode_finish(gui, TRUE);
+    {
+      // the invalidation branch above may have deferred its teardown while
+      // this compute ran, and the compute may have landed since it looked:
+      // its result was made on the torn-down geometry, drain it -- the next
+      // expose performs the teardown
+      const gboolean stale
+        = d->encoded_imgid != cur_imgid
+          || d->encoded_distort_hash != _compute_distort_hash(darktable.develop);
+      if(stale)
+        _decode_drain(gui);
+      else
+        _decode_publish(gui);
+    }
     else if(dst == DECODE_RUNNING)
+      // deliberately a toast rather than the mouse-move hint: it stays
+      // visible while the pointer is idle, and control.c dedups the
+      // repeated message
       dt_control_log(_("computing mask..."));
   }
 
