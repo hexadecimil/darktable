@@ -24,6 +24,7 @@
 #include "common/densecrf.h"
 #include "common/distance_transform.h"
 #include "common/mipmap_cache.h"
+#include "common/pfm.h"
 #include "common/ras2vect.h"
 #include "control/conf.h"
 #include "control/control.h"
@@ -920,7 +921,7 @@ static void _save_raster_mask(const float *mask,
   if(dot) *dot = '\0';
 
   // build output path, append _1, _2, ... if file already exists
-  gchar *mask_name = g_strdup_printf("%s_mask.png", basename);
+  gchar *mask_name = g_strdup_printf("%s_mask.pfm", basename);
   gchar *outpath = g_build_filename(root, mask_name, NULL);
   g_free(mask_name);
 
@@ -929,7 +930,7 @@ static void _save_raster_mask(const float *mask,
       seq++)
   {
     g_free(outpath);
-    mask_name = g_strdup_printf("%s_mask_%d.png", basename, seq);
+    mask_name = g_strdup_printf("%s_mask_%d.pfm", basename, seq);
     outpath = g_build_filename(root, mask_name, NULL);
     g_free(mask_name);
   }
@@ -937,48 +938,31 @@ static void _save_raster_mask(const float *mask,
   g_free(basename);
   g_free(root);
 
-  // create RGB buffer (rasterfile module expects 3-channel PNG)
-  const int stride = cairo_format_stride_for_width(CAIRO_FORMAT_RGB24, w);
-  uint8_t *buf = g_try_malloc0((size_t)stride * h);
-  if(!buf)
+  // Write the alpha as a single-channel float PFM rather than a binarised PNG.
+  //
+  // Thresholding here threw away everything the refinement produced: the
+  // transition band collapsed to one bit, so a pixel covered at 40% became
+  // either fully in or fully out. The raster mask module reads PFM natively
+  // (rasterfile.c), replicating the single plane across channels, so the
+  // continuous alpha now survives all the way to the pipeline.
+  dt_write_pfm(outpath, (size_t)w, (size_t)h, mask, sizeof(float));
+
+  if(g_file_test(outpath, G_FILE_TEST_EXISTS))
   {
-    g_free(outpath);
-    return;
+    int soft = 0;
+    for(size_t k = 0; k < (size_t)w * h; k++)
+      if(mask[k] > 0.05f && mask[k] < 0.95f) soft++;
+    dt_print(DT_DEBUG_AI,
+             "[object mask] raster mask saved: %s (%dx%d, %.3f%% soft pixels)",
+             outpath, w, h, 100.0 * soft / ((double)w * h));
+    dt_control_log(_("raster mask saved"));
+  }
+  else
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] failed to write: %s", outpath);
+    dt_control_log(_("failed to save raster mask"));
   }
 
-  for(int y = 0; y < h; y++)
-  {
-    uint8_t *row = buf + y * stride;
-    for(int x = 0; x < w; x++)
-    {
-      const uint8_t v = (mask[y * w + x] > threshold) ? 255 : 0;
-      // cairo RGB24 is native-endian BGRX in memory
-      row[x * 4 + 0] = v; // B
-      row[x * 4 + 1] = v; // G
-      row[x * 4 + 2] = v; // R
-      row[x * 4 + 3] = 0; // unused
-    }
-  }
-
-  cairo_surface_t *surface
-    = cairo_image_surface_create_for_data(buf, CAIRO_FORMAT_RGB24,
-                                          w, h, stride);
-  if(surface)
-  {
-    const cairo_status_t st = cairo_surface_write_to_png(surface, outpath);
-    cairo_surface_destroy(surface);
-    if(st == CAIRO_STATUS_SUCCESS)
-    {
-      dt_print(DT_DEBUG_AI, "[object mask] raster mask saved: %s", outpath);
-      dt_control_log(_("raster mask saved"));
-    }
-    else
-    {
-      dt_print(DT_DEBUG_AI, "[object mask] failed to write: %s", outpath);
-      dt_control_log(_("failed to save raster mask"));
-    }
-  }
-  g_free(buf);
   g_free(outpath);
 }
 
