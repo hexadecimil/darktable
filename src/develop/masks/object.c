@@ -900,17 +900,28 @@ static gboolean _write_mask_png16(const char *path,
   FILE *f = g_fopen(path, "wb");
   if(!f) return FALSE;
 
+  uint16_t *row = g_try_malloc((size_t)w * 3 * sizeof(uint16_t));
+  if(!row)
+  {
+    fclose(f);
+    return FALSE;
+  }
+
   png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
   if(!png)
   {
+    g_free(row);
     fclose(f);
     return FALSE;
   }
   png_infop info = png_create_info_struct(png);
   if(!info || setjmp(png_jmpbuf(png)))
   {
+    // libpng error path: free everything and remove the truncated file
     png_destroy_write_struct(&png, info ? &info : NULL);
+    g_free(row);
     fclose(f);
+    g_unlink(path);
     return FALSE;
   }
 
@@ -921,14 +932,6 @@ static gboolean _write_mask_png16(const char *path,
   png_set_compression_level(png, 6);
   png_write_info(png, info);
   png_set_swap(png);   // little-endian host, PNG wants big-endian samples
-
-  uint16_t *row = g_try_malloc((size_t)w * 3 * sizeof(uint16_t));
-  if(!row)
-  {
-    png_destroy_write_struct(&png, &info);
-    fclose(f);
-    return FALSE;
-  }
 
   for(int y = 0; y < h; y++)
   {
@@ -1056,7 +1059,8 @@ static int32_t _finalize_job_run(dt_job_t *job)
 {
   _finalize_job_t *const j = dt_control_job_get_params(job);
   gboolean ok = FALSE;
-  float *hint_nat = NULL, *alpha_gf = NULL, *alpha_full = NULL, *grid = NULL;
+  float *hint_soft = NULL, *hint_bin = NULL, *alpha_gf = NULL;
+  float *alpha_full = NULL, *grid = NULL;
   double *sat = NULL;
   gchar *outpath = NULL;
   gboolean pipe_ready = FALSE;
@@ -1070,8 +1074,18 @@ static int32_t _finalize_job_run(dt_job_t *job)
   if(j->history_end > 0 && j->history_end > dev.history_end)
     dev.history_end = j->history_end;
 
+  // pipe-input dimensions (sensor incl. borders) and the post-rawprepare
+  // frame. the external raster mask module sits after rawprepare (iop order
+  // 3.1 vs 1.0) and interprets its file in the post-rawprepare frame, so
+  // that is the space the file must be written in; rawprepare's crop offset
+  // is added back when entering the full forward transform, which includes
+  // rawprepare's own distort_transform.
   const int iw = dev.image_storage.width;
   const int ih = dev.image_storage.height;
+  const int pw = dev.image_storage.p_width > 0 ? dev.image_storage.p_width : iw;
+  const int ph = dev.image_storage.p_height > 0 ? dev.image_storage.p_height : ih;
+  const int cropx = dev.image_storage.crop_x;
+  const int cropy = dev.image_storage.crop_y;
 
   dt_dev_pixelpipe_t pipe;
   dt_mipmap_buffer_t buf;
@@ -1101,29 +1115,62 @@ static int32_t _finalize_job_run(dt_job_t *job)
                                   &pipe.processed_height);
 
   {
-    // subject region in native (processed, scale 1.0) coordinates; the two
-    // axis factors are derived independently from the integer grid sizes
-    const double fx = (double)pipe.processed_width / (double)j->hint_w;
-    const double fy = (double)pipe.processed_height / (double)j->hint_h;
-    rx = (int)floor(j->bx * fx);
-    ry = (int)floor(j->by * fy);
-    int rw = (int)ceil((j->bx + j->bw) * fx) - rx;
-    int rh = (int)ceil((j->by + j->bh) * fy) - ry;
+    // the encode render maps by pure scale (out = trunc(final_scale * proc)),
+    // so the exact hint->native factor is 1/final_scale, isotropic. deriving
+    // it from the truncated integer sizes would introduce an anisotropic
+    // drift of several native pixels at the far corner. recompute final_scale
+    // with the same formula as _encode_thread_func.
+    const int render_target = dt_conf_key_exists(CONF_OBJECT_RENDER_SIZE_KEY)
+      ? MAX(dt_conf_get_int(CONF_OBJECT_RENDER_SIZE_KEY), 1024)
+      : SEG_RENDER_DEFAULT;
+    const double e_scale
+      = fmin((double)render_target / (double)pipe.processed_width,
+             (double)render_target / (double)pipe.processed_height);
+    const double final_scale = fmin(e_scale, 1.0);
+    double fx = 1.0 / final_scale;
+    double fy = fx;
+    // the render-size setting may have changed since the mask was encoded;
+    // fall back to the integer ratio when the grids do not match
+    if((int)(final_scale * pipe.processed_width) != j->hint_w
+       || (int)(final_scale * pipe.processed_height) != j->hint_h)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] finalise: hint grid %dx%d does not match "
+               "current render scale, falling back to integer ratios",
+               j->hint_w, j->hint_h);
+      fx = (double)pipe.processed_width / (double)j->hint_w;
+      fy = (double)pipe.processed_height / (double)j->hint_h;
+    }
+
+    // the hint carries several native pixels of position error (one working
+    // pixel spans ~fx native ones), so both the correction band and the
+    // filter radius must scale with the resolution ratio
+    const int R = MAX(8, (int)ceil(2.5 * fx));
+    const int w_gf = MAX(4, R / 2);
+
+    rx = (int)floor(j->bx * fx) - R;
+    ry = (int)floor(j->by * fy) - R;
+    int rw = (int)ceil((j->bx + j->bw) * fx) + R - rx;
+    int rh = (int)ceil((j->by + j->bh) * fy) + R - ry;
     rx = CLAMP(rx, 0, pipe.processed_width - 8);
     ry = CLAMP(ry, 0, pipe.processed_height - 8);
     rw = CLAMP(rw, 8, pipe.processed_width - rx);
     rh = CLAMP(rh, 8, pipe.processed_height - ry);
 
     dt_print(DT_DEBUG_AI,
-             "[object mask] finalise: native region %dx%d at (%d,%d) of %dx%d",
-             rw, rh, rx, ry, pipe.processed_width, pipe.processed_height);
+             "[object mask] finalise: native region %dx%d at (%d,%d) of %dx%d"
+             " (R=%d, w=%d)",
+             rw, rh, rx, ry, pipe.processed_width, pipe.processed_height,
+             R, w_gf);
 
     // only the region goes through the pipe: demosaic's modify_roi_in
     // restricts the sensor read to what the ROI needs
     dt_dev_pixelpipe_process_no_gamma(&pipe, &dev, rx, ry, rw, rh, 1.0);
 
-    // realign everything on what the pipe actually produced, never on the
-    // requested ROI
+    if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) goto cleanup;
+
+    // for a non-display pipe these are the requested dimensions echoed back;
+    // kept as the single source of truth for the buffer we read
     const float *const guide = (const float *)pipe.backbuf;
     gw = pipe.backbuf_width;
     gh = pipe.backbuf_height;
@@ -1134,32 +1181,33 @@ static int32_t _finalize_job_run(dt_job_t *job)
     }
 
     const size_t npix = (size_t)gw * gh;
-    hint_nat = dt_alloc_align_float(npix);
+    hint_soft = dt_alloc_align_float(npix);
+    hint_bin = dt_alloc_align_float(npix);
     alpha_gf = dt_alloc_align_float(npix);
     sat = g_try_malloc((size_t)(gw + 1) * (gh + 1) * sizeof(double));
-    if(!hint_nat || !alpha_gf || !sat)
+    if(!hint_soft || !hint_bin || !alpha_gf || !sat)
     {
       dt_control_log(_("precise mask: out of memory"));
       goto cleanup;
     }
 
-    // binarised hint on the native grid, pixel-centre mapping. the band
-    // logic wants a clean step: the soft values of the working grid render
-    // confidence, not coverage
+    // hint on the native grid, pixel-centre mapping. the soft values are kept:
+    // away from the contour they carry genuine partial coverage (defocused
+    // edges, veils) that a hard threshold would destroy. the binarised copy
+    // drives the band logic and the filter, which want a clean step
     for(int y = 0; y < gh; y++)
     {
       const float hy = ((float)(ry + y) + 0.5f) / (float)fy - 0.5f;
       for(int x = 0; x < gw; x++)
       {
         const float hx = ((float)(rx + x) + 0.5f) / (float)fx - 0.5f;
-        hint_nat[(size_t)y * gw + x]
-          = (_sample_plane(j->hint, j->hint_w, j->hint_h, hx, hy)
-             > j->threshold) ? 1.0f : 0.0f;
+        const float v = _sample_plane(j->hint, j->hint_w, j->hint_h, hx, hy);
+        hint_soft[(size_t)y * gw + x] = CLAMPF(v, 0.0f, 1.0f);
+        hint_bin[(size_t)y * gw + x] = (v > j->threshold) ? 1.0f : 0.0f;
       }
     }
 
-    // summed-area table of the binary hint, for the band test below
-    const int R = 8;
+    // summed-area table of the binary hint, for the band weight below
     for(int x = 0; x <= gw; x++) sat[x] = 0.0;
     for(int y = 1; y <= gh; y++)
     {
@@ -1167,22 +1215,27 @@ static int32_t _finalize_job_run(dt_job_t *job)
       sat[(size_t)y * (gw + 1)] = 0.0;
       for(int x = 1; x <= gw; x++)
       {
-        rowsum += hint_nat[(size_t)(y - 1) * gw + (x - 1)];
+        rowsum += hint_bin[(size_t)(y - 1) * gw + (x - 1)];
         sat[(size_t)y * (gw + 1) + x]
           = sat[(size_t)(y - 1) * (gw + 1) + x] + rowsum;
       }
     }
 
     // guided filter: local affine model in RGB -- the inversion of
-    // I = a*F + (1-a)*B that a segmentation confidence lacks. eps is kept
-    // large on purpose: with a tiny eps the covariance determinant test
-    // inside guided_filter degenerates to a plain box blur silently
-    guided_filter(guide, hint_nat, alpha_gf, gw, gh, 4, 6,
+    // I = a*F + (1-a)*B that a segmentation confidence lacks. the effective
+    // regularisation comes from guide_weight scaling the covariances; these
+    // values measure as a genuine edge snap on real sRGB contrasts, not a
+    // box blur. high-ISO noise in the guide does transfer into the alpha
+    // inside the band; that is the accepted trade
+    guided_filter(guide, hint_bin, alpha_gf, gw, gh, 4, w_gf,
                   1.0f, 100.0f, 0.0f, 1.0f);
 
-    // composition: refined alpha inside a narrow band around the contour
-    // (Chebyshev distance <= R to the binary edge, decided per pixel from
-    // the summed-area table), hard hint outside
+    if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) goto cleanup;
+
+    // composition with a continuous band weight: 1 on the binary edge,
+    // fading to 0 with Chebyshev distance R. a hard band boundary would
+    // truncate the filter's ramp and leave a visible alpha step on guides
+    // with no local edge (plain sky)
     for(int y = 0; y < gh; y++)
     {
       for(int x = 0; x < gw; x++)
@@ -1193,20 +1246,25 @@ static int32_t _finalize_job_run(dt_job_t *job)
         const double inside
           = sat[(size_t)y1 * (gw + 1) + x1] - sat[(size_t)y0 * (gw + 1) + x1]
           - sat[(size_t)y1 * (gw + 1) + x0] + sat[(size_t)y0 * (gw + 1) + x0];
-        const gboolean band = inside > 0.5 && inside < area - 0.5;
+        const double f = inside / area;
+        const float wband = (float)(2.0 * MIN(f, 1.0 - f));
         const size_t k = (size_t)y * gw + x;
-        alpha_gf[k] = band ? CLAMP(alpha_gf[k], 0.0f, 1.0f) : hint_nat[k];
+        const float refined = CLAMPF(alpha_gf[k], 0.0f, 1.0f);
+        alpha_gf[k] = wband * refined + (1.0f - wband) * hint_soft[k];
       }
     }
 
-    // map back to full-frame *input* space through the geometry chain, on a
-    // coarse grid of forward-transformed nodes. this is the space the
-    // external raster mask module interprets the file in (iop order 3.1),
-    // so a crop added, changed or relaxed later keeps working
+    // map back to the full post-rawprepare frame through the geometry chain,
+    // on a coarse grid of forward-transformed nodes. grid nodes are indexed
+    // in the post-rawprepare frame (the file's space), shifted by
+    // rawprepare's crop to enter the full DIR_ALL transform, which includes
+    // rawprepare's own distort_transform. a crop module added or changed
+    // later keeps working; pixels outside the *current* crop stay 0 in the
+    // file, so relaxing an existing crop reveals a hard edge -- accepted
     const int G = 8;
-    const int gnx = iw / G + 2, gny = ih / G + 2;
+    const int gnx = pw / G + 2, gny = ph / G + 2;
     grid = g_try_malloc((size_t)gnx * gny * 2 * sizeof(float));
-    alpha_full = g_try_malloc0((size_t)iw * ih * sizeof(float));
+    alpha_full = g_try_malloc0((size_t)pw * ph * sizeof(float));
     if(!grid || !alpha_full)
     {
       dt_control_log(_("precise mask: out of memory"));
@@ -1215,17 +1273,17 @@ static int32_t _finalize_job_run(dt_job_t *job)
     for(int y = 0; y < gny; y++)
       for(int x = 0; x < gnx; x++)
       {
-        grid[((size_t)y * gnx + x) * 2 + 0] = (float)(x * G);
-        grid[((size_t)y * gnx + x) * 2 + 1] = (float)(y * G);
+        grid[((size_t)y * gnx + x) * 2 + 0] = (float)(x * G + cropx);
+        grid[((size_t)y * gnx + x) * 2 + 1] = (float)(y * G + cropy);
       }
     dt_dev_distort_transform_plus(&dev, &pipe, 0.0, DT_DEV_TRANSFORM_DIR_ALL,
                                   grid, (size_t)gnx * gny);
 
-    for(int y = 0; y < ih; y++)
+    for(int y = 0; y < ph; y++)
     {
       const int cy = y / G;
       const float wy = (float)(y - cy * G) / (float)G;
-      for(int x = 0; x < iw; x++)
+      for(int x = 0; x < pw; x++)
       {
         const int cx = x / G;
         const float wx = (float)(x - cx * G) / (float)G;
@@ -1242,24 +1300,26 @@ static int32_t _finalize_job_run(dt_job_t *job)
         const float lx = px - (float)rx;
         const float ly = py - (float)ry;
         if(lx > -1.0f && ly > -1.0f && lx < (float)gw && ly < (float)gh)
-          alpha_full[(size_t)y * iw + x]
+          alpha_full[(size_t)y * pw + x]
             = _sample_plane(alpha_gf, gw, gh, lx, ly);
       }
     }
   }
 
+  if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) goto cleanup;
+
   outpath = _build_mask_path(j->imgid);
-  if(outpath && _write_mask_png16(outpath, alpha_full, iw, ih))
+  if(outpath && _write_mask_png16(outpath, alpha_full, pw, ph))
   {
     size_t soft = 0;
-    for(size_t k = 0; k < (size_t)iw * ih; k++)
+    for(size_t k = 0; k < (size_t)pw * ph; k++)
       if(alpha_full[k] > 0.05f && alpha_full[k] < 0.95f) soft++;
     GStatBuf st;
     const double mo = (g_stat(outpath, &st) == 0) ? st.st_size / 1048576.0 : 0.0;
     dt_print(DT_DEBUG_AI,
              "[object mask] precise mask saved: %s (%dx%d, %.1f MB, "
              "%.3f%% soft, %.1fs)",
-             outpath, iw, ih, mo, 100.0 * soft / ((double)iw * ih),
+             outpath, pw, ph, mo, 100.0 * soft / ((double)pw * ph),
              dt_get_wtime() - t_start);
     dt_control_log(_("precise raster mask saved (%.1f MB, %.1fs)"),
                    mo, dt_get_wtime() - t_start);
@@ -1274,7 +1334,8 @@ cleanup:
   g_free(alpha_full);
   g_free(sat);
   dt_free_align(alpha_gf);
-  dt_free_align(hint_nat);
+  dt_free_align(hint_bin);
+  dt_free_align(hint_soft);
   if(pipe_ready) dt_dev_pixelpipe_cleanup(&pipe);
   dt_mipmap_cache_release(&buf);
   dt_dev_cleanup(&dev);
@@ -1290,6 +1351,10 @@ static void _launch_native_finalize(_object_data_t *d)
     dt_control_log(_("precise mask finalisation already running"));
     return;
   }
+
+  // the job re-reads the history from the database; unflushed edits
+  // (exposure, crop, ...) would silently be missing from the render
+  dt_dev_write_history(darktable.develop);
 
   const float thresh
     = CLAMP(dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY), 0.3f, 0.9f);
@@ -1326,6 +1391,7 @@ static void _launch_native_finalize(_object_data_t *d)
     return;
   }
   dt_control_job_set_params(job, j, _finalize_job_destroy);
+  dt_control_job_add_progress(job, _("precise raster mask"), TRUE);
   dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
   dt_control_log(_("computing precise raster mask..."));
 }
@@ -1666,6 +1732,9 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
        && dt_modifier_is(state, GDK_SHIFT_MASK))
     {
       _launch_native_finalize(d);
+      // stay in creation mode: this gesture must NOT fall through to the
+      // vector path below, which would also vectorise and end the session
+      return 1;
     }
 
     // right-click: finalize mask (prefer cached preview forms)
