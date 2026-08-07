@@ -436,7 +436,7 @@ static gpointer _encode_thread_func(gpointer data)
   g_free(rgb);
 
   // signal ready so the user can start placing points; warmup continues
-  // on this thread; _run_decoder joins the thread on the first click to
+  // on this thread; _launch_decode joins the thread on the first click to
   // avoid a race with warmup on the shared segmentation context
   g_atomic_int_set(&d->encode_state, ok ? ENCODE_READY : ENCODE_ERROR);
 
@@ -661,7 +661,183 @@ static gboolean _compute_bbox(const float *const restrict mask,
   return TRUE;
 }
 
-static void _run_decoder(dt_masks_form_gui_t *gui)
+/* ---------------------------- interactive decode ----------------------------
+ *
+ * Split into three parts as groundwork for running the compute off the GUI
+ * thread: _launch_decode snapshots every input on the GUI thread into a
+ * self-contained job, _decode_thread_func computes from that job alone (its
+ * only shared state is d->seg / d->refine / d->env, on which it has exclusive
+ * rights while a decode runs), and the result is published back into d->mask
+ * on the GUI side. For now the compute is called inline -- behaviour is
+ * identical to the previous synchronous code, bit for bit. */
+
+typedef struct _decode_job_t
+{
+  _object_data_t *d;         // owner; stays valid while a decode runs
+                             // (_free_data defers to _deferred_cleanup)
+  // -- inputs, snapshotted on the GUI thread; the compute never reads the
+  // live dynbufs, the preview pipe geometry or any gui->* field --
+  dt_seg_point_t *points;    // mapped to encode space, with pass headroom
+  int n_prompt_points;
+  int n_passes;
+  int seed_x, seed_y;        // unclamped; clamped against the mask dims
+  gboolean reset_prev_mask;  // decision taken at snapshot time
+  float threshold;
+  gboolean do_crf;
+  int crf_iter;
+  float crf_sigma_color;
+  float crf_w_bilateral;
+  gboolean do_refine;
+  float refine_margin;
+  // -- private output of the compute --
+  float *out_mask;
+  int out_w, out_h;
+} _decode_job_t;
+
+static void _decode_job_free(_decode_job_t *job)
+{
+  if(!job) return;
+  g_free(job->points);
+  g_free(job->out_mask);
+  g_free(job);
+}
+
+/* The compute. Runs from the job snapshot only; writes its result into the
+ * job, never into d->mask. Shaped as a GThreadFunc for the async step. */
+static gpointer _decode_thread_func(gpointer data)
+{
+  _decode_job_t *job = data;
+  _object_data_t *d = job->d;
+
+  if(job->reset_prev_mask)
+    dt_seg_reset_prev_mask(d->seg);
+
+  dt_seg_point_t *points = job->points;
+  int n_points = job->n_prompt_points;
+  const float threshold = job->threshold;
+  const gboolean supports_box = dt_seg_supports_box(d->seg);
+  int mw = 0, mh = 0;
+  float *mask = NULL;
+  gboolean box_added = FALSE;
+
+  for(int pass = 0; pass < job->n_passes; pass++)
+  {
+    float *new_mask = dt_seg_compute_mask(d->seg, points, n_points, &mw, &mh);
+    if(!new_mask) break;
+
+    if(mask && _mask_iou(mask, new_mask, (size_t)mw * mh, threshold) > 0.99f)
+    {
+      g_free(mask);
+      mask = new_mask;
+      dt_print(DT_DEBUG_AI,
+               "[object mask] converged at pass %d/%d", pass + 1, job->n_passes);
+      break;
+    }
+    g_free(mask);
+    mask = new_mask;
+
+    if(pass + 1 >= job->n_passes) break;
+
+    gboolean any_added = FALSE;
+    dt_seg_point_t peak;
+    if(_find_peak_point(mask, mw, mh, threshold,
+                        points, n_points, 8.0f, &peak))
+    {
+      points[n_points++] = peak;
+      any_added = TRUE;
+    }
+    if(supports_box && !box_added)
+    {
+      dt_seg_point_t tl, br;
+      if(_compute_bbox(mask, mw, mh, threshold, 0.05f, &tl, &br))
+      {
+        points[n_points++] = tl;
+        points[n_points++] = br;
+        box_added = TRUE;
+        any_added = TRUE;
+      }
+    }
+    if(!any_added) break;
+  }
+
+  if(mask)
+  {
+    // remove disconnected blobs: keep only the component at the seed point
+    const int seed_x = CLAMP(job->seed_x, 0, mw - 1);
+    const int seed_y = CLAMP(job->seed_y, 0, mh - 1);
+    _keep_seed_component(mask, mw, mh, threshold, seed_x, seed_y);
+
+    // optional DenseCRF edge refinement using the encoded RGB as guide
+    if(job->do_crf)
+    {
+      int rgb_w = 0, rgb_h = 0;
+      const uint8_t *rgb = dt_seg_get_encoded_rgb(d->seg, &rgb_w, &rgb_h);
+      if(rgb && rgb_w == mw && rgb_h == mh)
+      {
+        const double t0 = dt_get_wtime();
+        dt_dense_crf_binary(mask, rgb, mw, mh,
+                            5.0f, job->crf_sigma_color,
+                            3.0f, job->crf_w_bilateral, job->crf_iter);
+        dt_print(DT_DEBUG_AI,
+                 "[object mask] CRF refinement: %dx%d (%.2fs)",
+                 mw, mh, dt_get_wtime() - t0);
+      }
+    }
+
+    // optional CascadePSP contour refinement. the segmentation decoder emits
+    // a fixed 256x256 mask, so on a large image one mask pixel spans dozens
+    // of image pixels and no resampling can recover the contour. a dedicated
+    // network re-derives it from the image, given the coarse mask as a hint.
+    if(job->do_refine)
+    {
+      int rgb_w = 0, rgb_h = 0;
+      const uint8_t *rgb = dt_seg_get_encoded_rgb(d->seg, &rgb_w, &rgb_h);
+      if(rgb && rgb_w == mw && rgb_h == mh)
+      {
+        // lazy-load here on purpose: while a decode runs this code has
+        // exclusive rights on d->refine / d->refine_failed
+        if(!d->refine && !d->refine_failed)
+        {
+          d->refine = dt_refine_load(d->env);
+          if(!d->refine)
+          {
+            d->refine_failed = TRUE;
+            dt_print(DT_DEBUG_AI,
+                     "[object mask] contour refinement unavailable, disabled"
+                     " for this mask");
+          }
+        }
+
+        if(d->refine)
+        {
+          dt_seg_point_t tl, br;
+          if(_compute_bbox(mask, mw, mh, threshold, job->refine_margin,
+                           &tl, &br))
+          {
+            const int rx = CLAMP((int)tl.x, 0, mw - 1);
+            const int ry = CLAMP((int)tl.y, 0, mh - 1);
+            const int rw = CLAMP((int)br.x - rx + 1, 1, mw - rx);
+            const int rh = CLAMP((int)br.y - ry + 1, 1, mh - ry);
+            const double t1 = dt_get_wtime();
+            if(dt_refine_run(d->refine, rgb, mw, mh, mask, threshold,
+                             rx, ry, rw, rh))
+              dt_print(DT_DEBUG_AI,
+                       "[object mask] contour refinement: %dx%d region (%.2fs)",
+                       rw, rh, dt_get_wtime() - t1);
+          }
+        }
+      }
+    }
+  }
+
+  job->out_mask = mask;
+  job->out_w = mw;
+  job->out_h = mh;
+  return NULL;
+}
+
+/* GUI thread: snapshot every input into a job and run the compute. */
+static void _launch_decode(dt_masks_form_gui_t *gui)
 {
   _object_data_t *d = _get_data(gui);
   if(!d || !d->seg || !dt_seg_is_encoded(d->seg))
@@ -687,170 +863,68 @@ static void _run_decoder(dt_masks_form_gui_t *gui)
   const float sx = (wd > 0) ? (float)d->encode_w / wd : 1.0f;
   const float sy = (ht > 0) ? (float)d->encode_h / ht : 1.0f;
 
-  // always send all accumulated points; on the first click reset the
-  // previous mask, on subsequent clicks keep it so the decoder gets
-  // both all points AND the previous mask as boundary context;
-  // after decode, prev_mask carries refinement context, don't reset it
-  const int n_prompt_points = gui->guipoints_count;
-  if(gui->guipoints_count <= 1 && !d->has_selection)
-    dt_seg_reset_prev_mask(d->seg);
+  _decode_job_t *job = g_malloc0(sizeof(_decode_job_t));
+  job->d = d;
+  job->n_prompt_points = gui->guipoints_count;
+  // always send all accumulated points; keep the previous mask as boundary
+  // context on follow-up clicks (after a decode, prev_mask carries the
+  // refinement context, don't reset it)
+  job->reset_prev_mask = (gui->guipoints_count <= 1 && !d->has_selection);
+  job->n_passes = CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_PASSES_KEY), 1, 3);
 
   // headroom: one peak point per pass + 2 box corners (SAM only)
-  const int n_passes = CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_PASSES_KEY),
-                             1, 3);
-  dt_seg_point_t *points = g_new(dt_seg_point_t, n_prompt_points + n_passes + 2);
-  for(int i = 0; i < n_prompt_points; i++)
+  job->points
+    = g_new(dt_seg_point_t, job->n_prompt_points + job->n_passes + 2);
+  for(int i = 0; i < job->n_prompt_points; i++)
   {
-    points[i].x = gp[i * 2 + 0] * sx;
-    points[i].y = gp[i * 2 + 1] * sy;
-    points[i].label = (int)gpp[i];
+    job->points[i].x = gp[i * 2 + 0] * sx;
+    job->points[i].y = gp[i * 2 + 1] * sy;
+    job->points[i].label = (int)gpp[i];
   }
-  int n_points = n_prompt_points;
 
-  // find seed point for connected component filter:
-  // always search ALL accumulated points (not just prompt points)
-  int seed_x = -1, seed_y = -1;
+  // seed point for the connected component filter: last positive point
+  job->seed_x = -1;
+  job->seed_y = -1;
   for(int i = gui->guipoints_count - 1; i >= 0; i--)
   {
-    const int label = (int)gpp[i];
-    if(label == 1)
+    if((int)gpp[i] == 1)
     {
-      seed_x = (int)(gp[i * 2 + 0] * sx);
-      seed_y = (int)(gp[i * 2 + 1] * sy);
+      job->seed_x = (int)(gp[i * 2 + 0] * sx);
+      job->seed_y = (int)(gp[i * 2 + 1] * sy);
       break;
     }
   }
 
-  const float threshold
+  job->threshold
     = CLAMP(dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY), 0.3f, 0.9f);
-  const gboolean supports_box = dt_seg_supports_box(d->seg);
-  int mw = 0, mh = 0;
-  float *mask = NULL;
-  gboolean box_added = FALSE;
+  job->do_crf = d->preview_refine;
+  job->crf_iter
+    = CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_BOUNDARY_ITER_KEY), 1, 10);
+  job->crf_sigma_color
+    = CLAMP(dt_conf_get_float(CONF_OBJECT_REFINE_BOUNDARY_SIGMA_COLOR_KEY),
+            1.0f, 50.0f);
+  job->crf_w_bilateral
+    = CLAMP(dt_conf_get_float(CONF_OBJECT_REFINE_BOUNDARY_W_BILATERAL_KEY),
+            0.5f, 30.0f);
+  job->do_refine
+    = dt_conf_get_bool(CONF_OBJECT_AI_REFINE_KEY) && !d->refine_failed;
+  job->refine_margin
+    = CLAMPF(dt_conf_get_float(CONF_OBJECT_AI_REFINE_MARGIN_KEY), 0.0f, 0.5f);
 
-  for(int pass = 0; pass < n_passes; pass++)
+  // inline for now; the async step turns this into g_thread_new
+  _decode_thread_func(job);
+
+  // publish
+  if(job->out_mask)
   {
-    float *new_mask = dt_seg_compute_mask(d->seg, points, n_points, &mw, &mh);
-    if(!new_mask) break;
-
-    if(mask && _mask_iou(mask, new_mask, (size_t)mw * mh, threshold) > 0.99f)
-    {
-      g_free(mask);
-      mask = new_mask;
-      dt_print(DT_DEBUG_AI,
-               "[object mask] converged at pass %d/%d", pass + 1, n_passes);
-      break;
-    }
-    g_free(mask);
-    mask = new_mask;
-
-    if(pass + 1 >= n_passes) break;
-
-    gboolean any_added = FALSE;
-    dt_seg_point_t peak;
-    if(_find_peak_point(mask, mw, mh, threshold,
-                        points, n_points, 8.0f, &peak))
-    {
-      points[n_points++] = peak;
-      any_added = TRUE;
-    }
-    if(supports_box && !box_added)
-    {
-      dt_seg_point_t tl, br;
-      if(_compute_bbox(mask, mw, mh, threshold, 0.05f, &tl, &br))
-      {
-        points[n_points++] = tl;
-        points[n_points++] = br;
-        box_added = TRUE;
-        any_added = TRUE;
-      }
-    }
-    if(!any_added) break;
-  }
-  g_free(points);
-
-  if(mask)
-  {
-    // remove disconnected blobs: keep only the component at the seed point
-    seed_x = CLAMP(seed_x, 0, mw - 1);
-    seed_y = CLAMP(seed_y, 0, mh - 1);
-    _keep_seed_component(mask, mw, mh, threshold, seed_x, seed_y);
-
-    // optional DenseCRF edge refinement using the encoded RGB as guide
-    if(d->preview_refine)
-    {
-      int rgb_w = 0, rgb_h = 0;
-      const uint8_t *rgb = dt_seg_get_encoded_rgb(d->seg, &rgb_w, &rgb_h);
-      if(rgb && rgb_w == mw && rgb_h == mh)
-      {
-        const int crf_iter
-          = CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_BOUNDARY_ITER_KEY),
-                  1, 10);
-        const float crf_sigma_color
-          = CLAMP(dt_conf_get_float(CONF_OBJECT_REFINE_BOUNDARY_SIGMA_COLOR_KEY),
-                  1.0f, 50.0f);
-        const float crf_w_bilateral
-          = CLAMP(dt_conf_get_float(CONF_OBJECT_REFINE_BOUNDARY_W_BILATERAL_KEY),
-                  0.5f, 30.0f);
-        const double t0 = dt_get_wtime();
-        dt_dense_crf_binary(mask, rgb, mw, mh,
-                            5.0f, crf_sigma_color,
-                            3.0f, crf_w_bilateral, crf_iter);
-        dt_print(DT_DEBUG_AI,
-                 "[object mask] CRF refinement: %dx%d (%.2fs)",
-                 mw, mh, dt_get_wtime() - t0);
-      }
-    }
-
-    // optional CascadePSP contour refinement. the segmentation decoder emits a
-    // fixed 256x256 mask, so on a large image one mask pixel spans dozens of
-    // image pixels and no resampling can recover the contour. a dedicated
-    // network re-derives it from the image, given the coarse mask as a hint.
-    if(dt_conf_get_bool(CONF_OBJECT_AI_REFINE_KEY) && !d->refine_failed)
-    {
-      int rgb_w = 0, rgb_h = 0;
-      const uint8_t *rgb = dt_seg_get_encoded_rgb(d->seg, &rgb_w, &rgb_h);
-      if(rgb && rgb_w == mw && rgb_h == mh)
-      {
-        if(!d->refine)
-        {
-          d->refine = dt_refine_load(d->env);
-          if(!d->refine)
-          {
-            d->refine_failed = TRUE;
-            dt_print(DT_DEBUG_AI,
-                     "[object mask] contour refinement unavailable, disabled for"
-                     " this mask");
-          }
-        }
-
-        if(d->refine)
-        {
-          const float margin
-            = CLAMPF(dt_conf_get_float(CONF_OBJECT_AI_REFINE_MARGIN_KEY), 0.0f, 0.5f);
-          dt_seg_point_t tl, br;
-          if(_compute_bbox(mask, mw, mh, threshold, margin, &tl, &br))
-          {
-            const int rx = CLAMP((int)tl.x, 0, mw - 1);
-            const int ry = CLAMP((int)tl.y, 0, mh - 1);
-            const int rw = CLAMP((int)br.x - rx + 1, 1, mw - rx);
-            const int rh = CLAMP((int)br.y - ry + 1, 1, mh - ry);
-            const double t1 = dt_get_wtime();
-            if(dt_refine_run(d->refine, rgb, mw, mh, mask, threshold,
-                             rx, ry, rw, rh))
-              dt_print(DT_DEBUG_AI,
-                       "[object mask] contour refinement: %dx%d region (%.2fs)",
-                       rw, rh, dt_get_wtime() - t1);
-          }
-        }
-      }
-    }
-
     g_free(d->mask);
-    d->mask = mask;
-    d->mask_w = mw;
-    d->mask_h = mh;
+    d->mask = job->out_mask;
+    d->mask_w = job->out_w;
+    d->mask_h = job->out_h;
+    job->out_mask = NULL;   // ownership moved
   }
+  _decode_job_free(job);
+
   dt_gui_cursor_clear_busy();
 }
 
@@ -2258,7 +2332,7 @@ static int _object_events_button_released(dt_iop_module_t *module,
   gui->guipoints_count++;
   d->has_selection = TRUE;
 
-  _run_decoder(gui);
+  _launch_decode(gui);
 
   // auto-update vectorization preview after each decode
   if(d->mask)
