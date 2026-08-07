@@ -884,7 +884,7 @@ static void _update_preview(_object_data_t *d)
   d->preview_forms = ras2forms(inv_mask, d->mask_w, d->mask_h, NULL,
                                thresh,
                                d->preview_cleanup, (double)d->preview_smoothing,
-                               &d->preview_signs);
+                               0.3, &d->preview_signs);
   g_free(inv_mask);
 
   // apply feather to all path points
@@ -1043,6 +1043,10 @@ typedef struct _finalize_job_t
   char target_op[32];
   int target_multi_priority;
   gboolean has_target;
+  gboolean vectorize;   // TRUE: produce path forms instead of a raster file
+  int cleanup;          // potrace turdsize, working-grid px^2 (scaled inside)
+  float smoothing;      // potrace alphamax
+  float feather;        // border applied to the resulting path points
 } _finalize_job_t;
 
 /* Payload handed from the worker job to the GUI thread once the file is
@@ -1054,6 +1058,9 @@ typedef struct _finalize_apply_t
   char target_op[32];
   int target_multi_priority;
   gboolean has_target;
+  gboolean vectorize;
+  GList *forms;         // dt_masks_form_t*, points already input-normalized
+  GList *signs;
 } _finalize_apply_t;
 
 /* GUI thread: activate the external raster mask module on the produced file
@@ -1066,8 +1073,103 @@ static gboolean _finalize_apply_idle(gpointer data)
 
   if(!dev || dev->image_storage.id != a->imgid)
   {
-    // the darkroom moved on; the file exists, it just cannot be auto-wired
-    dt_control_log(_("precise raster mask saved (image changed, not applied)"));
+    if(a->vectorize)
+      dt_control_log(_("image changed, precise paths discarded"));
+    else
+      dt_control_log(_("precise raster mask saved (image changed, not applied)"));
+    goto out;
+  }
+
+  if(a->vectorize)
+  {
+    // wrap the native-resolution paths in a group and attach it to the
+    // target module -- mirrors _register_vectorized_forms and the classic
+    // right-click path, with coordinates already input-normalized by the job
+    if(!a->forms)
+    {
+      dt_control_log(_("no mask extracted from AI segmentation"));
+      goto out;
+    }
+
+    const char *group_prefix = _("ai object group");
+    const char *path_prefix = _("ai object");
+    guint grp_nb = 0, path_nb = 0;
+    for(GList *l = dev->forms; l; l = g_list_next(l))
+    {
+      const dt_masks_form_t *f = l->data;
+      if(strncmp(f->name, group_prefix, strlen(group_prefix)) == 0) grp_nb++;
+      if(strncmp(f->name, path_prefix, strlen(path_prefix)) == 0) path_nb++;
+    }
+    grp_nb++;
+    path_nb++;
+    for(GList *l = a->forms; l; l = g_list_next(l))
+    {
+      dt_masks_form_t *f = l->data;
+      snprintf(f->name, sizeof(f->name), "%s #%d", path_prefix, (int)path_nb++);
+    }
+
+    dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
+    snprintf(grp->name, sizeof(grp->name), "%s #%d", group_prefix, (int)grp_nb);
+
+    for(GList *l = a->forms; l; l = g_list_next(l))
+      dev->forms = g_list_append(dev->forms, l->data);
+
+    GList *sg = a->signs;
+    for(GList *l = a->forms; l; l = g_list_next(l), sg = sg ? g_list_next(sg) : NULL)
+    {
+      const int sign = sg ? GPOINTER_TO_INT(sg->data) : '+';
+      dt_masks_point_group_t *grpt = dt_masks_group_add_form(grp, l->data);
+      if(grpt && sign == '-')
+        grpt->state = (grpt->state & ~DT_MASKS_STATE_UNION) | DT_MASKS_STATE_DIFFERENCE;
+    }
+    dev->forms = g_list_append(dev->forms, grp);
+
+    // attach to the target module's blend mask group, as the classic path does
+    dt_iop_module_t *target = NULL;
+    if(a->has_target)
+      for(GList *l = dev->iop; l; l = g_list_next(l))
+      {
+        dt_iop_module_t *m = l->data;
+        if(!strcmp(m->op, a->target_op)
+           && m->multi_priority == a->target_multi_priority)
+        {
+          target = m;
+          break;
+        }
+      }
+
+    if(target && target->blend_params)
+    {
+      dt_masks_form_t *mod_grp
+        = dt_masks_get_from_id(dev, target->blend_params->mask_id);
+      if(!mod_grp)
+      {
+        mod_grp = dt_masks_create(DT_MASKS_GROUP);
+        gchar *label = dt_history_item_get_name(target);
+        snprintf(mod_grp->name, sizeof(mod_grp->name), _("group '%s'"), label);
+        g_free(label);
+        dev->forms = g_list_append(dev->forms, mod_grp);
+        target->blend_params->mask_id = mod_grp->formid;
+      }
+      dt_masks_point_group_t *grpt = dt_masks_group_add_form(mod_grp, grp);
+      if(grpt)
+        grpt->opacity = dt_conf_get_float("plugins/darkroom/masks/opacity");
+      target->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+      dt_dev_add_masks_history_item(dev, target, TRUE);
+      if(target->gui_data) dt_iop_gui_update(target);
+      dt_control_log(_("precise paths applied to %s"), target->name());
+      dt_masks_set_edit_mode(target, DT_MASKS_EDIT_FULL);
+      dt_masks_iop_update(target);
+    }
+    else
+    {
+      dt_dev_add_masks_history_item(dev, NULL, TRUE);
+      dt_control_log(_("precise paths created"));
+    }
+
+    a->forms = NULL;   // ownership moved to dev->forms
+    dt_dev_reprocess_all(dev);
+    dt_control_queue_redraw_center();
     goto out;
   }
 
@@ -1143,6 +1245,8 @@ static gboolean _finalize_apply_idle(gpointer data)
   dt_control_queue_redraw_center();
 
 out:
+  if(a->forms) g_list_free_full(a->forms, (GDestroyNotify)dt_masks_free_form);
+  g_list_free(a->signs);
   g_free(a->outpath);
   g_free(a);
   return G_SOURCE_REMOVE;
@@ -1486,6 +1590,67 @@ static int32_t _finalize_job_run(dt_job_t *job)
 
   if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) goto cleanup;
 
+  if(j->vectorize)
+  {
+    // trace the native alpha instead of writing a raster file. tolerance and
+    // cleanup are expressed in native pixels here: one traced pixel is one
+    // sensor pixel, so a ~1 px tolerance keeps the drift invisible while
+    // keeping the anchor count manageable
+    float *inv = g_try_malloc((size_t)pw * ph * sizeof(float));
+    if(!inv)
+    {
+      dt_control_log(_("precise mask: out of memory"));
+      goto cleanup;
+    }
+    for(size_t k = 0; k < (size_t)pw * ph; k++)
+      inv[k] = 1.0f - alpha_full[k];
+
+    GList *signs = NULL;
+    GList *forms = ras2forms(inv, pw, ph, NULL, 1.0f - j->threshold,
+                             MAX(2, (int)(j->cleanup * 15)),
+                             (double)j->smoothing, 1.2, &signs);
+    g_free(inv);
+
+    // normalize points straight into input space: the native grid is the
+    // post-rawprepare frame, so input coord = native coord + rawprepare crop
+    float wd_, ht_, iwidth_, iheight_;
+    (void)wd_;
+    (void)ht_;
+    iwidth_ = (float)iw;
+    iheight_ = (float)ih;
+    for(GList *l = forms; l; l = g_list_next(l))
+    {
+      dt_masks_form_t *f = l->data;
+      for(GList *p = f->points; p; p = g_list_next(p))
+      {
+        dt_masks_point_path_t *pt = p->data;
+        pt->corner[0] = (pt->corner[0] + cropx) / iwidth_;
+        pt->corner[1] = (pt->corner[1] + cropy) / iheight_;
+        pt->ctrl1[0] = (pt->ctrl1[0] + cropx) / iwidth_;
+        pt->ctrl1[1] = (pt->ctrl1[1] + cropy) / iheight_;
+        pt->ctrl2[0] = (pt->ctrl2[0] + cropx) / iwidth_;
+        pt->ctrl2[1] = (pt->ctrl2[1] + cropy) / iheight_;
+        pt->border[0] = j->feather;
+        pt->border[1] = j->feather;
+      }
+    }
+
+    _finalize_apply_t *a = g_malloc0(sizeof(_finalize_apply_t));
+    a->imgid = j->imgid;
+    a->vectorize = TRUE;
+    a->forms = forms;
+    a->signs = signs;
+    a->has_target = j->has_target;
+    memcpy(a->target_op, j->target_op, sizeof(a->target_op));
+    a->target_multi_priority = j->target_multi_priority;
+    g_idle_add(_finalize_apply_idle, a);
+    dt_print(DT_DEBUG_AI,
+             "[object mask] precise paths: %d form(s) traced at %dx%d (%.1fs)",
+             g_list_length(forms), pw, ph, dt_get_wtime() - t_start);
+    ok = TRUE;
+    goto cleanup;
+  }
+
   outpath = _build_mask_path(j->imgid);
   if(outpath && _write_mask_png16(outpath, alpha_full, pw, ph))
   {
@@ -1531,13 +1696,14 @@ cleanup:
 }
 
 /* GUI thread: snapshot the working mask and hand it to a worker job. */
-static void _launch_native_finalize(_object_data_t *d,
-                                    dt_iop_module_t *target)
+static gboolean _launch_native_finalize(_object_data_t *d,
+                                        dt_iop_module_t *target,
+                                        const gboolean vectorize)
 {
   if(!g_atomic_int_compare_and_exchange(&_finalize_running, 0, 1))
   {
     dt_control_log(_("precise mask finalisation already running"));
-    return;
+    return FALSE;
   }
 
   // the job re-reads the history from the database; unflushed edits
@@ -1554,7 +1720,7 @@ static void _launch_native_finalize(_object_data_t *d,
   {
     dt_control_log(_("empty mask, nothing to finalise"));
     g_atomic_int_set(&_finalize_running, 0);
-    return;
+    return FALSE;
   }
 
   _finalize_job_t *j = g_malloc0(sizeof(_finalize_job_t));
@@ -1569,6 +1735,10 @@ static void _launch_native_finalize(_object_data_t *d,
   j->bw = CLAMP((int)br.x - j->bx + 1, 1, d->mask_w - j->bx);
   j->bh = CLAMP((int)br.y - j->by + 1, 1, d->mask_h - j->by);
   j->threshold = thresh;
+  j->vectorize = vectorize;
+  j->cleanup = d->preview_cleanup;
+  j->smoothing = d->preview_smoothing;
+  j->feather = d->preview_feather;
   if(target)
   {
     g_strlcpy(j->target_op, target->op, sizeof(j->target_op));
@@ -1577,17 +1747,19 @@ static void _launch_native_finalize(_object_data_t *d,
   }
 
   dt_job_t *job = dt_control_job_create(_finalize_job_run,
-                                        "precise raster mask");
+                                        "precise mask finalisation");
   if(!job)
   {
     _finalize_job_destroy(j);
     g_atomic_int_set(&_finalize_running, 0);
-    return;
+    return FALSE;
   }
   dt_control_job_set_params(job, j, _finalize_job_destroy);
-  dt_control_job_add_progress(job, _("precise raster mask"), TRUE);
+  dt_control_job_add_progress(job, _("precise mask finalisation"), TRUE);
   dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
-  dt_control_log(_("computing precise raster mask..."));
+  dt_control_log(vectorize ? _("computing precise paths...")
+                           : _("computing precise raster mask..."));
+  return TRUE;
 }
 
 // transform mask-space forms to input-normalized coords and register them,
@@ -1771,7 +1943,7 @@ static dt_masks_form_t *_finalize_mask(dt_iop_module_t *module,
                                     0.3f, 0.9f);
   GList *signs = NULL;
   GList *forms = ras2forms(inv_mask, d->mask_w, d->mask_h, NULL,
-                           thresh, cleanup, (double)smoothing, &signs);
+                           thresh, cleanup, (double)smoothing, 0.3, &signs);
   g_free(inv_mask);
 
   return _register_vectorized_forms(module, forms, signs, d->mask_w, d->mask_h);
@@ -1925,7 +2097,8 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
     if(d && d->has_selection && d->mask
        && dt_modifier_is(state, GDK_SHIFT_MASK))
     {
-      _launch_native_finalize(d, module);
+      if(!_launch_native_finalize(d, module, FALSE))
+        return 1;   // busy: keep the session, the user can retry
 
       // leave creation mode right away: the mask will be wired into the
       // module automatically when the job lands, there is nothing left to
@@ -1945,7 +2118,29 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
       return 1;
     }
 
-    // right-click: finalize mask (prefer cached preview forms)
+    // right-click: precise paths -- same native finalisation as the raster
+    // gesture, traced by potrace at 1:1 instead of written to a file. falls
+    // back to the classic working-grid vectorisation when the job is busy
+    // or when there is no refined mask to work from
+    if(d && d->has_selection && d->mask
+       && _launch_native_finalize(d, module, TRUE))
+    {
+      gui->creation = FALSE;
+      gui->creation_continuous = FALSE;
+      gui->creation_continuous_module = NULL;
+      _free_data(gui);
+      dt_masks_dynbuf_free(gui->guipoints);
+      dt_masks_dynbuf_free(gui->guipoints_payload);
+      gui->guipoints = NULL;
+      gui->guipoints_payload = NULL;
+      gui->guipoints_count = 0;
+      dt_control_hinter_message("");
+      dt_masks_change_form_gui(NULL);
+      dt_control_queue_redraw_center();
+      return 1;
+    }
+
+    // classic fallback: vectorize the working-grid mask immediately
     dt_masks_form_t *new_grp = NULL;
     if(d && d->preview_forms)
       new_grp = _finalize_from_preview(module, gui);

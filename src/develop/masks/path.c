@@ -2657,7 +2657,7 @@ static GList *_path_revectorize(float *morphed,
   // holes. A hole can have more nodes than the outer contour, so select on the
   // sign first and only use node count as a tie-breaker among outer boundaries.
   GList *signs = NULL;
-  GList *new_forms = ras2forms(morphed, rw, rh, NULL, 0.5f, 2, alphamax, &signs);
+  GList *new_forms = ras2forms(morphed, rw, rh, NULL, 0.5f, 2, alphamax, 0.3, &signs);
 
   dt_masks_form_t *best = NULL;
   int best_n = 0;

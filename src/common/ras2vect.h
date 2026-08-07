@@ -39,6 +39,7 @@ GList *ras2forms(const float *mask,
                  const float threshold,
                  const int turdsize,
                  const double alphamax,
+                 const double opttolerance,
                  GList **out_signs);
 
 // clang-format off

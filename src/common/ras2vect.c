@@ -142,6 +142,7 @@ GList *ras2forms(const float *mask,
                  const float threshold,
                  const int turdsize,
                  const double alphamax,
+                 const double opttolerance,
                  GList **out_signs)
 {
   GList *forms = NULL;
@@ -178,11 +179,10 @@ GList *ras2forms(const float *mask,
   param->alphamax = alphamax;
   param->turnpolicy = POTRACE_TURNPOLICY_MINORITY;
   param->opticurve = 1;
-  // curve simplification tolerance, in mask pixels: 0.8 allowed the traced
-  // path to drift by ~3 native pixels from the mask it vectorises, which
-  // defeats any upstream refinement. 0.3 keeps the drift close to a single
-  // native pixel at the cost of somewhat more anchor points
-  param->opttolerance = 0.3;
+  // curve simplification tolerance, in pixels of the traced grid. the
+  // caller chooses: tight (~0.3) on a coarse working grid, looser on a
+  // native-resolution mask where one pixel is one sensor pixel
+  param->opttolerance = opttolerance;
 
   potrace_state_t *st = potrace_trace(param, bm);
 

@@ -168,7 +168,7 @@ static void _vectorize_button_clicked(GtkWidget *widget,
 
   const dt_image_t *const image = &(self->dev->image_storage);
   GList *forms = ras2forms(cd->mask, cd->width, cd->height, image,
-                           SET_THRESHOLD, 0, 0.0, NULL);
+                           SET_THRESHOLD, 0, 0.0, 0.3, NULL);
 
   dt_pthread_mutex_unlock(&cd->lock);
 
