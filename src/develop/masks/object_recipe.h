@@ -102,6 +102,14 @@ gboolean dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
 gboolean dt_object_recipe_recompute_now(const dt_rf_recipe_t *recipe,
                                         const dt_imgid_t imgid);
 
+// rewrite a recipe's recorded models to the ones installed NOW -- the
+// user-consented way out when the recorded model is gone and the pinned
+// replay rightly refuses. changing the blob changes the fingerprint, so
+// the redone mask lives under a NEW name and never corrupts the content-
+// addressed store; the caller persists the rebound recipe in the module's
+// params before scheduling. FALSE when no active model can stand in
+gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe);
+
 #else
 
 // without AI support a recipe can never be recomputed on this machine; the
@@ -134,6 +142,12 @@ dt_object_recipe_recompute_now(const dt_rf_recipe_t *recipe,
 {
   (void)recipe;
   (void)imgid;
+  return FALSE;
+}
+
+static inline gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe)
+{
+  (void)recipe;
   return FALSE;
 }
 

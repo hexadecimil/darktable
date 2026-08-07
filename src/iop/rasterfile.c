@@ -148,6 +148,7 @@ typedef struct dt_iop_rasterfile_gui_data_t
   GtkWidget *fbutton;
   GtkWidget *file;
   GtkWidget *vectorize;
+  GtkWidget *recompute;
 } dt_iop_rasterfile_gui_data_t;
 
 int legacy_params(dt_iop_module_t *self,
@@ -472,6 +473,34 @@ static void _fbutton_clicked(GtkWidget *widget, dt_iop_module_t *self)
   }
   g_free(mfolder);
   g_object_unref(filechooser);
+}
+
+// redo the mask from its recipe with the models installed NOW. this is the
+// user-consented escape when the recorded model is gone and the pinned
+// replay rightly refuses to run: the recipe is rebound to the active
+// models and persisted FIRST -- its fingerprint changes, so the redone
+// mask lives under a new name and resolution follows automatically
+static void _recompute_clicked(GtkWidget *widget, dt_iop_module_t *self)
+{
+  dt_iop_rasterfile_params_t *p = self->params;
+  if(!dt_rf_recipe_valid(&p->recipe) || !self->dev)
+    return;
+
+  dt_rf_recipe_t rebound = p->recipe;
+  if(!dt_object_recipe_rebind_models(&rebound))
+  {
+    dt_control_log(_("no AI model available to recompute this mask"));
+    return;
+  }
+
+  if(memcmp(&rebound, &p->recipe, sizeof(rebound)) != 0)
+  {
+    p->recipe = rebound;
+    dt_dev_add_history_item(darktable.develop, self, TRUE);
+  }
+  if(dt_object_recipe_schedule_recompute(&p->recipe,
+                                         self->dev->image_storage.id))
+    dt_control_log(_("recomputing the mask with the current model..."));
 }
 
 static void _file_callback(GtkWidget *widget, dt_iop_module_t *self)
@@ -808,6 +837,7 @@ void gui_changed(dt_iop_module_t *self,
   }
 
   gtk_widget_set_sensitive(g->vectorize, p->path[0] && p->file[0]);
+  gtk_widget_set_sensitive(g->recompute, dt_rf_recipe_valid(&p->recipe));
 }
 
 void gui_update(dt_iop_module_t *self)
@@ -901,9 +931,21 @@ void gui_init(dt_iop_module_t *self)
   g_signal_connect(g->vectorize, "clicked",
                    G_CALLBACK(_vectorize_button_clicked), self);
 
+  // only meaningful for AI masks carrying a provenance recipe
+  g->recompute = gtk_button_new_with_label(_("recompute mask"));
+  gtk_widget_set_tooltip_text
+    (g->recompute,
+     _("regenerate this AI mask from its recorded recipe using the"
+       " currently installed models.\nuse this when the mask file is"
+       " missing and the model it was made with has been updated or"
+       " removed: the mask is redone with the current model instead"));
+  g_signal_connect(g->recompute, "clicked",
+                   G_CALLBACK(_recompute_clicked), self);
+
   dt_gui_box_add(self->widget,
                  dt_gui_hbox(g->fbutton, dt_gui_expand(g->file)),
-                 g->vectorize);
+                 g->vectorize,
+                 g->recompute);
 }
 
 #undef RASTERFILE_MAXFILE

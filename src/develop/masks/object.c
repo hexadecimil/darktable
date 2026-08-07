@@ -3191,6 +3191,14 @@ static int32_t _recompute_job_run(dt_job_t *job)
                                        _finalize_keep_going, job);
   if(p->status == DT_OBJECT_RECIPE_OK && dt_control_running())
     g_idle_add(_recompute_landed_idle, GINT_TO_POINTER(p->imgid));
+  else if(p->status == DT_OBJECT_RECIPE_FAILED && dt_control_running())
+    // the mask stays zeroed and the user needs to know why, and the way
+    // out: the raster module's recompute button rebinds the recipe to the
+    // models installed NOW
+    dt_control_log(_("AI mask not regenerated: its recorded model is"
+                     " missing or changed.\nuse 'recompute mask' in the"
+                     " raster masks module to redo it with the current"
+                     " model"));
   return p->status == DT_OBJECT_RECIPE_OK ? 0 : 1;
 }
 
@@ -3239,6 +3247,49 @@ gboolean dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
   dt_control_job_set_params(job, p, _recompute_job_destroy);
   dt_control_job_add_progress(job, _("recomputing AI mask"), TRUE);
   dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
+  return TRUE;
+}
+
+gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe)
+{
+  if(!dt_rf_recipe_valid(recipe))
+    return FALSE;
+
+  char *seg_id = dt_ai_models_get_active_for_task("mask");
+  if(!seg_id || !*seg_id)
+  {
+    g_free(seg_id);
+    return FALSE;
+  }
+  memset(recipe->seg_model, 0, sizeof(recipe->seg_model));
+  memset(recipe->seg_model_version, 0, sizeof(recipe->seg_model_version));
+  g_strlcpy(recipe->seg_model, seg_id, sizeof(recipe->seg_model));
+  const char *seg_ver = dt_ai_model_get_version(seg_id);
+  if(seg_ver)
+    g_strlcpy(recipe->seg_model_version, seg_ver,
+              sizeof(recipe->seg_model_version));
+  g_free(seg_id);
+
+  if(recipe->ai_refine)
+  {
+    char *refine_id = dt_ai_models_get_active_for_task("refine");
+    if(!refine_id || !*refine_id)
+    {
+      // the recipe promises contour refinement and no refine model is
+      // active: rebinding would drop a recorded processing step
+      g_free(refine_id);
+      return FALSE;
+    }
+    memset(recipe->refine_model, 0, sizeof(recipe->refine_model));
+    memset(recipe->refine_model_version, 0,
+           sizeof(recipe->refine_model_version));
+    g_strlcpy(recipe->refine_model, refine_id, sizeof(recipe->refine_model));
+    const char *refine_ver = dt_ai_model_get_version(refine_id);
+    if(refine_ver)
+      g_strlcpy(recipe->refine_model_version, refine_ver,
+                sizeof(recipe->refine_model_version));
+    g_free(refine_id);
+  }
   return TRUE;
 }
 
@@ -3757,6 +3808,19 @@ static int _object_events_button_released(dt_iop_module_t *module,
                                                   "object guipoints_payload");
   if(!gui->guipoints_payload)
     return 1;
+
+  // the provenance recipe describes at most DT_RF_RECIPE_MAX_POINTS clicks;
+  // one more and the session could never be regenerated from its recipe.
+  // refuse the point outright -- a hard, explained limit beats a mask that
+  // silently lost its provenance (and 32 prompts is far beyond any real
+  // refinement session; ctrl+shift+click restarts from zero)
+  if(gui->guipoints_count >= DT_RF_RECIPE_MAX_POINTS)
+  {
+    dt_control_log(_("maximum of %d points reached, "
+                     "ctrl+shift+click to start over"),
+                   DT_RF_RECIPE_MAX_POINTS);
+    return 1;
+  }
 
   // click: foreground point, shift+click: background point (only
   // after first selection)
