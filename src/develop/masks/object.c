@@ -50,6 +50,7 @@ typedef struct dt_iop_rasterfile_params_t
 #include "develop/blend.h"
 #include "develop/imageop.h"
 #include "develop/masks.h"
+#include "develop/masks/object_recipe.h"
 #include "develop/openmp_maths.h"
 #include "develop/pixelpipe_hb.h"
 #include "gui/gtk.h"
@@ -146,6 +147,18 @@ typedef struct _object_data_t
   gboolean decode_busy_shown;       // GUI thread only: busy_enter needs a leave
   GArray *decode_marks;             // GUI thread only: one _decode_mark_t per
                                     // accumulated click, provenance recording
+  // provenance: scalars of the last launched decode. the mask the
+  // finalisation captures is the one that decode computed, so the recipe
+  // must record these values, not the conf/preview state at capture time
+  // (a toggle after the last decode would otherwise poison the recipe).
+  // threshold stays per-boundary in decode_marks
+  gboolean last_do_crf;
+  int last_crf_iter;
+  float last_crf_sigma_color;
+  float last_crf_w_bilateral;
+  gboolean last_do_refine;
+  float last_refine_margin;
+  int last_n_passes;
 } _object_data_t;
 
 // clicks can outpace the compute (coalescing), so N points do not mean N
@@ -324,6 +337,58 @@ typedef struct _encode_thread_data_t
   dt_hash_t distort_hash;  // hash from live darkroom state (for disk cache key)
 } _encode_thread_data_t;
 
+// convert the float RGBA backbuf of a processed export pipe to the uint8
+// RGB layout the segmentation encoder expects. NULL when the render failed
+// or on allocation failure. shared by the interactive encode thread and
+// the headless recipe replay
+static uint8_t *_backbuf_to_rgb8(const dt_dev_pixelpipe_t *pipe,
+                                 const int w,
+                                 const int h)
+{
+  if(!pipe->backbuf)
+    return NULL;
+  const float *outbuf = (const float *)pipe->backbuf;
+  uint8_t *rgb = g_try_malloc((size_t)w * h * 3);
+  if(!rgb)
+    return NULL;
+  for(size_t i = 0; i < (size_t)w * h; i++)
+  {
+    rgb[i * 3 + 0] = (uint8_t)CLAMP(outbuf[i * 4 + 0] * 255.0f + 0.5f, 0, 255);
+    rgb[i * 3 + 1] = (uint8_t)CLAMP(outbuf[i * 4 + 1] * 255.0f + 0.5f, 0, 255);
+    rgb[i * 3 + 2] = (uint8_t)CLAMP(outbuf[i * 4 + 2] * 255.0f + 0.5f, 0, 255);
+  }
+  return rgb;
+}
+
+// encode `rgb` with `*seg`, falling back to a CPU-provider reload of the
+// model on failure. `model_id` names the model to reload; NULL reloads the
+// active "mask" model (fetched lazily, only when the fallback triggers).
+// on a failed reload *seg is NULL on return. shared by the interactive
+// encode thread and the headless recipe replay -- keep both callers'
+// behaviour identical when touching this
+static gboolean _seg_encode_cpu_fallback(dt_seg_context_t **seg,
+                                         dt_ai_environment_t *env,
+                                         const char *model_id,
+                                         const uint8_t *rgb,
+                                         const int w,
+                                         const int h)
+{
+  gboolean ok = dt_seg_encode_image(*seg, rgb, w, h);
+  if(!ok)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] encoding failed, retrying with CPU provider");
+    dt_seg_free(*seg);
+    dt_ai_env_set_provider(env, DT_AI_PROVIDER_CPU);
+    char *active = model_id ? NULL : dt_ai_models_get_active_for_task("mask");
+    *seg = dt_seg_load(env, model_id ? model_id : active);
+    g_free(active);
+    if(*seg)
+      ok = dt_seg_encode_image(*seg, rgb, w, h);
+  }
+  return ok;
+}
+
 // background thread: loads model, renders image via export pipe, and encodes,
 // does ZERO GLib/GTK calls - only computation + atomic state set,
 // the poll timer on the main thread detects completion
@@ -434,21 +499,7 @@ static gpointer _encode_thread_func(gpointer data)
   dt_dev_pixelpipe_process_no_gamma(&pipe, &dev, 0, 0, out_w, out_h, final_scale);
 
   // backbuf is float RGBA after process_no_gamma, convert to uint8 RGB for SAM
-  uint8_t *rgb = NULL;
-  if(pipe.backbuf)
-  {
-    const float *outbuf = (const float *)pipe.backbuf;
-    rgb = g_try_malloc((size_t)out_w * out_h * 3);
-    if(rgb)
-    {
-      for(size_t i = 0; i < (size_t)out_w * out_h; i++)
-      {
-        rgb[i * 3 + 0] = (uint8_t)CLAMP(outbuf[i * 4 + 0] * 255.0f + 0.5f, 0, 255);
-        rgb[i * 3 + 1] = (uint8_t)CLAMP(outbuf[i * 4 + 1] * 255.0f + 0.5f, 0, 255);
-        rgb[i * 3 + 2] = (uint8_t)CLAMP(outbuf[i * 4 + 2] * 255.0f + 0.5f, 0, 255);
-      }
-    }
-  }
+  uint8_t *rgb = _backbuf_to_rgb8(&pipe, out_w, out_h);
 
   dt_dev_pixelpipe_cleanup(&pipe);
   dt_mipmap_cache_release(&buf);
@@ -465,25 +516,11 @@ static gpointer _encode_thread_func(gpointer data)
   d->encode_w = out_w;
   d->encode_h = out_h;
 
-  // encode the image
-  gboolean ok = dt_seg_encode_image(d->seg, rgb, out_w, out_h);
-
-  // if accelerated encoding failed, fall back to CPU
-  if(!ok)
-  {
-    dt_print(DT_DEBUG_AI,
-             "[object mask] encoding failed, retrying with CPU provider");
-    dt_seg_free(d->seg);
-    dt_ai_env_set_provider(d->env, DT_AI_PROVIDER_CPU);
-    char *model_id = dt_ai_models_get_active_for_task("mask");
-    d->seg = dt_seg_load(d->env, model_id);
-    g_free(model_id);
-
-    if(d->seg)
-      ok = dt_seg_encode_image(d->seg, rgb, out_w, out_h);
-    else
-      d->model_loaded = FALSE;
-  }
+  // encode the image, falling back to CPU when acceleration fails
+  const gboolean ok
+    = _seg_encode_cpu_fallback(&d->seg, d->env, NULL, rgb, out_w, out_h);
+  if(!d->seg)
+    d->model_loaded = FALSE;
 
   // dt_seg_encode_image keeps its own copy of rgb for edge refinement
   if(ok)
@@ -990,6 +1027,19 @@ static void _launch_decode(dt_masks_form_gui_t *gui)
   d->decode_pending = FALSE;
   d->decode_launched_count = gui->guipoints_count;
 
+  // provenance: scalars of the last launched decode. the mask a later
+  // finalisation captures is the one THIS job computes; the conf and the
+  // preview toggles may move before the capture, so the recipe must read
+  // these snapshots, never the live state (threshold is recorded
+  // per-boundary through the mark below)
+  d->last_do_crf = job->do_crf;
+  d->last_crf_iter = job->crf_iter;
+  d->last_crf_sigma_color = job->crf_sigma_color;
+  d->last_crf_w_bilateral = job->crf_w_bilateral;
+  d->last_do_refine = job->do_refine;
+  d->last_refine_margin = job->refine_margin;
+  d->last_n_passes = job->n_passes;
+
   // provenance: this decode's boundary is the last point it covers
   _marks_resize(d, gui->guipoints_count);
   _decode_mark_t *mark = &g_array_index(d->decode_marks, _decode_mark_t,
@@ -1073,6 +1123,19 @@ static void _decode_finish(dt_masks_form_gui_t *gui, const gboolean publish)
   }
   _decode_job_t *job = d->decode_job;
   d->decode_job = NULL;
+
+  // a failed decode never produced a boundary: retract the provenance mark
+  // posted optimistically at launch, or a later capture would record a
+  // decode the session never completed and the replay would diverge
+  if(st == DECODE_ERROR && d->decode_marks
+     && d->decode_launched_count > 0
+     && d->decode_launched_count <= (int)d->decode_marks->len)
+  {
+    _decode_mark_t *mark = &g_array_index(d->decode_marks, _decode_mark_t,
+                                          d->decode_launched_count - 1);
+    mark->launched = FALSE;
+    mark->threshold = 0.0f;
+  }
 
   gboolean published = FALSE;
   if(publish && st == DECODE_READY && job && job->out_mask)
@@ -1220,6 +1283,64 @@ static gboolean _write_mask_png16(const char *path,
   return TRUE;
 }
 
+// cheap validation of an existing mask file: non-empty and carrying the
+// PNG signature. a zero-byte or truncated file under a content-addressed
+// name would otherwise be trusted forever ("exists = success") and the
+// broken mask could never self-repair
+static gboolean _mask_png_valid(const char *path)
+{
+  GStatBuf st;
+  if(g_stat(path, &st) != 0 || st.st_size <= 0)
+    return FALSE;
+  FILE *f = g_fopen(path, "rb");
+  if(!f)
+    return FALSE;
+  guchar sig[8] = { 0 };
+  const size_t got = fread(sig, 1, sizeof(sig), f);
+  fclose(f);
+  return got == sizeof(sig) && png_sig_cmp(sig, 0, sizeof(sig)) == 0;
+}
+
+// content-addressed write: to a temp name unique to this writer, then an
+// atomic move. an existing valid file under the same fingerprint was made
+// from the same recipe -- it already is this content, keep it; an invalid
+// one (truncated by a crash, zero bytes) is replaced. the unique temp name
+// matters: the interactive finalisation and a headless replay of the same
+// fingerprint, or two instances sharing the mask root, must never
+// interleave writes into the same temp file. shared by the finalisation
+// job and the headless recipe replay
+static gboolean _write_mask_png16_atomic(const char *outpath,
+                                         const float *const restrict mask,
+                                         const int w,
+                                         const int h)
+{
+  gchar *tmp = g_strdup_printf("%s.%d-%p.tmp", outpath,
+                               (int)getpid(), (void *)g_thread_self());
+  gboolean written = _write_mask_png16(tmp, mask, w, h);
+  if(written)
+  {
+    if(_mask_png_valid(outpath))
+      g_unlink(tmp);
+    else
+    {
+      // no-op when the target does not exist; drops an invalid leftover
+      g_unlink(outpath);
+      if(g_rename(tmp, outpath) != 0)
+      {
+        g_unlink(tmp);
+        // a concurrent writer of the same fingerprint may have won the
+        // rename race: the file now under the target name is the same
+        // content by construction, that still is a success
+        written = g_file_test(outpath, G_FILE_TEST_EXISTS);
+      }
+    }
+  }
+  else
+    g_unlink(tmp);
+  g_free(tmp);
+  return written;
+}
+
 
 /* Build a unique output path <def_path>/<image>_mask[_N].png. NULL on error.
  * May be called from a worker job: dt_control_log is thread-safe. */
@@ -1343,9 +1464,12 @@ static gboolean _capture_recipe(_object_data_t *d,
                 sizeof(recipe->seg_model_version));
   }
 
-  recipe->ai_refine
-    = (dt_conf_get_bool(CONF_OBJECT_AI_REFINE_KEY) && !d->refine_failed)
-      ? 1 : 0;
+  // the mask being finalised was computed by the LAST launched decode:
+  // record that job's scalars, not the live conf/preview state -- a toggle
+  // flipped after the last decode never reached the mask. refine_failed
+  // still absorbs a load failure: the decode then ran without refinement,
+  // so ai_refine=0 is exact
+  recipe->ai_refine = (d->last_do_refine && !d->refine_failed) ? 1 : 0;
   if(recipe->ai_refine)
   {
     char *refine_id = dt_ai_models_get_active_for_task("refine");
@@ -1366,21 +1490,17 @@ static gboolean _capture_recipe(_object_data_t *d,
   recipe->render_size = dt_conf_key_exists(CONF_OBJECT_RENDER_SIZE_KEY)
     ? dt_conf_get_int(CONF_OBJECT_RENDER_SIZE_KEY)
     : SEG_RENDER_DEFAULT;
-  recipe->refine_passes
-    = CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_PASSES_KEY), 1, 3);
+  recipe->refine_passes = CLAMP(d->last_n_passes, 1, 3);
+  // the final threshold is genuinely a finalisation-time input (the native
+  // pass and its bbox read the conf at the right click), so the conf read
+  // is the correct capture here -- unlike the per-decode scalars above
   recipe->threshold
     = CLAMP(dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY), 0.3f, 0.9f);
-  recipe->crf_enabled = d->preview_refine ? 1 : 0;
-  recipe->crf_iterations
-    = CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_BOUNDARY_ITER_KEY), 1, 10);
-  recipe->crf_sigma_color
-    = CLAMP(dt_conf_get_float(CONF_OBJECT_REFINE_BOUNDARY_SIGMA_COLOR_KEY),
-            1.0f, 50.0f);
-  recipe->crf_w_bilateral
-    = CLAMP(dt_conf_get_float(CONF_OBJECT_REFINE_BOUNDARY_W_BILATERAL_KEY),
-            0.5f, 30.0f);
-  recipe->ai_refine_margin
-    = CLAMPF(dt_conf_get_float(CONF_OBJECT_AI_REFINE_MARGIN_KEY), 0.0f, 0.5f);
+  recipe->crf_enabled = d->last_do_crf ? 1 : 0;
+  recipe->crf_iterations = d->last_crf_iter;
+  recipe->crf_sigma_color = d->last_crf_sigma_color;
+  recipe->crf_w_bilateral = d->last_crf_w_bilateral;
+  recipe->ai_refine_margin = d->last_refine_margin;
   recipe->cleanup = d->preview_cleanup;
   recipe->smoothing = d->preview_smoothing;
   recipe->feather = d->preview_feather;
@@ -1735,35 +1855,51 @@ static gboolean _finalize_keep_going(void *p)
   return dt_control_job_get_state((dt_job_t *)p) != DT_JOB_STATE_CANCELLED;
 }
 
-static int32_t _finalize_job_run(dt_job_t *job)
+// request of the native render core below, grouped so the two call sites
+// name every field instead of threading fifteen positional arguments (an
+// inverted bbox would compile without a sound)
+typedef struct _finalize_render_req_t
 {
-  _finalize_job_t *const j = dt_control_job_get_params(job);
+  const float *hint;    // working-grid mask the finalisation works from
+  int hint_w, hint_h;
+  int bx, by, bw, bh;   // subject bounding box on the hint grid
+  float threshold;
+  int render_target;    // encode-render size cap the hint was made under
+  gboolean interactive; // FALSE suppresses every dt_control_log
+} _finalize_render_req_t;
+
+// the shared render core of the native finalisation: from a working-grid
+// hint (and its subject bbox) to the alpha plane of the full
+// post-rawprepare frame. renders the bbox at scale 1.0 through an export
+// pipe on the ALREADY LOADED dev, re-runs the refinement network tiled at
+// native scale, re-derives sub-pixel coverage with a guided filter inside
+// a band around the contour, and maps the result back through the
+// geometry chain. shared by the interactive finalisation job and the
+// headless recipe replay: req->interactive=FALSE suppresses every
+// dt_control_log (the replay may run outside any GUI). req->render_target
+// is the encode-render size cap the hint was made under, used to recover
+// the exact hint->native scale factor; keep_going (nullable) is polled at
+// the expensive steps. returns the (*out_pw x *out_ph) alpha plane, freed
+// by the caller with g_free, or NULL on failure/cancellation
+static float *_finalize_render_alpha(dt_develop_t *dev,
+                                     const _finalize_render_req_t *req,
+                                     gboolean (*keep_going)(void *),
+                                     void *user,
+                                     int *out_pw,
+                                     int *out_ph)
+{
+  const float *const hint = req->hint;
+  const int hint_w = req->hint_w, hint_h = req->hint_h;
+  const int bx = req->bx, by = req->by, bw = req->bw, bh = req->bh;
+  const float threshold = req->threshold;
+  const int render_target = req->render_target;
+  const gboolean interactive = req->interactive;
   gboolean ok = FALSE;
   float *hint_soft = NULL, *hint_bin = NULL, *alpha_gf = NULL;
   float *alpha_full = NULL, *grid = NULL;
   double *sat = NULL;
-  gchar *outpath = NULL;
   gboolean pipe_ready = FALSE;
   int rx = 0, ry = 0, gw = 0, gh = 0;
-
-  const double t_start = dt_get_wtime();
-
-  dt_develop_t dev;
-  dt_dev_init(&dev, FALSE);
-  dt_dev_load_image(&dev, j->imgid);
-  if(j->history_end > 0 && j->history_end > dev.history_end)
-    dev.history_end = j->history_end;
-
-  // the hint only matches a render made on the exact distortion state it
-  // was computed on; the history can have moved while this job waited in
-  // the queue, and a mismatched render would be silently misaligned
-  if(_compute_distort_hash(&dev) != j->distort_hash)
-  {
-    dt_control_log(_("image geometry changed, precise mask cancelled"));
-    dt_dev_cleanup(&dev);
-    g_atomic_int_set(&_finalize_running, 0);
-    return 1;
-  }
 
   // pipe-input dimensions (sensor incl. borders) and the post-rawprepare
   // frame. the external raster mask module sits after rawprepare (iop order
@@ -1771,41 +1907,48 @@ static int32_t _finalize_job_run(dt_job_t *job)
   // that is the space the file must be written in; rawprepare's crop offset
   // is added back when entering the full forward transform, which includes
   // rawprepare's own distort_transform.
-  const int iw = dev.image_storage.width;
-  const int ih = dev.image_storage.height;
-  const int pw = dev.image_storage.p_width > 0 ? dev.image_storage.p_width : iw;
-  const int ph = dev.image_storage.p_height > 0 ? dev.image_storage.p_height : ih;
+  const int iw = dev->image_storage.width;
+  const int ih = dev->image_storage.height;
+  const int pw = dev->image_storage.p_width > 0 ? dev->image_storage.p_width : iw;
+  const int ph = dev->image_storage.p_height > 0 ? dev->image_storage.p_height : ih;
+  *out_pw = pw;
+  *out_ph = ph;
   // rawprepare's default sensor crop, from the image metadata. a hand-edited
   // rawprepare margin is not reflected here -- accepted limitation: the
   // raster file module reads its file against the same metadata geometry,
   // so both sides drift together for that (rare) case
-  const int cropx = dev.image_storage.crop_x;
-  const int cropy = dev.image_storage.crop_y;
+  const int cropx = dev->image_storage.crop_x;
+  const int cropy = dev->image_storage.crop_y;
 
   dt_dev_pixelpipe_t pipe;
   dt_mipmap_buffer_t buf;
-  dt_mipmap_cache_get(&buf, j->imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
+  dt_mipmap_cache_get(&buf, dev->image_storage.id, DT_MIPMAP_FULL,
+                      DT_MIPMAP_BLOCKING, 'r');
   if(!buf.buf || !buf.width || !buf.height)
   {
-    dt_control_log(_("precise mask: cannot get the image buffer"));
+    dt_print(DT_DEBUG_AI, "[object mask] finalise: cannot get the image buffer");
+    if(interactive)
+      dt_control_log(_("precise mask: cannot get the image buffer"));
     goto cleanup;
   }
 
   if(!dt_dev_pixelpipe_init_export(&pipe, iw, ih, IMAGEIO_RGB | IMAGEIO_INT8,
                                    FALSE))
   {
-    dt_control_log(_("precise mask: cannot init the render pipe"));
+    dt_print(DT_DEBUG_AI, "[object mask] finalise: cannot init the render pipe");
+    if(interactive)
+      dt_control_log(_("precise mask: cannot init the render pipe"));
     goto cleanup;
   }
   pipe_ready = TRUE;
 
   dt_dev_pixelpipe_set_icc(&pipe, DT_COLORSPACE_SRGB, NULL,
                            DT_INTENT_PERCEPTUAL);
-  dt_dev_pixelpipe_set_input(&pipe, &dev, (float *)buf.buf,
+  dt_dev_pixelpipe_set_input(&pipe, dev, (float *)buf.buf,
                              buf.width, buf.height, buf.iscale);
-  dt_dev_pixelpipe_create_nodes(&pipe, &dev);
-  dt_dev_pixelpipe_synch_all(&pipe, &dev);
-  dt_dev_pixelpipe_get_dimensions(&pipe, &dev, pipe.iwidth, pipe.iheight,
+  dt_dev_pixelpipe_create_nodes(&pipe, dev);
+  dt_dev_pixelpipe_synch_all(&pipe, dev);
+  dt_dev_pixelpipe_get_dimensions(&pipe, dev, pipe.iwidth, pipe.iheight,
                                   &pipe.processed_width,
                                   &pipe.processed_height);
 
@@ -1815,26 +1958,24 @@ static int32_t _finalize_job_run(dt_job_t *job)
     // it from the truncated integer sizes would introduce an anisotropic
     // drift of several native pixels at the far corner. recompute final_scale
     // with the same formula as _encode_thread_func.
-    const int render_target = dt_conf_key_exists(CONF_OBJECT_RENDER_SIZE_KEY)
-      ? MAX(dt_conf_get_int(CONF_OBJECT_RENDER_SIZE_KEY), 1024)
-      : SEG_RENDER_DEFAULT;
     const double e_scale
       = fmin((double)render_target / (double)pipe.processed_width,
              (double)render_target / (double)pipe.processed_height);
     const double final_scale = fmin(e_scale, 1.0);
     double fx = 1.0 / final_scale;
     double fy = fx;
-    // the render-size setting may have changed since the mask was encoded;
-    // fall back to the integer ratio when the grids do not match
-    if((int)(final_scale * pipe.processed_width) != j->hint_w
-       || (int)(final_scale * pipe.processed_height) != j->hint_h)
+    // the render-size setting may have changed since the mask was encoded
+    // (or, on a replay, the recorded dims may come from a reused .seg
+    // cache); fall back to the integer ratio when the grids do not match
+    if((int)(final_scale * pipe.processed_width) != hint_w
+       || (int)(final_scale * pipe.processed_height) != hint_h)
     {
       dt_print(DT_DEBUG_AI,
                "[object mask] finalise: hint grid %dx%d does not match "
                "current render scale, falling back to integer ratios",
-               j->hint_w, j->hint_h);
-      fx = (double)pipe.processed_width / (double)j->hint_w;
-      fy = (double)pipe.processed_height / (double)j->hint_h;
+               hint_w, hint_h);
+      fx = (double)pipe.processed_width / (double)hint_w;
+      fy = (double)pipe.processed_height / (double)hint_h;
     }
 
     // the hint carries several native pixels of position error (one working
@@ -1843,10 +1984,10 @@ static int32_t _finalize_job_run(dt_job_t *job)
     const int R = MAX(8, (int)ceil(2.5 * fx));
     const int w_gf = MAX(4, R / 2);
 
-    rx = (int)floor(j->bx * fx) - R;
-    ry = (int)floor(j->by * fy) - R;
-    int rw = (int)ceil((j->bx + j->bw) * fx) + R - rx;
-    int rh = (int)ceil((j->by + j->bh) * fy) + R - ry;
+    rx = (int)floor(bx * fx) - R;
+    ry = (int)floor(by * fy) - R;
+    int rw = (int)ceil((bx + bw) * fx) + R - rx;
+    int rh = (int)ceil((by + bh) * fy) + R - ry;
     rx = CLAMP(rx, 0, pipe.processed_width - 8);
     ry = CLAMP(ry, 0, pipe.processed_height - 8);
     rw = CLAMP(rw, 8, pipe.processed_width - rx);
@@ -1860,9 +2001,9 @@ static int32_t _finalize_job_run(dt_job_t *job)
 
     // only the region goes through the pipe: demosaic's modify_roi_in
     // restricts the sensor read to what the ROI needs
-    dt_dev_pixelpipe_process_no_gamma(&pipe, &dev, rx, ry, rw, rh, 1.0);
+    dt_dev_pixelpipe_process_no_gamma(&pipe, dev, rx, ry, rw, rh, 1.0);
 
-    if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) goto cleanup;
+    if(keep_going && !keep_going(user)) goto cleanup;
 
     // for a non-display pipe these are the requested dimensions echoed back;
     // kept as the single source of truth for the buffer we read
@@ -1871,7 +2012,9 @@ static int32_t _finalize_job_run(dt_job_t *job)
     gh = pipe.backbuf_height;
     if(!guide || gw < 8 || gh < 8)
     {
-      dt_control_log(_("precise mask: native render failed"));
+      dt_print(DT_DEBUG_AI, "[object mask] finalise: native render failed");
+      if(interactive)
+        dt_control_log(_("precise mask: native render failed"));
       goto cleanup;
     }
 
@@ -1882,7 +2025,9 @@ static int32_t _finalize_job_run(dt_job_t *job)
     sat = g_try_malloc((size_t)(gw + 1) * (gh + 1) * sizeof(double));
     if(!hint_soft || !hint_bin || !alpha_gf || !sat)
     {
-      dt_control_log(_("precise mask: out of memory"));
+      dt_print(DT_DEBUG_AI, "[object mask] finalise: out of memory");
+      if(interactive)
+        dt_control_log(_("precise mask: out of memory"));
       goto cleanup;
     }
 
@@ -1896,9 +2041,9 @@ static int32_t _finalize_job_run(dt_job_t *job)
       for(int x = 0; x < gw; x++)
       {
         const float hx = ((float)(rx + x) + 0.5f) / (float)fx - 0.5f;
-        const float v = _sample_plane(j->hint, j->hint_w, j->hint_h, hx, hy);
+        const float v = _sample_plane(hint, hint_w, hint_h, hx, hy);
         hint_soft[(size_t)y * gw + x] = CLAMPF(v, 0.0f, 1.0f);
-        hint_bin[(size_t)y * gw + x] = (v > j->threshold) ? 1.0f : 0.0f;
+        hint_bin[(size_t)y * gw + x] = (v > threshold) ? 1.0f : 0.0f;
       }
     }
 
@@ -1928,8 +2073,8 @@ static int32_t _finalize_job_run(dt_job_t *job)
           }
 
           const double t_net = dt_get_wtime();
-          if(dt_refine_run_tiled(net, rgb8, gw, gh, mask_net, j->threshold,
-                                 _finalize_keep_going, job))
+          if(dt_refine_run_tiled(net, rgb8, gw, gh, mask_net, threshold,
+                                 keep_going, user))
           {
             dt_print(DT_DEBUG_AI,
                      "[object mask] finalise: tiled network pass (%.1fs)",
@@ -1937,7 +2082,7 @@ static int32_t _finalize_job_run(dt_job_t *job)
             for(size_t k = 0; k < npix; k++)
             {
               hint_soft[k] = mask_net[k];
-              hint_bin[k] = (mask_net[k] > j->threshold) ? 1.0f : 0.0f;
+              hint_bin[k] = (mask_net[k] > threshold) ? 1.0f : 0.0f;
             }
           }
         }
@@ -1950,7 +2095,7 @@ static int32_t _finalize_job_run(dt_job_t *job)
                  "keeping the interactive hint");
       if(net) dt_refine_free(net);
       if(net_env) dt_ai_env_destroy(net_env);
-      if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) goto cleanup;
+      if(keep_going && !keep_going(user)) goto cleanup;
     }
 
     // summed-area table of the binary hint, for the band weight below
@@ -1976,7 +2121,7 @@ static int32_t _finalize_job_run(dt_job_t *job)
     guided_filter(guide, hint_bin, alpha_gf, gw, gh, 4, w_gf,
                   1.0f, 100.0f, 0.0f, 1.0f);
 
-    if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) goto cleanup;
+    if(keep_going && !keep_going(user)) goto cleanup;
 
     // composition with a continuous band weight: 1 on the binary edge,
     // fading to 0 with Chebyshev distance R. a hard band boundary would
@@ -2013,7 +2158,9 @@ static int32_t _finalize_job_run(dt_job_t *job)
     alpha_full = g_try_malloc0((size_t)pw * ph * sizeof(float));
     if(!grid || !alpha_full)
     {
-      dt_control_log(_("precise mask: out of memory"));
+      dt_print(DT_DEBUG_AI, "[object mask] finalise: out of memory");
+      if(interactive)
+        dt_control_log(_("precise mask: out of memory"));
       goto cleanup;
     }
     for(int y = 0; y < gny; y++)
@@ -2022,7 +2169,7 @@ static int32_t _finalize_job_run(dt_job_t *job)
         grid[((size_t)y * gnx + x) * 2 + 0] = (float)(x * G + cropx);
         grid[((size_t)y * gnx + x) * 2 + 1] = (float)(y * G + cropy);
       }
-    dt_dev_distort_transform_plus(&dev, &pipe, 0.0, DT_DEV_TRANSFORM_DIR_ALL,
+    dt_dev_distort_transform_plus(dev, &pipe, 0.0, DT_DEV_TRANSFORM_DIR_ALL,
                                   grid, (size_t)gnx * gny);
 
     for(int y = 0; y < ph; y++)
@@ -2052,10 +2199,78 @@ static int32_t _finalize_job_run(dt_job_t *job)
     }
   }
 
+  ok = TRUE;
+
+cleanup:
+  g_free(grid);
+  g_free(sat);
+  dt_free_align(alpha_gf);
+  dt_free_align(hint_bin);
+  dt_free_align(hint_soft);
+  if(pipe_ready) dt_dev_pixelpipe_cleanup(&pipe);
+  dt_mipmap_cache_release(&buf);
+  if(!ok)
+  {
+    g_free(alpha_full);
+    alpha_full = NULL;
+  }
+  return alpha_full;
+}
+
+static int32_t _finalize_job_run(dt_job_t *job)
+{
+  _finalize_job_t *const j = dt_control_job_get_params(job);
+  gboolean ok = FALSE;
+  float *alpha_full = NULL;
+  gchar *outpath = NULL;
+  int pw = 0, ph = 0;
+
+  const double t_start = dt_get_wtime();
+
+  dt_develop_t dev;
+  dt_dev_init(&dev, FALSE);
+  dt_dev_load_image(&dev, j->imgid);
+  if(j->history_end > 0 && j->history_end > dev.history_end)
+    dev.history_end = j->history_end;
+
+  // the hint only matches a render made on the exact distortion state it
+  // was computed on; the history can have moved while this job waited in
+  // the queue, and a mismatched render would be silently misaligned
+  if(_compute_distort_hash(&dev) != j->distort_hash)
+  {
+    dt_control_log(_("image geometry changed, precise mask cancelled"));
+    dt_dev_cleanup(&dev);
+    g_atomic_int_set(&_finalize_running, 0);
+    return 1;
+  }
+
+  const int render_target = dt_conf_key_exists(CONF_OBJECT_RENDER_SIZE_KEY)
+    ? MAX(dt_conf_get_int(CONF_OBJECT_RENDER_SIZE_KEY), 1024)
+    : SEG_RENDER_DEFAULT;
+  const _finalize_render_req_t req = {
+    .hint = j->hint,
+    .hint_w = j->hint_w,
+    .hint_h = j->hint_h,
+    .bx = j->bx, .by = j->by, .bw = j->bw, .bh = j->bh,
+    .threshold = j->threshold,
+    .render_target = render_target,
+    .interactive = TRUE,
+  };
+  alpha_full = _finalize_render_alpha(&dev, &req,
+                                      _finalize_keep_going, job, &pw, &ph);
+  if(!alpha_full)
+    goto cleanup;
+
   if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) goto cleanup;
 
   if(j->vectorize)
   {
+    // native-frame geometry, same derivation as the render core above
+    const int iw = dev.image_storage.width;
+    const int ih = dev.image_storage.height;
+    const int cropx = dev.image_storage.crop_x;
+    const int cropy = dev.image_storage.crop_y;
+
     // trace the native alpha instead of writing a raster file. tolerance and
     // cleanup are expressed in native pixels here: one traced pixel is one
     // sensor pixel, so a ~1 px tolerance keeps the drift invisible while
@@ -2127,23 +2342,10 @@ static int32_t _finalize_job_run(dt_job_t *job)
   gboolean written = FALSE;
   if(j->has_recipe && j->outpath)
   {
-    // content-addressed target: write to a temp name, move in atomically.
-    // an existing file under the same fingerprint was made from the same
-    // recipe -- it already is this content, keep it
+    // content-addressed target: atomic write, and an existing file under
+    // the same fingerprint already is this content
     outpath = g_strdup(j->outpath);
-    gchar *tmp = g_strdup_printf("%s.tmp", outpath);
-    written = _write_mask_png16(tmp, alpha_full, pw, ph);
-    if(written)
-    {
-      if(g_file_test(outpath, G_FILE_TEST_EXISTS))
-        g_unlink(tmp);
-      else if(g_rename(tmp, outpath) != 0)
-      {
-        g_unlink(tmp);
-        written = FALSE;
-      }
-    }
-    g_free(tmp);
+    written = _write_mask_png16_atomic(outpath, alpha_full, pw, ph);
   }
   else
   {
@@ -2185,14 +2387,7 @@ static int32_t _finalize_job_run(dt_job_t *job)
 
 cleanup:
   g_free(outpath);
-  g_free(grid);
   g_free(alpha_full);
-  g_free(sat);
-  dt_free_align(alpha_gf);
-  dt_free_align(hint_bin);
-  dt_free_align(hint_soft);
-  if(pipe_ready) dt_dev_pixelpipe_cleanup(&pipe);
-  dt_mipmap_cache_release(&buf);
   dt_dev_cleanup(&dev);
   g_atomic_int_set(&_finalize_running, 0);
   return ok ? 0 : 1;
@@ -2286,6 +2481,553 @@ static gboolean _launch_native_finalize(_object_data_t *d,
   dt_control_log(vectorize ? _("computing precise paths...")
                            : _("computing precise raster mask..."));
   return TRUE;
+}
+
+/* ------------------------ headless recipe replay ------------------------
+ *
+ * Regenerate the finalised mask PNG from its provenance recipe alone: the
+ * same render at the recorded encode dimensions, the recorded segmentation
+ * model pinned to its recorded version, the decodes replayed at the
+ * recorded boundaries, the same native finalisation, the same
+ * content-addressed file name. Runs on a worker job or inline in a CLI
+ * context: this code itself calls no GTK and no dt_control_log -- dt_print
+ * only -- but the replayed pipes run every module of the history (see the
+ * self-reference note below). The replay never produces path forms; those
+ * stay a GUI-session gesture.
+ *
+ * Documented limitations, all confined to the guide render and accepted as
+ * ONNX-variance-class (T2) deviations:
+ *  - self-reference: both replay pipes synch the full history, including
+ *    the rasterfile instance whose file is the very one being regenerated.
+ *    That instance resolves to a missing file, blend falls back to a
+ *    zeroed mask, and the RGB guide through the target module may differ
+ *    from the original run (where an earlier file could be present).
+ *    rasterfile.c stays silent about the missing file when a recipe is
+ *    present -- the recompute is the answer, not a toast.
+ *  - divergent distortion history: when the current history no longer
+ *    matches the recorded distort_hash the replay still proceeds (see the
+ *    comment at the check below); the regenerated bytes then depend on the
+ *    CURRENT history, which the fingerprint does not cover.
+ *  - the recipe does not record whether the original run's native tiled
+ *    refinement pass succeeded; the replay's own attempt may degrade
+ *    differently (model pinning above only guarantees the same weights). */
+
+gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
+                                  const dt_imgid_t imgid,
+                                  gboolean (*keep_going)(void *),
+                                  void *user)
+{
+  if(!dt_rf_recipe_valid(recipe) || !dt_is_valid_imgid(imgid))
+    return FALSE;
+
+  // the recorded decode boundaries drive the replay; the last one produced
+  // the mask the finalisation worked from. a recipe without any boundary
+  // defines no refinement chain and cannot be replayed
+  int last_decode = -1;
+  for(int i = 0; i < recipe->n_points; i++)
+    if(recipe->points[i].decode_after)
+      last_decode = i;
+  if(last_decode < 0)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: recipe records no decode boundary");
+    return FALSE;
+  }
+
+  // pin the models to the recorded versions. the fingerprint names the
+  // exact weights; replaying with anything else would write different
+  // content under the same name and poison a shared store forever. hard
+  // failure on any deviation: it is retryable once the right models are
+  // installed, and a mask-to-0 in the meantime beats silent divergence
+  const char *seg_ver = dt_ai_model_get_version(recipe->seg_model);
+  if(g_strcmp0(seg_ver, recipe->seg_model_version) != 0)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: segmentation model '%s' is version '%s',"
+             " the recipe records '%s' -- not replaying",
+             recipe->seg_model, seg_ver ? seg_ver : "?",
+             recipe->seg_model_version);
+    return FALSE;
+  }
+  if(recipe->ai_refine)
+  {
+    // dt_refine_load offers no per-id loading: the replay can only use the
+    // ACTIVE refine model, so that one must be the recorded one
+    char *refine_id = dt_ai_models_get_active_for_task("refine");
+    const char *refine_ver
+      = refine_id ? dt_ai_model_get_version(refine_id) : NULL;
+    const gboolean pinned = refine_id
+      && strcmp(refine_id, recipe->refine_model) == 0
+      && g_strcmp0(refine_ver, recipe->refine_model_version) == 0;
+    if(!pinned)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: active refine model '%s' (version"
+               " '%s') does not match the recorded '%s' (version '%s') --"
+               " not replaying",
+               refine_id ? refine_id : "(none)",
+               refine_ver ? refine_ver : "?",
+               recipe->refine_model, recipe->refine_model_version);
+      g_free(refine_id);
+      return FALSE;
+    }
+    g_free(refine_id);
+  }
+
+  gboolean ok = FALSE;
+  gchar *outpath = NULL;
+  float *enc_pts = NULL;
+  uint8_t *rgb = NULL;
+  float *hint = NULL;
+  float *alpha_full = NULL;
+  int hint_w = 0, hint_h = 0;
+  dt_ai_environment_t *env = NULL;
+  dt_seg_context_t *seg = NULL;
+  dt_dev_pixelpipe_t pipe;
+  dt_mipmap_buffer_t buf;
+  gboolean pipe_ready = FALSE, buf_ready = FALSE;
+  // minimal stand-in for the session data _decode_thread_func works on: the
+  // compute only touches seg/refine/refine_failed/env, plus a final atomic
+  // store to decode_state that nobody polls here
+  _object_data_t od = { 0 };
+
+  const double t_start = dt_get_wtime();
+
+  dt_develop_t dev;
+  dt_dev_init(&dev, FALSE);
+  dt_dev_load_image(&dev, imgid);
+  // no history_end override here: headless, the database is the source of
+  // truth (the interactive threads only override it because the darkroom
+  // can be ahead of the database)
+
+  // the recipe describes the distortion state the prompts were clicked on.
+  // if the history moved since, the replay still renders the CURRENT state
+  // -- the closest available to what the recipe names -- and says so; a
+  // stale mask is repaired by a manual re-finalisation. proceeding (where
+  // the interactive job cancels) is deliberate: cancelling would leave a
+  // permanent mask-to-0 on the common cross-machine case (crop added after
+  // finalisation), and the input-space-normalised points make the replay
+  // largely self-correcting. accepted deviation from the content-addressed
+  // promise: the regenerated bytes then depend on the CURRENT history,
+  // which the fingerprint does not cover -- divergence is confined to the
+  // guide render (the mask lives in input space) and is treated as
+  // ONNX-variance-class (T2), see the block comment above
+  const dt_hash_t cur_hash = _compute_distort_hash(&dev);
+  if((dt_hash_t)recipe->distort_hash != cur_hash)
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: distortion state changed since capture, "
+             "the regenerated mask may be misaligned");
+
+  // content-addressed target under the LOCAL mask root, derived from the
+  // loaded dev -- never darktable.develop. must mirror what _recipe_outpath
+  // and rasterfile.c's commit_params resolve
+  {
+    const dt_image_t *img = &dev.image_storage;
+    gchar *base = g_path_get_basename(img->filename);
+    char *dot = g_strrstr(base, ".");
+    if(dot) *dot = '\0';
+    gchar *fname = dt_rasterfile_recipe_filename(recipe, base,
+                                                 img->width, img->height);
+    gchar *root = dt_rasterfile_mask_root();
+    if(g_mkdir_with_parents(root, 0755) == 0)
+      outpath = g_build_filename(root, fname, NULL);
+    else
+      dt_print(DT_DEBUG_AI, "[object mask] replay: cannot create folder: %s",
+               root);
+    g_free(root);
+    g_free(fname);
+    g_free(base);
+  }
+  if(!outpath)
+    goto cleanup;
+
+  // an existing file under this fingerprint was produced from this very
+  // recipe: it already is the requested content -- but only when it is an
+  // actual PNG. a zero-byte or truncated leftover would otherwise be
+  // trusted forever and the pipe would loop on an unreadable file
+  if(g_file_test(outpath, G_FILE_TEST_EXISTS))
+  {
+    if(_mask_png_valid(outpath))
+    {
+      dt_print(DT_DEBUG_AI, "[object mask] replay: %s already exists",
+               outpath);
+      ok = TRUE;
+      goto cleanup;
+    }
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: %s exists but is not a valid PNG,"
+             " regenerating", outpath);
+    g_unlink(outpath);
+  }
+
+  // load the RECORDED segmentation model, not the currently active one: the
+  // replay reproduces the original session. a missing model is a clean
+  // failure -- the caller may retry once it is installed
+  env = dt_ai_env_init(NULL);
+  seg = env ? dt_seg_load(env, recipe->seg_model) : NULL;
+  if(!seg)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: segmentation model '%s' unavailable",
+             recipe->seg_model);
+    goto cleanup;
+  }
+  od.env = env;
+  od.seg = seg;
+
+  const int enc_w = recipe->encode_w;
+  const int enc_h = recipe->encode_h;
+  if(enc_w <= 0 || enc_h <= 0)
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: invalid encode dimensions");
+    goto cleanup;
+  }
+
+  // export render pipe at full input dimensions, as _encode_thread_func
+  // builds it. it serves both the encode render and the prompt mapping
+  dt_mipmap_cache_get(&buf, imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
+  buf_ready = TRUE;
+  if(!buf.buf || !buf.width || !buf.height)
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: cannot get the image buffer");
+    goto cleanup;
+  }
+  const int iw = dev.image_storage.width;
+  const int ih = dev.image_storage.height;
+  if(!dt_dev_pixelpipe_init_export(&pipe, iw, ih, IMAGEIO_RGB | IMAGEIO_INT8,
+                                   FALSE))
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: cannot init the render pipe");
+    goto cleanup;
+  }
+  pipe_ready = TRUE;
+  dt_dev_pixelpipe_set_icc(&pipe, DT_COLORSPACE_SRGB, NULL,
+                           DT_INTENT_PERCEPTUAL);
+  dt_dev_pixelpipe_set_input(&pipe, &dev, (float *)buf.buf,
+                             buf.width, buf.height, buf.iscale);
+  dt_dev_pixelpipe_create_nodes(&pipe, &dev);
+  dt_dev_pixelpipe_synch_all(&pipe, &dev);
+  dt_dev_pixelpipe_get_dimensions(&pipe, &dev, pipe.iwidth, pipe.iheight,
+                                  &pipe.processed_width,
+                                  &pipe.processed_height);
+  if(pipe.processed_width <= 0 || pipe.processed_height <= 0)
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: empty processed dimensions");
+    goto cleanup;
+  }
+
+  // the recipe travels in the XMP and is untrusted input: the encode
+  // render never upscales, so recorded dims above the processed frame are
+  // necessarily corrupt -- reject them before they size any allocation
+  if(enc_w > pipe.processed_width || enc_h > pipe.processed_height)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: recorded encode dims %dx%d exceed the"
+             " processed frame %dx%d, rejecting",
+             enc_w, enc_h, pipe.processed_width, pipe.processed_height);
+    goto cleanup;
+  }
+
+  // prompt points back to encode-render pixels, the exact inverse of the
+  // capture convention (backtransform through the pipe, divided by its
+  // input dims): scale by THIS pipe's input dims, forward through the full
+  // distortion chain -- the same transform_plus/DIR_ALL the finalisation
+  // grid uses -- then the plain processed->encode factor of _launch_decode
+  // (which uses no pixel-centre offset either). the normalised coordinates
+  // are scale-invariant, so the preview pipe of the capture and this export
+  // pipe agree by the same convention every stored mask form relies on
+  const int n = recipe->n_points;
+  enc_pts = g_new(float, (size_t)n * 2);
+  for(int k = 0; k < n; k++)
+  {
+    enc_pts[k * 2 + 0] = recipe->points[k].x * (float)pipe.iwidth;
+    enc_pts[k * 2 + 1] = recipe->points[k].y * (float)pipe.iheight;
+  }
+  dt_dev_distort_transform_plus(&dev, &pipe, 0.0, DT_DEV_TRANSFORM_DIR_ALL,
+                                enc_pts, n);
+  const float psx = (float)enc_w / (float)pipe.processed_width;
+  const float psy = (float)enc_h / (float)pipe.processed_height;
+  for(int k = 0; k < n; k++)
+  {
+    enc_pts[k * 2 + 0] *= psx;
+    enc_pts[k * 2 + 1] *= psy;
+  }
+
+  // encoder embeddings: the disk cache first, keyed exactly like the
+  // interactive session (imgid + current distortion state + model). the
+  // cache is validated without dimensions, so a hit at other dims than the
+  // recipe records would put the prompts on the wrong grid -- re-encode then
+  gboolean encoded = FALSE;
+  if(dt_seg_disk_cache_load(seg, imgid, cur_hash))
+  {
+    int cw = 0, ch = 0;
+    dt_seg_get_encoded_rgb(seg, &cw, &ch);
+    if(cw == enc_w && ch == enc_h)
+      encoded = TRUE;
+    else
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: cached encoding is %dx%d, recipe "
+               "records %dx%d, re-encoding", cw, ch, enc_w, enc_h);
+      dt_seg_reset_encoding(seg);
+    }
+  }
+
+  if(!encoded)
+  {
+    // render at EXACTLY the recorded dims -- never re-read the render-size
+    // conf for this render, a changed preference would shift the prompt
+    // grid. the sampling scale is recovered with the encode-thread formula
+    // from the recorded cap; when the recorded dims come from a .seg made
+    // under another cap the formula cannot land on them, fall back to the
+    // dim ratio (sub-pixel sampling difference, accepted for that rare case)
+    const int render_cap = MAX(recipe->render_size, 1024);
+    const double e_scale
+      = fmin((double)render_cap / (double)pipe.processed_width,
+             (double)render_cap / (double)pipe.processed_height);
+    double final_scale = fmin(e_scale, 1.0);
+    if((int)(final_scale * pipe.processed_width) != enc_w
+       || (int)(final_scale * pipe.processed_height) != enc_h)
+    {
+      final_scale = fmin((double)enc_w / (double)pipe.processed_width,
+                         (double)enc_h / (double)pipe.processed_height);
+      // bound the requested ROI to the scaled extent of the processed
+      // frame: the ratio truncates, so allow the accepted one-pixel slack,
+      // but reject a recipe whose dims the render cannot reach -- the
+      // prompts would land on the wrong grid anyway
+      if((int)(final_scale * pipe.processed_width) + 1 < enc_w
+         || (int)(final_scale * pipe.processed_height) + 1 < enc_h)
+      {
+        dt_print(DT_DEBUG_AI,
+                 "[object mask] replay: recorded dims %dx%d not reachable"
+                 " from the processed frame, rejecting", enc_w, enc_h);
+        goto cleanup;
+      }
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: recorded dims %dx%d do not match the "
+               "recorded render cap, using the dim ratio", enc_w, enc_h);
+    }
+
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: rendering %dx%d for encoding...",
+             enc_w, enc_h);
+    // the return value signals "pipe altered mid-flight", not success --
+    // the backbuf and its dimensions are the check that matters
+    dt_dev_pixelpipe_process_no_gamma(&pipe, &dev, 0, 0, enc_w, enc_h,
+                                      final_scale);
+    if(!pipe.backbuf
+       || pipe.backbuf_width != enc_w || pipe.backbuf_height != enc_h)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: render for encoding returned %dx%d,"
+               " expected %dx%d",
+               pipe.backbuf_width, pipe.backbuf_height, enc_w, enc_h);
+      goto cleanup;
+    }
+
+    // backbuf is float RGBA, convert to uint8 RGB -- same as the encode
+    // thread
+    rgb = _backbuf_to_rgb8(&pipe, enc_w, enc_h);
+    if(!rgb)
+    {
+      dt_print(DT_DEBUG_AI, "[object mask] replay: render for encoding failed");
+      goto cleanup;
+    }
+
+    // same CPU fallback as the interactive encode thread, pinned to the
+    // recorded model
+    encoded = _seg_encode_cpu_fallback(&seg, env, recipe->seg_model,
+                                       rgb, enc_w, enc_h);
+    od.seg = seg;
+    // populate the disk cache for repeated replays -- but never clobber a
+    // file the interactive session wrote: a single slot exists per image,
+    // and overwriting it with the recipe dims would silently degrade the
+    // session's working resolution on its next cache hit
+    if(encoded && !dt_seg_disk_cache_exists(imgid))
+      dt_seg_disk_cache_save(seg, imgid, cur_hash, rgb, enc_w, enc_h);
+    g_free(rgb);
+    rgb = NULL;
+    if(!encoded)
+    {
+      dt_print(DT_DEBUG_AI, "[object mask] replay: encoding failed");
+      goto cleanup;
+    }
+  }
+
+  // this pipe served the encode render and the prompt mapping; the
+  // finalisation core below builds its own
+  dt_dev_pixelpipe_cleanup(&pipe);
+  pipe_ready = FALSE;
+  dt_mipmap_cache_release(&buf);
+  buf_ready = FALSE;
+
+  if(keep_going && !keep_going(user))
+    goto cleanup;
+
+  // replay the decodes at the recorded boundaries: decode i covers points
+  // 0..i, with the threshold recorded when that decode really ran. the
+  // whole per-decode sequence (multi-pass refinement with peak points and
+  // box prompt, IoU convergence, seed-component filter, CRF and CascadePSP
+  // when they were active) IS _decode_thread_func, called synchronously on
+  // a per-boundary job -- zero duplicated logic, zero divergence. prev_mask
+  // is never reset between decodes, as in the interactive session; the
+  // context is freshly loaded, so the first decode starts clean anyway
+  for(int i = 0; i <= last_decode; i++)
+  {
+    if(!recipe->points[i].decode_after)
+      continue;
+    if(keep_going && !keep_going(user))
+      goto cleanup;
+
+    const int n_prompt = i + 1;
+    _decode_job_t *djob = g_malloc0(sizeof(_decode_job_t));
+    djob->d = &od;
+    djob->n_prompt_points = n_prompt;
+    // always FALSE, like every launch of the interactive path (see
+    // _launch_decode); do not attach first-click semantics to it
+    djob->reset_prev_mask = FALSE;
+    // the clamps mirror the conf reads of _launch_decode that recorded
+    // these values, and shield against a hand-edited recipe
+    djob->n_passes = CLAMP(recipe->refine_passes, 1, 3);
+    // headroom: one peak point per pass + 2 box corners (SAM only)
+    djob->points = g_new(dt_seg_point_t, n_prompt + djob->n_passes + 2);
+    for(int k = 0; k < n_prompt; k++)
+    {
+      djob->points[k].x = enc_pts[k * 2 + 0];
+      djob->points[k].y = enc_pts[k * 2 + 1];
+      djob->points[k].label = (int)recipe->points[k].label;
+    }
+    // seed for the connected-component filter: last positive point, as in
+    // _launch_decode
+    djob->seed_x = -1;
+    djob->seed_y = -1;
+    for(int k = n_prompt - 1; k >= 0; k--)
+      if(recipe->points[k].label == 1)
+      {
+        djob->seed_x = (int)enc_pts[k * 2 + 0];
+        djob->seed_y = (int)enc_pts[k * 2 + 1];
+        break;
+      }
+    djob->threshold = CLAMP(recipe->points[i].threshold, 0.3f, 0.9f);
+    djob->do_crf = recipe->crf_enabled != 0;
+    djob->crf_iter = CLAMP(recipe->crf_iterations, 1, 10);
+    djob->crf_sigma_color = CLAMP(recipe->crf_sigma_color, 1.0f, 50.0f);
+    djob->crf_w_bilateral = CLAMP(recipe->crf_w_bilateral, 0.5f, 30.0f);
+    djob->do_refine = recipe->ai_refine != 0 && !od.refine_failed;
+    djob->refine_margin = CLAMPF(recipe->ai_refine_margin, 0.0f, 0.5f);
+
+    _decode_thread_func(djob);
+
+    // the interactive session absorbs a refine load failure gracefully
+    // (refine_failed, decode proceeds unrefined) -- the replay must not:
+    // it would write an unrefined mask under a fingerprint that promises
+    // refinement. hard failure, retryable once the model loads again
+    if(recipe->ai_refine && od.refine_failed)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: refine model failed to load,"
+               " cannot reproduce the recorded refinement");
+      _decode_job_free(djob);
+      goto cleanup;
+    }
+
+    if(i == last_decode && djob->out_mask)
+    {
+      hint = djob->out_mask;
+      hint_w = djob->out_w;
+      hint_h = djob->out_h;
+      djob->out_mask = NULL;   // ownership moved
+    }
+    const gboolean decode_ok = (i == last_decode) ? (hint != NULL)
+                                                  : (djob->out_mask != NULL);
+    _decode_job_free(djob);
+    if(!decode_ok)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: decode at point %d failed", i + 1);
+      goto cleanup;
+    }
+  }
+
+  // the segmentation stack is done; release it before the heavy native pass
+  // (which loads its own refinement context, as the interactive job does)
+  if(od.refine)
+  {
+    dt_refine_free(od.refine);
+    od.refine = NULL;
+  }
+  dt_seg_free(seg);
+  seg = NULL;
+  od.seg = NULL;
+  dt_ai_env_destroy(env);
+  env = NULL;
+  od.env = NULL;
+
+  // subject bbox on the working grid, exactly as _launch_native_finalize
+  // derives it: final threshold, CascadePSP margin as padding
+  const float thresh = CLAMP(recipe->threshold, 0.3f, 0.9f);
+  const float margin = CLAMPF(recipe->ai_refine_margin, 0.0f, 0.5f);
+  dt_seg_point_t tl, br;
+  if(!_compute_bbox(hint, hint_w, hint_h, thresh, margin, &tl, &br))
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: empty mask, nothing to write");
+    goto cleanup;
+  }
+  const int bx = CLAMP((int)tl.x, 0, hint_w - 1);
+  const int by = CLAMP((int)tl.y, 0, hint_h - 1);
+  const int bw = CLAMP((int)br.x - bx + 1, 1, hint_w - bx);
+  const int bh = CLAMP((int)br.y - by + 1, 1, hint_h - by);
+
+  // the native pass is the peak of VRAM use and shares its serialisation
+  // token with the interactive finalisation job: never run both at once.
+  // busy means a finalisation (or another replay) is in flight -- fail
+  // cleanly, the caller may retry later
+  if(!g_atomic_int_compare_and_exchange(&_finalize_running, 0, 1))
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: a finalisation is already running,"
+             " try again later");
+    goto cleanup;
+  }
+  int pw = 0, ph = 0;
+  const _finalize_render_req_t req = {
+    .hint = hint,
+    .hint_w = hint_w,
+    .hint_h = hint_h,
+    .bx = bx, .by = by, .bw = bw, .bh = bh,
+    .threshold = thresh,
+    .render_target = MAX(recipe->render_size, 1024),
+    .interactive = FALSE,
+  };
+  alpha_full = _finalize_render_alpha(&dev, &req, keep_going, user, &pw, &ph);
+  g_atomic_int_set(&_finalize_running, 0);
+  if(!alpha_full)
+    goto cleanup;
+
+  if(!_write_mask_png16_atomic(outpath, alpha_full, pw, ph))
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: cannot write %s", outpath);
+    goto cleanup;
+  }
+
+  dt_print(DT_DEBUG_AI,
+           "[object mask] replay: %s regenerated (%dx%d, %.1fs)",
+           outpath, pw, ph, dt_get_wtime() - t_start);
+  ok = TRUE;
+
+cleanup:
+  g_free(rgb);
+  g_free(enc_pts);
+  g_free(hint);
+  g_free(alpha_full);
+  g_free(outpath);
+  if(pipe_ready) dt_dev_pixelpipe_cleanup(&pipe);
+  if(buf_ready) dt_mipmap_cache_release(&buf);
+  if(od.refine) dt_refine_free(od.refine);
+  if(seg) dt_seg_free(seg);
+  if(env) dt_ai_env_destroy(env);
+  dt_dev_cleanup(&dev);
+  return ok;
 }
 
 // transform mask-space forms to input-normalized coords and register them,

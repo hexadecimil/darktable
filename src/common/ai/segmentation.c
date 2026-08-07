@@ -1217,6 +1217,17 @@ static gboolean _get_cache_dir(char *out, size_t size)
   return FALSE;
 }
 
+gboolean dt_seg_disk_cache_exists(const dt_imgid_t imgid)
+{
+  char dir[PATH_MAX] = {0};
+  if(!_get_cache_dir(dir, sizeof(dir)))
+    return FALSE;
+
+  char path[PATH_MAX] = {0};
+  snprintf(path, sizeof(path), "%s/%d.seg", dir, imgid);
+  return g_file_test(path, G_FILE_TEST_EXISTS);
+}
+
 gboolean dt_seg_disk_cache_save(dt_seg_context_t *ctx,
                                 const dt_imgid_t imgid,
                                 const dt_hash_t distort_hash,
@@ -1235,12 +1246,20 @@ gboolean dt_seg_disk_cache_save(dt_seg_context_t *ctx,
   char path[PATH_MAX] = {0};
   snprintf(path, sizeof(path), "%s/%d.seg", dir, imgid);
 
-  FILE *fp = g_fopen(path, "wb");
+  // write to a temp name unique to this writer, then move atomically: the
+  // interactive encode thread and a headless recipe replay may both save
+  // this slot, and interleaved direct writes would produce a file of the
+  // same byte structure that passes every validation with mixed embeddings
+  char tmppath[PATH_MAX + 64] = {0};
+  snprintf(tmppath, sizeof(tmppath), "%s.%d-%p.tmp",
+           path, (int)getpid(), (void *)g_thread_self());
+
+  FILE *fp = g_fopen(tmppath, "wb");
   if(!fp)
   {
     dt_print(DT_DEBUG_AI,
              "[segmentation] disk cache: cannot open %s for writing",
-             path);
+             tmppath);
     return FALSE;
   }
 
@@ -1298,11 +1317,25 @@ gboolean dt_seg_disk_cache_save(dt_seg_context_t *ctx,
 
   if(!ok)
   {
-    g_unlink(path);
+    g_unlink(tmppath);
     dt_print(DT_DEBUG_AI,
              "[segmentation] disk cache: write error for imgid %d",
              imgid);
     return FALSE;
+  }
+
+  if(g_rename(tmppath, path) != 0)
+  {
+    // a concurrent writer may have installed its file first: keep the
+    // version that won, drop ours
+    g_unlink(tmppath);
+    if(!g_file_test(path, G_FILE_TEST_EXISTS))
+    {
+      dt_print(DT_DEBUG_AI,
+               "[segmentation] disk cache: cannot move %s into place",
+               tmppath);
+      return FALSE;
+    }
   }
 
   dt_print(DT_DEBUG_AI,

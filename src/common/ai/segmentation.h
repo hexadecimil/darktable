@@ -137,6 +137,15 @@ void dt_seg_reset_prev_mask(dt_seg_context_t *ctx);
 /* --- disk cache for encoder embeddings --- */
 
 /**
+ * @brief TRUE when a disk cache file exists for the image, whatever its
+ *        content. One slot exists per image: writers that must not clobber
+ *        another session's encoding (e.g. the headless recipe replay)
+ *        check this before dt_seg_disk_cache_save().
+ * @param imgid Image ID (used as filename key).
+ */
+gboolean dt_seg_disk_cache_exists(const dt_imgid_t imgid);
+
+/**
  * @brief Save current encoder embeddings + RGB to disk cache.
  *        No-op if no active encoding.
  * @param ctx Segmentation context with active encoding.

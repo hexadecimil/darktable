@@ -87,6 +87,10 @@ typedef struct dt_iop_rasterfile_data_t
 {
   dt_iop_rasterfile_mode_t mode;
   char filepath[PATH_MAX];
+  // TRUE when the params carry a valid recipe: a missing or unreadable
+  // file is then an expected transient state (the mask is recomputable and
+  // a recompute is the answer), so the read path logs without toasting
+  gboolean quiet;
 } dt_iop_rasterfile_data_t;
 
 typedef struct dt_rasterfile_cache_t
@@ -224,6 +228,7 @@ static void _vectorize_button_clicked(GtkWidget *widget,
 
 static float *_read_rasterfile(char *filename,
                                const dt_iop_rasterfile_mode_t mode,
+                               const gboolean quiet,
                                int *swidth,
                                int *sheight)
 {
@@ -240,7 +245,8 @@ static float *_read_rasterfile(char *filename,
     if(!dt_imageio_png_read_header(filename, &png))
     {
       dt_print(DT_DEBUG_ALWAYS, "failed to read PNG header from '%s'", filename ? filename : "???");
-      dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
+      if(!quiet)
+        dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
       return NULL;
     }
 
@@ -251,7 +257,8 @@ static float *_read_rasterfile(char *filename,
       fclose(png.f);
       png_destroy_read_struct(&png.png_ptr, &png.info_ptr, NULL);
       dt_print(DT_DEBUG_ALWAYS, "can't read raster mask file '%s'", filename ? filename : "???");
-      dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
+      if(!quiet)
+        dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
       return NULL;
     }
 
@@ -259,7 +266,8 @@ static float *_read_rasterfile(char *filename,
     {
       dt_free_align(buf);
       dt_print(DT_DEBUG_ALWAYS, "can't read raster mask file '%s'", filename ? filename : "???");
-      dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
+      if(!quiet)
+        dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
       return NULL;
     }
 
@@ -270,7 +278,8 @@ static float *_read_rasterfile(char *filename,
     {
       dt_free_align(buf);
       dt_print(DT_DEBUG_ALWAYS, "can't read raster mask file '%s'", filename ? filename : "???");
-      dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
+      if(!quiet)
+        dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
       return NULL;
     }
 
@@ -319,7 +328,8 @@ static float *_read_rasterfile(char *filename,
   {
     dt_print(DT_DEBUG_ALWAYS,
              "can't read raster mask file '%s'", filename ? filename : "???");
-    dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
+    if(!quiet)
+      dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
 
     dt_free_align(image);
     dt_free_align(mask);
@@ -505,7 +515,8 @@ static float *_get_rasterfile_mask(dt_dev_pixelpipe_iop_t *piece,
     _clear_cache(cd);
     dt_print(DT_DEBUG_PIPE,
              "read image raster file `%s'", d->filepath);
-    cd->mask = _read_rasterfile(d->filepath, d->mode, &cd->width, &cd->height);
+    cd->mask = _read_rasterfile(d->filepath, d->mode, d->quiet,
+                                &cd->width, &cd->height);
     cd->hash = cd->mask ? hash : DT_INVALID_HASH;
     dt_print(DT_DEBUG_PIPE,
              "got raster mask data %p %dx%d", cd->mask, cd->width, cd->height);
@@ -646,6 +657,9 @@ void commit_params(dt_iop_module_t *self,
   dt_iop_rasterfile_data_t *d = piece->data;
 
   d->mode = p->mode;
+  // a recipe makes the file recomputable: its absence is then a transient
+  // state handled by a recompute, not a toast (see _read_rasterfile)
+  d->quiet = dt_rf_recipe_valid(&p->recipe);
   gchar *fullpath = NULL;
   if(dt_rf_recipe_valid(&p->recipe))
   {

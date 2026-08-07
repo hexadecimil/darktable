@@ -95,6 +95,15 @@ typedef struct dt_rf_recipe_t
   int32_t reserved[16];  // zero-filled headroom for compatible extensions
 } dt_rf_recipe_t;
 
+// the layout is load-bearing twice over: the struct is embedded in module
+// params (a size drift silently invalidates every stored history) and it
+// is hashed verbatim (an implicit-padding hole would make the fingerprint
+// build-dependent). freeze both
+G_STATIC_ASSERT(sizeof(dt_rf_recipe_point_t) == 24);
+G_STATIC_ASSERT(sizeof(dt_rf_recipe_t)
+                == 240 + DT_RF_RECIPE_MAX_POINTS * sizeof(dt_rf_recipe_point_t)
+                   + 64);
+
 // a recipe is only acted upon when fully understood: an unknown version is
 // deliberately NOT valid, the embedding module then falls back to plain
 // path/file resolution without touching the recipe bytes
