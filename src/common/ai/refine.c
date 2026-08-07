@@ -368,6 +368,182 @@ gboolean dt_refine_run(dt_refine_context_t *ctx,
   return TRUE;
 }
 
+
+/* Bilinear upsample of the used area of a padded plane, pixel-centre. */
+static void _upsample_used(const float *const restrict src,
+                           const int stride,
+                           const int uw,
+                           const int uh,
+                           float *const restrict dst,
+                           const int dw,
+                           const int dh)
+{
+  const float fx = (float)uw / (float)dw;
+  const float fy = (float)uh / (float)dh;
+  DT_OMP_FOR()
+  for(int y = 0; y < dh; y++)
+  {
+    const float sy = ((float)y + 0.5f) * fy - 0.5f;
+    for(int x = 0; x < dw; x++)
+    {
+      const float sx = ((float)x + 0.5f) * fx - 0.5f;
+      dst[(size_t)y * dw + x] = _sample_1c(src, stride, uw, uh, sx, sy);
+    }
+  }
+}
+
+gboolean dt_refine_run_tiled(dt_refine_context_t *ctx,
+                             const uint8_t *const rgb,
+                             const int rgb_w,
+                             const int rgb_h,
+                             float *const mask,
+                             const float threshold,
+                             dt_refine_keep_going_t keep_going,
+                             void *user)
+{
+  if(!ctx || !rgb || !mask) return FALSE;
+  const int s = ctx->side;
+  const int W = rgb_w, H = rgb_h;
+  if(W < 8 || H < 8) return FALSE;
+
+  const size_t nplane = (size_t)W * H;
+  float *r224 = dt_alloc_align_float(nplane);
+  float *r56 = dt_alloc_align_float(nplane);
+  float *accum = dt_alloc_align_float(nplane);
+  float *weight = dt_alloc_align_float(nplane);
+  if(!r224 || !r56 || !accum || !weight)
+  {
+    dt_free_align(r224);
+    dt_free_align(r56);
+    dt_free_align(accum);
+    dt_free_align(weight);
+    return FALSE;
+  }
+  gboolean ok = FALSE;
+
+  // ---- global pass, letterboxed to the graph side. its ramped write-back
+  // into `mask` is kept on purpose: it is the right fallback if the caller
+  // cancels before the tiles complete. the padded network outputs stay in
+  // ctx->o_p224 / o_p56 afterwards -- that is what guides the tiles.
+  if(!dt_refine_run(ctx, rgb, W, H, mask, threshold, 0, 0, W, H))
+    goto cleanup;
+
+  {
+    const float scale = (float)s / (float)MAX(W, H);
+    const int uw = MAX(1, MIN(s, (int)lrintf(W * scale)));
+    const int uh = MAX(1, MIN(s, (int)lrintf(H * scale)));
+
+    // upstream guidance: binarised pred_224 and soft pred_56, both mapped to
+    // [-1, 1] on the native grid (eval_helper.py:83-84)
+    _upsample_used(ctx->o_p224, s, uw, uh, r224, W, H);
+    _upsample_used(ctx->o_p56, s, uw, uh, r56, W, H);
+    DT_OMP_FOR()
+    for(size_t k = 0; k < nplane; k++)
+    {
+      r224[k] = (r224[k] > 0.5f) ? 1.0f : -1.0f;
+      r56[k] = r56[k] * 2.0f - 1.0f;
+      accum[k] = 0.0f;
+      weight[k] = 0.0f;
+    }
+
+    // ---- local pass: overlapping s x s tiles at 1:1 (eval_helper.py:86-157)
+    const int padding = 16;
+    const int step = s / 2 - 2 * padding;
+    const size_t plane = (size_t)s * s;
+    int done = 0, skipped = 0;
+
+    for(int ty = 0; ty * step < H; ty++)
+    {
+      for(int tx = 0; tx * step < W; tx++)
+      {
+        int sx = tx * step, sy = ty * step;
+        int ex = sx + s, ey = sy + s;
+        if(ey > H) { ey = H; sy = MAX(0, H - s); }
+        if(ex > W) { ex = W; sx = MAX(0, W - s); }
+        const int tw = ex - sx, th = ey - sy;
+
+        // skip tiles that are (almost) entirely inside or outside: the
+        // network cannot improve them (eval_helper.py:126-130)
+        double occ = 0.0;
+        for(int y = sy; y < ey; y++)
+          for(int x = sx; x < ex; x++)
+            occ += (r224[(size_t)y * W + x] > 0.0f);
+        occ /= (double)tw * th;
+        if(occ > 0.9 || occ < 0.1)
+        {
+          skipped++;
+          continue;
+        }
+
+        if(keep_going && !keep_going(user)) goto cleanup;
+
+        // fill the tensors: image at 1:1, guidance planes as seg/p8/p4,
+        // padded with 0 (image) and -1 (masks) as safe_forward does
+        memset(ctx->t_image, 0, 3 * plane * sizeof(float));
+        for(size_t k = 0; k < plane; k++)
+          ctx->t_seg[k] = ctx->t_p8[k] = ctx->t_p4[k] = -1.0f;
+
+        // local copies: file-scope constants cannot be shared under default(none)
+        const dt_aligned_pixel_t mean = { REFINE_MEAN[0], REFINE_MEAN[1], REFINE_MEAN[2], 0.0f };
+        const dt_aligned_pixel_t stdv = { REFINE_STD[0], REFINE_STD[1], REFINE_STD[2], 1.0f };
+
+        DT_OMP_FOR(shared(mean, stdv))
+        for(int y = 0; y < th; y++)
+        {
+          const uint8_t *const src = rgb + ((size_t)(sy + y) * W + sx) * 3;
+          for(int x = 0; x < tw; x++)
+          {
+            for(int c = 0; c < 3; c++)
+              ctx->t_image[(size_t)c * plane + (size_t)y * s + x]
+                = (src[x * 3 + c] / 255.0f - mean[c]) / stdv[c];
+            const size_t kk = (size_t)(sy + y) * W + sx + x;
+            ctx->t_seg[(size_t)y * s + x] = r224[kk];
+            ctx->t_p8[(size_t)y * s + x] = r224[kk];
+            ctx->t_p4[(size_t)y * s + x] = r56[kk];
+          }
+        }
+
+        if(_block(ctx, ctx->t_seg, ctx->t_p8, ctx->t_p4) != 0) goto cleanup;
+        done++;
+
+        // accumulate with overlap cropping (eval_helper.py:134-157)
+        int asx = sx, asy = sy, aex = ex, aey = ey;
+        int psx = 0, psy = 0;
+        if(sx != 0) { asx += padding; psx += padding; }
+        if(sy != 0) { asy += padding; psy += padding; }
+        if(ex != W) aex -= padding;
+        if(ey != H) aey -= padding;
+
+        for(int y = asy; y < aey; y++)
+          for(int x = asx; x < aex; x++)
+          {
+            accum[(size_t)y * W + x]
+              += ctx->o_p224[(size_t)(psy + y - asy) * s + psx + x - asx];
+            weight[(size_t)y * W + x] += 1.0f;
+          }
+      }
+    }
+
+    dt_print(DT_DEBUG_AI, "[refine] tiled pass: %d tiles run, %d skipped",
+             done, skipped);
+
+    // fused output; where no tile contributed, keep the global result
+    DT_OMP_FOR()
+    for(size_t k = 0; k < nplane; k++)
+      mask[k] = (weight[k] > 0.0f)
+        ? CLAMPF(accum[k] / weight[k], 0.0f, 1.0f)
+        : CLAMPF(r224[k] * 0.5f + 0.5f, 0.0f, 1.0f);
+    ok = TRUE;
+  }
+
+cleanup:
+  dt_free_align(r224);
+  dt_free_align(r56);
+  dt_free_align(accum);
+  dt_free_align(weight);
+  return ok;
+}
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

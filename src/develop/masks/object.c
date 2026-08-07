@@ -1055,6 +1055,11 @@ static inline float _sample_plane(const float *const restrict src,
        + src[(size_t)y1 * sw + x1] * ax * ay;
 }
 
+static gboolean _finalize_keep_going(void *p)
+{
+  return dt_control_job_get_state((dt_job_t *)p) != DT_JOB_STATE_CANCELLED;
+}
+
 static int32_t _finalize_job_run(dt_job_t *job)
 {
   _finalize_job_t *const j = dt_control_job_get_params(job);
@@ -1205,6 +1210,57 @@ static int32_t _finalize_job_run(dt_job_t *job)
         hint_soft[(size_t)y * gw + x] = CLAMPF(v, 0.0f, 1.0f);
         hint_bin[(size_t)y * gw + x] = (v > j->threshold) ? 1.0f : 0.0f;
       }
+    }
+
+    // ---- tiled network pass at native scale ----
+    // the interactive loop's refinement worked at ~3 native px per network
+    // sample; here the same network re-derives the contour at 1:1, one
+    // inference per overlapping tile. this is what actually moves the
+    // contour onto the true edge; the guided filter afterwards only shapes
+    // sub-pixel coverage inside the band. degradation is graceful: without
+    // a usable model (missing, CPU provider, OOM) the hint stays as it is.
+    {
+      dt_ai_environment_t *net_env = dt_ai_env_init(NULL);
+      dt_refine_context_t *net = net_env ? dt_refine_load(net_env) : NULL;
+      if(net)
+      {
+        uint8_t *rgb8 = g_try_malloc((size_t)gw * gh * 3);
+        float *mask_net = dt_alloc_align_float(npix);
+        if(rgb8 && mask_net)
+        {
+          DT_OMP_FOR()
+          for(size_t k = 0; k < npix; k++)
+          {
+            for(int c = 0; c < 3; c++)
+              rgb8[k * 3 + c]
+                = (uint8_t)lrintf(CLAMPF(guide[k * 4 + c], 0.0f, 1.0f) * 255.0f);
+            mask_net[k] = hint_soft[k];
+          }
+
+          const double t_net = dt_get_wtime();
+          if(dt_refine_run_tiled(net, rgb8, gw, gh, mask_net, j->threshold,
+                                 _finalize_keep_going, job))
+          {
+            dt_print(DT_DEBUG_AI,
+                     "[object mask] finalise: tiled network pass (%.1fs)",
+                     dt_get_wtime() - t_net);
+            for(size_t k = 0; k < npix; k++)
+            {
+              hint_soft[k] = mask_net[k];
+              hint_bin[k] = (mask_net[k] > j->threshold) ? 1.0f : 0.0f;
+            }
+          }
+        }
+        g_free(rgb8);
+        dt_free_align(mask_net);
+      }
+      else
+        dt_print(DT_DEBUG_AI,
+                 "[object mask] finalise: refine model unavailable, "
+                 "keeping the interactive hint");
+      if(net) dt_refine_free(net);
+      if(net_env) dt_ai_env_destroy(net_env);
+      if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) goto cleanup;
     }
 
     // summed-area table of the binary hint, for the band weight below

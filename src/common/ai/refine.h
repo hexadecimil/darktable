@@ -74,6 +74,33 @@ int dt_refine_get_side(const dt_refine_context_t *ctx);
  * @param roi_h     region height, in mask pixels.
  * @return TRUE when the mask was modified, FALSE when it was left intact.
  */
+/** Cancellation probe for long refinements: return FALSE to abort. */
+typedef gboolean (*dt_refine_keep_going_t)(void *user);
+
+/**
+ * @brief Tiled refinement of the whole buffer at 1:1 scale.
+ *
+ * Runs the global pass (letterboxed to the graph side), then re-runs the
+ * network on overlapping side x side tiles at native scale, guided by the
+ * upsampled global predictions, and fuses the tiles with overlap cropping --
+ * the faithful port of the upstream high-resolution pipeline. Costs one
+ * inference per kept tile; tiles whose occupancy is outside [0.1, 0.9] are
+ * skipped, as upstream does.
+ *
+ * @param mask float alpha in [0,1], same grid as rgb, replaced on success.
+ *             On cancellation the global-pass result may already be written.
+ * @param keep_going polled between inferences; NULL means never cancel.
+ * @return TRUE when the tiled result was written.
+ */
+gboolean dt_refine_run_tiled(dt_refine_context_t *ctx,
+                             const uint8_t *const rgb,
+                             const int rgb_w,
+                             const int rgb_h,
+                             float *const mask,
+                             const float threshold,
+                             dt_refine_keep_going_t keep_going,
+                             void *user);
+
 gboolean dt_refine_run(dt_refine_context_t *ctx,
                        const uint8_t *const rgb,
                        const int rgb_w,
