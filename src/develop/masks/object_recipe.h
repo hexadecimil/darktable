@@ -71,6 +71,17 @@ gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
                                   gboolean (*keep_going)(void *),
                                   void *user);
 
+// schedule a background recompute of a recipe's mask file, guarded by an
+// anti-respawn table (one recompute in flight per recipe+image; a failure
+// is not retried within the session). safe to call from a pixelpipe thread:
+// it only marks the table and enqueues a job. when the job system is down
+// (darktable-cli) the job runs INLINE inside this call; the return value is
+// TRUE exactly in that case, meaning the file may exist right now and one
+// immediate retry of the read is worth it. GUI callers always get FALSE and
+// are notified by a pipe reprocess when the recompute lands.
+gboolean dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
+                                             const dt_imgid_t imgid);
+
 #else
 
 // without AI support a recipe can never be recomputed on this machine; the
@@ -84,6 +95,15 @@ static inline gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
   (void)imgid;
   (void)keep_going;
   (void)user;
+  return FALSE;
+}
+
+static inline gboolean
+dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
+                                    const dt_imgid_t imgid)
+{
+  (void)recipe;
+  (void)imgid;
   return FALSE;
 }
 

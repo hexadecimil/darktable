@@ -3030,6 +3030,144 @@ cleanup:
   return ok;
 }
 
+// ---------------------------- recompute scheduling --------------------------
+//
+// the anti-respawn table: one entry per (recipe, image) currently being
+// recomputed, or having failed this session. its key is a local hash of the
+// recipe blob and the image id -- cheaper than the file fingerprint (no
+// image-cache access) and just as unique for this purpose. entries are
+// marked BEFORE the job is added: dt_control_add_job runs the job INLINE
+// when the job system is down (CLI), and the very pipe that triggered us
+// would otherwise re-enter through its retry
+
+typedef enum _recompute_state_t
+{
+  _RECOMPUTE_RUNNING = 1,
+  _RECOMPUTE_FAILED = 2,   // no automatic retry this session
+} _recompute_state_t;
+
+static GMutex _recompute_mutex;
+static GHashTable *_recompute_table = NULL;   // gint64* key -> state
+
+typedef struct _recompute_job_t
+{
+  dt_rf_recipe_t recipe;
+  dt_imgid_t imgid;
+  gint64 key;
+  gboolean ran;
+  gboolean succeeded;
+} _recompute_job_t;
+
+// GUI thread: a recompute landed for the displayed image. the failed read
+// left the raster module's cache unhashed (auto-repair), so a new pipe run
+// rereads the file -- all we owe it is that run
+static gboolean _recompute_landed_idle(gpointer data)
+{
+  const dt_imgid_t imgid = GPOINTER_TO_INT(data);
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || dev->image_storage.id != imgid
+     || dt_view_get_current() != DT_VIEW_DARKROOM)
+    return G_SOURCE_REMOVE;
+
+  for(GList *l = dev->iop; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *m = l->data;
+    if(!strcmp(m->op, "rasterfile"))
+    {
+      dt_dev_reprocess_center(dev, m->iop_order);
+      break;
+    }
+  }
+  return G_SOURCE_REMOVE;
+}
+
+static int32_t _recompute_job_run(dt_job_t *job)
+{
+  _recompute_job_t *p = dt_control_job_get_params(job);
+  p->ran = TRUE;
+  p->succeeded = dt_object_recipe_compute(&p->recipe, p->imgid,
+                                          _finalize_keep_going, job);
+  if(p->succeeded && dt_control_running())
+    g_idle_add(_recompute_landed_idle, GINT_TO_POINTER(p->imgid));
+  return p->succeeded ? 0 : 1;
+}
+
+// runs on every outcome -- finished, cancelled, discarded on shutdown --
+// which is exactly why the table is settled here and nowhere else
+static void _recompute_job_destroy(void *data)
+{
+  _recompute_job_t *p = data;
+  g_mutex_lock(&_recompute_mutex);
+  if(_recompute_table)
+  {
+    if(p->ran && !p->succeeded)
+    {
+      gint64 *key = g_new(gint64, 1);
+      *key = p->key;
+      g_hash_table_replace(_recompute_table, key,
+                           GINT_TO_POINTER(_RECOMPUTE_FAILED));
+    }
+    else
+      // success (the file exists now) or never ran (cancelled): both allow
+      // a future schedule to look again
+      g_hash_table_remove(_recompute_table, &p->key);
+  }
+  g_mutex_unlock(&_recompute_mutex);
+  g_free(p);
+}
+
+gboolean dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
+                                             const dt_imgid_t imgid)
+{
+  if(!dt_rf_recipe_valid(recipe) || !dt_is_valid_imgid(imgid))
+    return FALSE;
+
+  dt_hash_t key64 = dt_hash(DT_INITHASH, recipe, sizeof(*recipe));
+  key64 = dt_hash(key64, &imgid, sizeof(imgid));
+
+  g_mutex_lock(&_recompute_mutex);
+  if(!_recompute_table)
+    _recompute_table
+      = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+  const gint64 lookup = (gint64)key64;
+  if(g_hash_table_lookup(_recompute_table, &lookup))
+  {
+    // already recomputing, or failed this session: nothing to retry now
+    g_mutex_unlock(&_recompute_mutex);
+    return FALSE;
+  }
+  gint64 *key = g_new(gint64, 1);
+  *key = (gint64)key64;
+  g_hash_table_insert(_recompute_table, key,
+                      GINT_TO_POINTER(_RECOMPUTE_RUNNING));
+  g_mutex_unlock(&_recompute_mutex);
+
+  _recompute_job_t *p = g_new0(_recompute_job_t, 1);
+  p->recipe = *recipe;
+  p->imgid = imgid;
+  p->key = (gint64)key64;
+
+  dt_job_t *job = dt_control_job_create(_recompute_job_run,
+                                        "AI mask recompute");
+  if(!job)
+  {
+    g_mutex_lock(&_recompute_mutex);
+    g_hash_table_remove(_recompute_table, &p->key);
+    g_mutex_unlock(&_recompute_mutex);
+    g_free(p);
+    return FALSE;
+  }
+  dt_control_job_set_params(job, p, _recompute_job_destroy);
+  dt_control_job_add_progress(job, _("recomputing AI mask"), TRUE);
+
+  // when the job system is down (darktable-cli) this call runs the job
+  // inline and returns after completion: tell the caller its file may
+  // exist NOW, one immediate retry turns a broken export into a correct one
+  const gboolean ran_inline = !dt_control_running();
+  dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
+  return ran_inline;
+}
+
 // transform mask-space forms to input-normalized coords and register them,
 // takes ownership of `forms` and `signs` lists (forms are appended to dev->forms)
 static dt_masks_form_t *

@@ -37,6 +37,7 @@
 #include "common/ras2vect.h"
 #include "common/rasterfile_recipe.h"
 #include "common/utility.h"
+#include "develop/masks/object_recipe.h"
 #include "imageio/imageio_png.h"
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
@@ -91,6 +92,9 @@ typedef struct dt_iop_rasterfile_data_t
   // file is then an expected transient state (the mask is recomputable and
   // a recompute is the answer), so the read path logs without toasting
   gboolean quiet;
+  // committed copy of the provenance recipe, so the pixelpipe safety net
+  // can schedule a recompute without touching the live GUI params
+  dt_rf_recipe_t recipe;
 } dt_iop_rasterfile_data_t;
 
 typedef struct dt_rasterfile_cache_t
@@ -520,6 +524,25 @@ static float *_get_rasterfile_mask(dt_dev_pixelpipe_iop_t *piece,
     cd->hash = cd->mask ? hash : DT_INVALID_HASH;
     dt_print(DT_DEBUG_PIPE,
              "got raster mask data %p %dx%d", cd->mask, cd->width, cd->height);
+
+    // safety net: a valid recipe can regenerate a missing or unreadable
+    // file. never from a thumbnail pipe (cheap pipes must not flood the
+    // job queue; the full/export pipes will come). scheduling only marks
+    // a table and enqueues -- except under darktable-cli, where the job
+    // system is down and the recompute runs INLINE inside the call (TRUE
+    // return): the file may exist right now, and one immediate retry
+    // turns a broken export into a correct one. leaving cd->hash invalid
+    // otherwise is deliberate: the next pipe run rereads the file
+    if(!cd->mask
+       && !(piece->pipe->type & DT_DEV_PIXELPIPE_THUMBNAIL)
+       && dt_rf_recipe_valid(&d->recipe)
+       && dt_object_recipe_schedule_recompute(&d->recipe,
+                                              piece->pipe->image.id))
+    {
+      cd->mask = _read_rasterfile(d->filepath, d->mode, d->quiet,
+                                  &cd->width, &cd->height);
+      cd->hash = cd->mask ? hash : DT_INVALID_HASH;
+    }
   }
   if(cd->mask)
   {
@@ -660,6 +683,7 @@ void commit_params(dt_iop_module_t *self,
   // a recipe makes the file recomputable: its absence is then a transient
   // state handled by a recompute, not a toast (see _read_rasterfile)
   d->quiet = dt_rf_recipe_valid(&p->recipe);
+  d->recipe = p->recipe;
   gchar *fullpath = NULL;
   if(dt_rf_recipe_valid(&p->recipe))
   {
@@ -748,6 +772,27 @@ void gui_changed(dt_iop_module_t *self,
 
     if(other)
       dt_dev_reprocess_center(self->dev, self->iop_order);
+
+    // proactive: a valid recipe whose cache file is missing (library moved
+    // to this machine, cache purged) is regenerated without waiting for a
+    // pipe to fail reading it. the anti-respawn table absorbs repeats
+    if(dt_rf_recipe_valid(&p->recipe) && self->dev)
+    {
+      const dt_image_t *img = &self->dev->image_storage;
+      gchar *base = g_path_get_basename(img->filename);
+      char *dot = g_strrstr(base, ".");
+      if(dot) *dot = '\0';
+      gchar *fname = dt_rasterfile_recipe_filename(&p->recipe, base,
+                                                   img->width, img->height);
+      gchar *root = dt_rasterfile_mask_root();
+      gchar *fullpath = g_build_filename(root, fname, NULL);
+      if(!g_file_test(fullpath, G_FILE_TEST_EXISTS))
+        dt_object_recipe_schedule_recompute(&p->recipe, img->id);
+      g_free(fullpath);
+      g_free(root);
+      g_free(fname);
+      g_free(base);
+    }
   }
 
   gtk_widget_set_sensitive(g->vectorize, p->path[0] && p->file[0]);
