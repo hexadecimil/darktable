@@ -469,6 +469,7 @@ if(USE_AI)
   FILE(GLOB SOURCE_FILES_AI
     "common/ai_models.c"
     "common/ai/segmentation.c"
+    "common/ai/refine.c"
     "common/ai/restore.c"
     "common/ai/restore_rgb.c"
     "common/ai/restore_raw_bayer.c"

@@ -17,6 +17,7 @@
 */
 
 #include "common/ai/segmentation.h"
+#include "common/ai/refine.h"
 #include "common/ai_models.h"
 #include "common/colorspaces.h"
 #include "common/debug.h"
@@ -50,6 +51,8 @@
 #define CONF_OBJECT_REFINE_BOUNDARY_ITER_KEY "plugins/darkroom/masks/object/refine_boundary_iterations"
 #define CONF_OBJECT_REFINE_BOUNDARY_SIGMA_COLOR_KEY "plugins/darkroom/masks/object/refine_boundary_sigma_color"
 #define CONF_OBJECT_REFINE_BOUNDARY_W_BILATERAL_KEY "plugins/darkroom/masks/object/refine_boundary_weight_bilateral"
+#define CONF_OBJECT_AI_REFINE_KEY "plugins/darkroom/masks/object/ai_refine"
+#define CONF_OBJECT_AI_REFINE_MARGIN_KEY "plugins/darkroom/masks/object/ai_refine_margin"
 
 // default render target (longest side in pixels).
 // the SAM encoder internally downscales to 1024 so encoding quality
@@ -97,6 +100,8 @@ typedef struct _object_data_t
   float preview_smoothing;          // current smoothing (potrace alphamax, 0.0-1.3)
   float preview_feather;            // path border/feather (0.0-0.5, normalized)
   gboolean preview_refine;          // run DenseCRF edge refinement on each decode
+  dt_refine_context_t *refine;      // CascadePSP contour refinement, loaded lazily
+  gboolean refine_failed;           // TRUE once loading failed, do not retry
 } _object_data_t;
 
 static _object_data_t *_get_data(dt_masks_form_gui_t *gui)
@@ -201,6 +206,7 @@ static void _destroy_data(_object_data_t *d)
     d->env = NULL;
   }
 
+  if(d->refine) dt_refine_free(d->refine);
   g_free(d->mask);
   _free_preview_forms(d);
   g_free(d);
@@ -774,6 +780,50 @@ static void _run_decoder(dt_masks_form_gui_t *gui)
         dt_print(DT_DEBUG_AI,
                  "[object mask] CRF refinement: %dx%d (%.2fs)",
                  mw, mh, dt_get_wtime() - t0);
+      }
+    }
+
+    // optional CascadePSP contour refinement. the segmentation decoder emits a
+    // fixed 256x256 mask, so on a large image one mask pixel spans dozens of
+    // image pixels and no resampling can recover the contour. a dedicated
+    // network re-derives it from the image, given the coarse mask as a hint.
+    if(dt_conf_get_bool(CONF_OBJECT_AI_REFINE_KEY) && !d->refine_failed)
+    {
+      int rgb_w = 0, rgb_h = 0;
+      const uint8_t *rgb = dt_seg_get_encoded_rgb(d->seg, &rgb_w, &rgb_h);
+      if(rgb && rgb_w == mw && rgb_h == mh)
+      {
+        if(!d->refine)
+        {
+          d->refine = dt_refine_load(d->env);
+          if(!d->refine)
+          {
+            d->refine_failed = TRUE;
+            dt_print(DT_DEBUG_AI,
+                     "[object mask] contour refinement unavailable, disabled for"
+                     " this mask");
+          }
+        }
+
+        if(d->refine)
+        {
+          const float margin
+            = CLAMPF(dt_conf_get_float(CONF_OBJECT_AI_REFINE_MARGIN_KEY), 0.0f, 0.5f);
+          dt_seg_point_t tl, br;
+          if(_compute_bbox(mask, mw, mh, threshold, margin, &tl, &br))
+          {
+            const int rx = CLAMP((int)tl.x, 0, mw - 1);
+            const int ry = CLAMP((int)tl.y, 0, mh - 1);
+            const int rw = CLAMP((int)br.x - rx + 1, 1, mw - rx);
+            const int rh = CLAMP((int)br.y - ry + 1, 1, mh - ry);
+            const double t1 = dt_get_wtime();
+            if(dt_refine_run(d->refine, rgb, mw, mh, mask, threshold,
+                             rx, ry, rw, rh))
+              dt_print(DT_DEBUG_AI,
+                       "[object mask] contour refinement: %dx%d region (%.2fs)",
+                       rw, rh, dt_get_wtime() - t1);
+          }
+        }
       }
     }
 
