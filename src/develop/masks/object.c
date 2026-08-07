@@ -24,8 +24,10 @@
 #include "common/densecrf.h"
 #include "common/guided_filter.h"
 
-// mirror of iop/rasterfile.c's parameter layout, which lives in the module
-// file only. keep in sync; introspection guards the size at history level.
+#include "common/rasterfile_recipe.h"
+// mirror of iop/rasterfile.c's parameter layout (v2), which lives in the
+// module file only. keep in sync; introspection guards the size at history
+// level, and the recipe struct itself is shared through rasterfile_recipe.h
 #define RASTERFILE_MAXFILE 2048
 typedef enum dt_iop_rasterfile_mode_t
 {
@@ -36,6 +38,8 @@ typedef struct dt_iop_rasterfile_params_t
   dt_iop_rasterfile_mode_t mode;
   char path[RASTERFILE_MAXFILE];
   char file[RASTERFILE_MAXFILE];
+  int32_t _pad;
+  dt_rf_recipe_t recipe;
 } dt_iop_rasterfile_params_t;
 #include "common/distance_transform.h"
 #include "common/mipmap_cache.h"
@@ -140,7 +144,27 @@ typedef struct _object_data_t
   gboolean decode_pending;          // GUI thread only: clicks landed mid-decode
   int decode_launched_count;        // GUI thread only: point count at launch
   gboolean decode_busy_shown;       // GUI thread only: busy_enter needs a leave
+  GArray *decode_marks;             // GUI thread only: one _decode_mark_t per
+                                    // accumulated click, provenance recording
 } _object_data_t;
+
+// clicks can outpace the compute (coalescing), so N points do not mean N
+// decodes. the provenance recipe must replay decodes exactly at the
+// boundaries where they really happened to reproduce the iterative
+// refinement context, so each click records whether a decode was launched
+// right after it, and with which threshold
+typedef struct _decode_mark_t
+{
+  float threshold;
+  gboolean launched;
+} _decode_mark_t;
+
+static void _marks_resize(_object_data_t *d, const int count)
+{
+  if(!d->decode_marks)
+    d->decode_marks = g_array_new(FALSE, TRUE, sizeof(_decode_mark_t));
+  g_array_set_size(d->decode_marks, count);
+}
 
 static _object_data_t *_get_data(dt_masks_form_gui_t *gui)
 {
@@ -253,6 +277,7 @@ static void _destroy_data(_object_data_t *d)
   }
 
   if(d->refine) dt_refine_free(d->refine);
+  if(d->decode_marks) g_array_free(d->decode_marks, TRUE);
   g_free(d->mask);
   _free_preview_forms(d);
   g_free(d);
@@ -964,6 +989,14 @@ static void _launch_decode(dt_masks_form_gui_t *gui)
 
   d->decode_pending = FALSE;
   d->decode_launched_count = gui->guipoints_count;
+
+  // provenance: this decode's boundary is the last point it covers
+  _marks_resize(d, gui->guipoints_count);
+  _decode_mark_t *mark = &g_array_index(d->decode_marks, _decode_mark_t,
+                                        job->n_prompt_points - 1);
+  mark->threshold = job->threshold;
+  mark->launched = TRUE;
+
   d->decode_job = job;
   g_atomic_int_set(&d->decode_state, DECODE_RUNNING);
   // the poll timer (started with the encode) redraws every 100 ms; the
@@ -1188,13 +1221,8 @@ static gchar *_build_mask_path(const dt_imgid_t imgid)
 
   // the mask file is a local cache, not part of the library: the recipe
   // lives in the history/XMP, the file can always be regenerated with a new
-  // finalisation. default to a per-machine data dir rather than erroring out
-  gchar *root = dt_conf_get_string("plugins/darkroom/segments/def_path");
-  if(!root || !*root)
-  {
-    g_free(root);
-    root = g_build_filename(g_get_user_data_dir(), "darktable", "masks", NULL);
-  }
+  // finalisation
+  gchar *root = dt_rasterfile_mask_root();
   if(g_mkdir_with_parents(root, 0755) != 0)
   {
     dt_print(DT_DEBUG_AI, "[object mask] cannot create folder: %s", root);
@@ -1261,7 +1289,145 @@ typedef struct _finalize_job_t
   int cleanup;          // potrace turdsize, working-grid px^2 (scaled inside)
   float smoothing;      // potrace alphamax
   float feather;        // border applied to the resulting path points
+  // provenance of the mask, captured on the GUI thread at launch. when
+  // valid, outpath holds the content-addressed target file name derived
+  // from its fingerprint; otherwise the job falls back to a sequential name
+  dt_rf_recipe_t recipe;
+  gboolean has_recipe;
+  gchar *outpath;       // owned by the job
 } _finalize_job_t;
+
+// GUI thread: record everything needed to regenerate the finalised mask
+// file from the raw -- the provenance recipe stored with the raster
+// module's params, so a library opened on another machine (or after the
+// cache was purged) can recompute the file instead of showing a broken
+// mask. returns FALSE when the session cannot be described (more clicks
+// than the recipe holds); the caller then falls back to a plain file
+static gboolean _capture_recipe(_object_data_t *d,
+                                dt_masks_form_gui_t *gui,
+                                dt_rf_recipe_t *recipe)
+{
+  memset(recipe, 0, sizeof(*recipe));
+  const int n = gui->guipoints_count;
+  if(n <= 0 || n > DT_RF_RECIPE_MAX_POINTS)
+    return FALSE;
+
+  float wd, ht, iwidth, iheight;
+  dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
+  if(iwidth <= 0 || iheight <= 0)
+    return FALSE;
+
+  recipe->magic = DT_RF_RECIPE_MAGIC;
+  recipe->version = DT_RF_RECIPE_VERSION;
+  // the hash of the distortion state the ENCODING was made on -- the render
+  // the prompt points were clicked against, not whatever the history holds
+  // at capture time
+  recipe->distort_hash = (int64_t)d->encoded_distort_hash;
+
+  const char *seg_id = dt_seg_get_model_id(d->seg);
+  if(seg_id)
+  {
+    g_strlcpy(recipe->seg_model, seg_id, sizeof(recipe->seg_model));
+    const char *v = dt_ai_model_get_version(seg_id);
+    if(v)
+      g_strlcpy(recipe->seg_model_version, v,
+                sizeof(recipe->seg_model_version));
+  }
+
+  recipe->ai_refine
+    = (dt_conf_get_bool(CONF_OBJECT_AI_REFINE_KEY) && !d->refine_failed)
+      ? 1 : 0;
+  if(recipe->ai_refine)
+  {
+    char *refine_id = dt_ai_models_get_active_for_task("refine");
+    if(refine_id)
+    {
+      g_strlcpy(recipe->refine_model, refine_id,
+                sizeof(recipe->refine_model));
+      const char *v = dt_ai_model_get_version(refine_id);
+      if(v)
+        g_strlcpy(recipe->refine_model_version, v,
+                  sizeof(recipe->refine_model_version));
+      g_free(refine_id);
+    }
+  }
+
+  recipe->encode_w = d->encode_w;
+  recipe->encode_h = d->encode_h;
+  recipe->render_size = dt_conf_key_exists(CONF_OBJECT_RENDER_SIZE_KEY)
+    ? dt_conf_get_int(CONF_OBJECT_RENDER_SIZE_KEY)
+    : SEG_RENDER_DEFAULT;
+  recipe->refine_passes
+    = CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_PASSES_KEY), 1, 3);
+  recipe->threshold
+    = CLAMP(dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY), 0.3f, 0.9f);
+  recipe->crf_enabled = d->preview_refine ? 1 : 0;
+  recipe->crf_iterations
+    = CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_BOUNDARY_ITER_KEY), 1, 10);
+  recipe->crf_sigma_color
+    = CLAMP(dt_conf_get_float(CONF_OBJECT_REFINE_BOUNDARY_SIGMA_COLOR_KEY),
+            1.0f, 50.0f);
+  recipe->crf_w_bilateral
+    = CLAMP(dt_conf_get_float(CONF_OBJECT_REFINE_BOUNDARY_W_BILATERAL_KEY),
+            0.5f, 30.0f);
+  recipe->ai_refine_margin
+    = CLAMPF(dt_conf_get_float(CONF_OBJECT_AI_REFINE_MARGIN_KEY), 0.0f, 0.5f);
+  recipe->cleanup = d->preview_cleanup;
+  recipe->smoothing = d->preview_smoothing;
+  recipe->feather = d->preview_feather;
+
+  // points: preview-pipe pixel space -> normalized input space, the same
+  // convention every stored mask form uses
+  const float *gp = dt_masks_dynbuf_buffer(gui->guipoints);
+  const float *gpp = dt_masks_dynbuf_buffer(gui->guipoints_payload);
+  float *pts = g_new(float, (size_t)n * 2);
+  memcpy(pts, gp, (size_t)n * 2 * sizeof(float));
+  dt_dev_distort_backtransform(darktable.develop, pts, n);
+
+  recipe->n_points = n;
+  for(int i = 0; i < n; i++)
+  {
+    dt_rf_recipe_point_t *rp = &recipe->points[i];
+    rp->x = pts[i * 2 + 0] / iwidth;
+    rp->y = pts[i * 2 + 1] / iheight;
+    rp->label = (int32_t)gpp[i];
+    if(d->decode_marks && i < (int)d->decode_marks->len)
+    {
+      const _decode_mark_t *mark
+        = &g_array_index(d->decode_marks, _decode_mark_t, i);
+      rp->decode_after = mark->launched ? 1 : 0;
+      rp->threshold = mark->launched ? mark->threshold : 0.0f;
+    }
+  }
+  g_free(pts);
+  return TRUE;
+}
+
+// GUI thread: the content-addressed target path of a recipe, under the
+// local mask root. must derive exactly what rasterfile.c's commit_params
+// derives on resolution. NULL when the root folder cannot be created
+static gchar *_recipe_outpath(const dt_rf_recipe_t *recipe)
+{
+  const dt_image_t *img = &darktable.develop->image_storage;
+  gchar *base = g_path_get_basename(img->filename);
+  char *dot = g_strrstr(base, ".");
+  if(dot) *dot = '\0';
+  gchar *fname = dt_rasterfile_recipe_filename(recipe, base,
+                                               img->width, img->height);
+  gchar *root = dt_rasterfile_mask_root();
+  gchar *outpath = NULL;
+  if(g_mkdir_with_parents(root, 0755) == 0)
+    outpath = g_build_filename(root, fname, NULL);
+  else
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] cannot create folder: %s", root);
+    dt_control_log(_("cannot create raster mask folder"));
+  }
+  g_free(root);
+  g_free(fname);
+  g_free(base);
+  return outpath;
+}
 
 /* Payload handed from the worker job to the GUI thread once the file is
  * written: everything needed to wire the mask into the pipeline. */
@@ -1275,6 +1441,8 @@ typedef struct _finalize_apply_t
   gboolean vectorize;
   GList *forms;         // dt_masks_form_t*, points already input-normalized
   GList *signs;
+  dt_rf_recipe_t recipe;  // provenance stored with the raster module params
+  gboolean has_recipe;
 } _finalize_apply_t;
 
 /* GUI thread: activate the external raster mask module on the produced file
@@ -1405,7 +1573,9 @@ static gboolean _finalize_apply_idle(gpointer data)
   }
 
   {
-    // params layout of rasterfile: { mode; char path[2048]; char file[2048] }
+    // v2 params of rasterfile, through the layout mirror at the top of this
+    // file. path/file are informative when a recipe is present: resolution
+    // then derives the file name from the recipe fingerprint
     dt_iop_rasterfile_params_t *p = (dt_iop_rasterfile_params_t *)rf->params;
     gchar *dir = g_path_get_dirname(a->outpath);
     gchar *base = g_path_get_basename(a->outpath);
@@ -1414,6 +1584,10 @@ static gboolean _finalize_apply_idle(gpointer data)
     g_strlcpy(p->file, base, sizeof(p->file));
     g_free(dir);
     g_free(base);
+    if(a->has_recipe)
+      p->recipe = a->recipe;
+    else
+      memset(&p->recipe, 0, sizeof(p->recipe));
     rf->enabled = TRUE;
     dt_dev_add_history_item(dev, rf, TRUE);
   }
@@ -1474,6 +1648,7 @@ static void _finalize_job_destroy(void *p)
   _finalize_job_t *j = p;
   if(!j) return;
   g_free(j->hint);
+  g_free(j->outpath);
   g_free(j);
 }
 
@@ -1869,8 +2044,34 @@ static int32_t _finalize_job_run(dt_job_t *job)
     goto cleanup;
   }
 
-  outpath = _build_mask_path(j->imgid);
-  if(outpath && _write_mask_png16(outpath, alpha_full, pw, ph))
+  gboolean written = FALSE;
+  if(j->has_recipe && j->outpath)
+  {
+    // content-addressed target: write to a temp name, move in atomically.
+    // an existing file under the same fingerprint was made from the same
+    // recipe -- it already is this content, keep it
+    outpath = g_strdup(j->outpath);
+    gchar *tmp = g_strdup_printf("%s.tmp", outpath);
+    written = _write_mask_png16(tmp, alpha_full, pw, ph);
+    if(written)
+    {
+      if(g_file_test(outpath, G_FILE_TEST_EXISTS))
+        g_unlink(tmp);
+      else if(g_rename(tmp, outpath) != 0)
+      {
+        g_unlink(tmp);
+        written = FALSE;
+      }
+    }
+    g_free(tmp);
+  }
+  else
+  {
+    outpath = _build_mask_path(j->imgid);
+    written = outpath && _write_mask_png16(outpath, alpha_full, pw, ph);
+  }
+
+  if(written)
   {
     size_t soft = 0;
     for(size_t k = 0; k < (size_t)pw * ph; k++)
@@ -1892,6 +2093,9 @@ static int32_t _finalize_job_run(dt_job_t *job)
     a->has_target = j->has_target;
     memcpy(a->target_op, j->target_op, sizeof(a->target_op));
     a->target_multi_priority = j->target_multi_priority;
+    a->has_recipe = j->has_recipe;
+    if(j->has_recipe)
+      a->recipe = j->recipe;
     g_idle_add(_finalize_apply_idle, a);
     ok = TRUE;
   }
@@ -1913,8 +2117,9 @@ cleanup:
   return ok ? 0 : 1;
 }
 
-/* GUI thread: snapshot the working mask and hand it to a worker job. */
+// GUI thread: snapshot the working mask and hand it to a worker job
 static gboolean _launch_native_finalize(_object_data_t *d,
+                                        dt_masks_form_gui_t *gui,
                                         dt_iop_module_t *target,
                                         const gboolean vectorize)
 {
@@ -1957,6 +2162,23 @@ static gboolean _launch_native_finalize(_object_data_t *d,
   j->cleanup = d->preview_cleanup;
   j->smoothing = d->preview_smoothing;
   j->feather = d->preview_feather;
+
+  // the raster file gets a provenance recipe: it makes the file
+  // recomputable and names it by content. sessions the recipe cannot hold
+  // (too many clicks) fall back to a plain sequential file name
+  if(!vectorize)
+  {
+    j->has_recipe = _capture_recipe(d, gui, &j->recipe);
+    if(j->has_recipe)
+    {
+      j->outpath = _recipe_outpath(&j->recipe);
+      if(!j->outpath)
+        j->has_recipe = FALSE;
+    }
+    if(!j->has_recipe)
+      memset(&j->recipe, 0, sizeof(j->recipe));
+  }
+
   if(target)
   {
     g_strlcpy(j->target_op, target->op, sizeof(j->target_op));
@@ -2240,6 +2462,7 @@ static void _clear_selection(dt_masks_form_gui_t *gui)
   if(gui->guipoints_payload)
     dt_masks_dynbuf_reset(gui->guipoints_payload);
   gui->guipoints_count = 0;
+  _marks_resize(d, 0);
 
   g_free(d->mask);
   d->mask = NULL;
@@ -2333,7 +2556,7 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
     if(d && d->has_selection && d->mask
        && dt_modifier_is(state, GDK_SHIFT_MASK))
     {
-      if(!_launch_native_finalize(d, module, FALSE))
+      if(!_launch_native_finalize(d, gui, module, FALSE))
         return 1;   // busy: keep the session, the user can retry
 
       // leave creation mode right away: the mask will be wired into the
@@ -2359,7 +2582,7 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
     // back to the classic working-grid vectorisation when the job is busy
     // or when there is no refined mask to work from
     if(d && d->has_selection && d->mask
-       && _launch_native_finalize(d, module, TRUE))
+       && _launch_native_finalize(d, gui, module, TRUE))
     {
       gui->creation = FALSE;
       gui->creation_continuous = FALSE;
@@ -2486,6 +2709,7 @@ static int _object_events_button_released(dt_iop_module_t *module,
   dt_masks_dynbuf_add_2(gui->guipoints, d->drag_start_x, d->drag_start_y);
   dt_masks_dynbuf_add(gui->guipoints_payload, label);
   gui->guipoints_count++;
+  _marks_resize(d, gui->guipoints_count);   // new click: no decode yet
   d->has_selection = TRUE;
 
   // coalescing decided inside _launch_decode (single source of truth); the
@@ -2643,6 +2867,7 @@ static void _object_events_post_expose(cairo_t *cr,
     if(gui->guipoints_payload)
       dt_masks_dynbuf_reset(gui->guipoints_payload);
     gui->guipoints_count = 0;
+    _marks_resize(d, 0);
   }
 
   // eager encoding: load model and encode image as soon as tool opens

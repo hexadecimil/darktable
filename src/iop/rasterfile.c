@@ -35,6 +35,7 @@
 #include "common/fast_guided_filter.h"
 #include "common/pfm.h"
 #include "common/ras2vect.h"
+#include "common/rasterfile_recipe.h"
 #include "common/utility.h"
 #include "imageio/imageio_png.h"
 #include "gui/accelerators.h"
@@ -53,7 +54,7 @@
 
 #define SET_THRESHOLD 0.6f
 
-DT_MODULE_INTROSPECTION(1, dt_iop_rasterfile_params_t)
+DT_MODULE_INTROSPECTION(2, dt_iop_rasterfile_params_t)
 
 typedef enum dt_iop_rasterfile_mode_t
 {
@@ -73,6 +74,13 @@ typedef struct dt_iop_rasterfile_params_t
   dt_iop_rasterfile_mode_t mode;  // $DEFAULT: DT_RASTERFILE_MODE_ALL $DESCRIPTION: "mode"
   char path[RASTERFILE_MAXFILE];
   char file[RASTERFILE_MAXFILE];
+  int32_t _pad;                   // explicit: aligns the recipe to 8 bytes
+  // provenance of an AI-generated mask file, or all-zero for a plain file
+  // picked by hand. when valid, the file is resolved content-addressed
+  // against the LOCAL mask root (see commit_params); path/file above are
+  // then informative only, so a library moved between machines keeps
+  // resolving. inert bytes on builds without the AI subsystem
+  dt_rf_recipe_t recipe;
 } dt_iop_rasterfile_params_t;
 
 typedef struct dt_iop_rasterfile_data_t
@@ -141,6 +149,28 @@ int legacy_params(dt_iop_module_t *self,
                   int32_t *new_params_size,
                   int *new_version)
 {
+  typedef struct dt_iop_rasterfile_params_v1_t
+  {
+    dt_iop_rasterfile_mode_t mode;
+    char path[RASTERFILE_MAXFILE];
+    char file[RASTERFILE_MAXFILE];
+  } dt_iop_rasterfile_params_v1_t;
+
+  if(old_version == 1)
+  {
+    const dt_iop_rasterfile_params_v1_t *o = old_params;
+    dt_iop_rasterfile_params_t *n = calloc(1, sizeof(dt_iop_rasterfile_params_t));
+
+    n->mode = o->mode;
+    memcpy(n->path, o->path, sizeof(n->path));
+    memcpy(n->file, o->file, sizeof(n->file));
+    // recipe stays zeroed: no provenance, plain path/file resolution
+
+    *new_params = n;
+    *new_params_size = sizeof(dt_iop_rasterfile_params_t);
+    *new_version = 2;
+    return 0;
+  }
   return 1;
 }
 
@@ -407,6 +437,10 @@ static void _fbutton_clicked(GtkWidget *widget, dt_iop_module_t *self)
       dt_strlcpy_to_fixed(p->file, bname, sizeof(p->file));
       g_free(bname);
 
+      // picking a file by hand detaches any AI provenance: from here on the
+      // chosen file IS the mask, no fingerprint may override it
+      memset(&p->recipe, 0, sizeof(p->recipe));
+
       _update_filepath(self);
       dt_dev_add_history_item(darktable.develop, self, TRUE);
     }
@@ -428,6 +462,8 @@ static void _file_callback(GtkWidget *widget, dt_iop_module_t *self)
   dt_iop_rasterfile_params_t *p = self->params;
   const gchar *select = dt_bauhaus_combobox_get_text(widget);
   dt_strlcpy_to_fixed(p->file, select, sizeof(p->file));
+  // same detachment as the file chooser: a hand-picked file wins
+  memset(&p->recipe, 0, sizeof(p->recipe));
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 }
 
@@ -607,7 +643,27 @@ void commit_params(dt_iop_module_t *self,
   dt_iop_rasterfile_data_t *d = piece->data;
 
   d->mode = p->mode;
-  gchar *fullpath = g_build_filename(p->path, p->file, NULL);
+  gchar *fullpath = NULL;
+  if(dt_rf_recipe_valid(&p->recipe))
+  {
+    // content-addressed resolution: the recipe fingerprint names the file
+    // under the LOCAL mask root, whatever path was recorded on the machine
+    // that produced it
+    const dt_image_t *img = &pipe->image;
+    gchar *base = g_path_get_basename(img->filename);
+    char *dot = g_strrstr(base, ".");
+    if(dot) *dot = '\0';
+    gchar *fname = dt_rasterfile_recipe_filename(&p->recipe, base,
+                                                 img->width, img->height);
+    gchar *root = dt_rasterfile_mask_root();
+    fullpath = g_build_filename(root, fname, NULL);
+    g_free(root);
+    g_free(fname);
+    g_free(base);
+  }
+  else
+    fullpath = g_build_filename(p->path, p->file, NULL);
+
   dt_strlcpy_to_fixed(d->filepath, fullpath, sizeof(d->filepath));
   g_free(fullpath);
 }
@@ -635,6 +691,7 @@ void reload_defaults(dt_iop_module_t *self)
   dt_iop_rasterfile_params_t *dp = self->default_params;
   memset(dp->path, 0, sizeof(dp->path));
   memset(dp->file, 0, sizeof(dp->file));
+  memset(&dp->recipe, 0, sizeof(dp->recipe));
 }
 
 void distort_mask(dt_iop_module_t *self,
@@ -691,6 +748,7 @@ void init(dt_iop_module_t *self)
   dt_iop_rasterfile_params_t *d = self->default_params;
   memset(d->path, 0, sizeof(d->path));
   memset(d->file, 0, sizeof(d->file));
+  memset(&d->recipe, 0, sizeof(d->recipe));
 
   /*
     Implementation note and reminder:
