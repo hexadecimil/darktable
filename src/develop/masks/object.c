@@ -1630,8 +1630,12 @@ static int32_t _finalize_job_run(dt_job_t *job)
         pt->ctrl1[1] = (pt->ctrl1[1] + cropy) / iheight_;
         pt->ctrl2[0] = (pt->ctrl2[0] + cropx) / iwidth_;
         pt->ctrl2[1] = (pt->ctrl2[1] + cropy) / iheight_;
-        pt->border[0] = j->feather;
-        pt->border[1] = j->feather;
+        // a precise contour needs no imposed falloff: below the legacy
+        // floor, collapse the border to a sub-pixel sliver -- visually a
+        // hard edge, structurally still a valid border for the path editor
+        const float fb = (j->feather < 0.0005f) ? 0.00002f : j->feather;
+        pt->border[0] = fb;
+        pt->border[1] = fb;
       }
     }
 
@@ -2798,7 +2802,8 @@ static void _object_modify_property(dt_masks_form_t *const form,
       float feather = dt_conf_get_float(CONF_OBJECT_FEATHER_KEY);
       if(feather < 0.0005f && ratio > 1.0f)
         feather = 0.001f; // bootstrap from zero on increase
-      feather = CLAMP(feather * ratio, 0.0005f, 1.0f);
+      feather = CLAMP(feather * ratio, 0.0f, 1.0f);
+      if(feather < 0.0002f) feather = 0.0f; // snap to a hard edge
       dt_conf_set_float(CONF_OBJECT_FEATHER_KEY, feather);
       if(d)
       {

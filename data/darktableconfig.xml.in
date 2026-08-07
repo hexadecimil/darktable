@@ -3683,8 +3683,8 @@
   </dtconfig>
   <dtconfig>
     <name>plugins/darkroom/masks/object/feather</name>
-    <type min="0.0005" max="1.0">float</type>
-    <default>0.0005</default>
+    <type min="0.0" max="1.0">float</type>
+    <default>0.0</default>
     <shortdescription>AI mask feather</shortdescription>
     <longdescription>feather (border softness) applied to the resulting path mask. 0 = hard edge, higher values create a softer transition.</longdescription>
   </dtconfig>
