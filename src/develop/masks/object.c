@@ -24,7 +24,6 @@
 #include "common/densecrf.h"
 #include "common/distance_transform.h"
 #include "common/mipmap_cache.h"
-#include "common/pfm.h"
 #include "common/ras2vect.h"
 #include "control/conf.h"
 #include "control/control.h"
@@ -35,6 +34,9 @@
 #include "develop/pixelpipe_hb.h"
 #include "gui/gtk.h"
 #include "imageio/imageio_common.h"
+
+#include <png.h>
+#include <setjmp.h>
 #include "views/view.h"
 
 #include <limits.h>
@@ -885,6 +887,68 @@ static void _update_preview(_object_data_t *d)
 
 // save the raster mask as an RGB PNG to the raster mask root folder
 // (compatible with the external raster masks module)
+/* Write a mask as a 16-bit RGB PNG. The external raster mask module reads that
+ * depth with a 1/65535 normaliser and no thresholding, so the alpha survives
+ * intact. The three channels carry the same value; deflate collapses them. */
+static gboolean _write_mask_png16(const char *path,
+                                  const float *const restrict mask,
+                                  const int w,
+                                  const int h)
+{
+  FILE *f = g_fopen(path, "wb");
+  if(!f) return FALSE;
+
+  png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+  if(!png)
+  {
+    fclose(f);
+    return FALSE;
+  }
+  png_infop info = png_create_info_struct(png);
+  if(!info || setjmp(png_jmpbuf(png)))
+  {
+    png_destroy_write_struct(&png, info ? &info : NULL);
+    fclose(f);
+    return FALSE;
+  }
+
+  png_init_io(png, f);
+  png_set_IHDR(png, info, w, h, 16, PNG_COLOR_TYPE_RGB,
+               PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
+               PNG_FILTER_TYPE_DEFAULT);
+  png_set_compression_level(png, 6);
+  png_write_info(png, info);
+  png_set_swap(png);   // little-endian host, PNG wants big-endian samples
+
+  uint16_t *row = g_try_malloc((size_t)w * 3 * sizeof(uint16_t));
+  if(!row)
+  {
+    png_destroy_write_struct(&png, &info);
+    fclose(f);
+    return FALSE;
+  }
+
+  for(int y = 0; y < h; y++)
+  {
+    const float *const src = mask + (size_t)y * w;
+    for(int x = 0; x < w; x++)
+    {
+      const uint16_t v = (uint16_t)lrintf(CLAMPF(src[x], 0.0f, 1.0f) * 65535.0f);
+      row[x * 3 + 0] = v;
+      row[x * 3 + 1] = v;
+      row[x * 3 + 2] = v;
+    }
+    png_write_row(png, (png_bytep)row);
+  }
+
+  png_write_end(png, NULL);
+  png_destroy_write_struct(&png, &info);
+  g_free(row);
+  fclose(f);
+  return TRUE;
+}
+
+
 static void _save_raster_mask(const float *mask,
                               const int w,
                               const int h,
@@ -921,7 +985,7 @@ static void _save_raster_mask(const float *mask,
   if(dot) *dot = '\0';
 
   // build output path, append _1, _2, ... if file already exists
-  gchar *mask_name = g_strdup_printf("%s_mask.pfm", basename);
+  gchar *mask_name = g_strdup_printf("%s_mask.png", basename);
   gchar *outpath = g_build_filename(root, mask_name, NULL);
   g_free(mask_name);
 
@@ -930,7 +994,7 @@ static void _save_raster_mask(const float *mask,
       seq++)
   {
     g_free(outpath);
-    mask_name = g_strdup_printf("%s_mask_%d.pfm", basename, seq);
+    mask_name = g_strdup_printf("%s_mask_%d.png", basename, seq);
     outpath = g_build_filename(root, mask_name, NULL);
     g_free(mask_name);
   }
@@ -938,23 +1002,30 @@ static void _save_raster_mask(const float *mask,
   g_free(basename);
   g_free(root);
 
-  // Write the alpha as a single-channel float PFM rather than a binarised PNG.
+  // Write the alpha as a 16-bit PNG rather than a binarised 8-bit one.
   //
-  // Thresholding here threw away everything the refinement produced: the
-  // transition band collapsed to one bit, so a pixel covered at 40% became
-  // either fully in or fully out. The raster mask module reads PFM natively
-  // (rasterfile.c), replicating the single plane across channels, so the
-  // continuous alpha now survives all the way to the pipeline.
-  dt_write_pfm(outpath, (size_t)w, (size_t)h, mask, sizeof(float));
+  // Thresholding threw away everything the refinement produced: the transition
+  // band collapsed to a single bit, so a pixel covered at 40% became either
+  // fully in or fully out. 16 bits give 65536 levels, far beyond what the
+  // refinement can resolve, and the raster mask module already reads that
+  // depth without thresholding (rasterfile.c).
+  //
+  // PNG rather than PFM on purpose: a mask is mostly flat 0 and 1 with a thin
+  // transition band, which deflate compresses extremely well. The same data as
+  // raw float would be 4 bytes per pixel with no compression at all.
+  const gboolean ok = _write_mask_png16(outpath, mask, w, h);
 
-  if(g_file_test(outpath, G_FILE_TEST_EXISTS))
+  if(ok)
   {
-    int soft = 0;
+    size_t soft = 0;
     for(size_t k = 0; k < (size_t)w * h; k++)
       if(mask[k] > 0.05f && mask[k] < 0.95f) soft++;
+
+    GStatBuf st;
+    const double mo = (g_stat(outpath, &st) == 0) ? st.st_size / 1048576.0 : 0.0;
     dt_print(DT_DEBUG_AI,
-             "[object mask] raster mask saved: %s (%dx%d, %.3f%% soft pixels)",
-             outpath, w, h, 100.0 * soft / ((double)w * h));
+             "[object mask] raster mask saved: %s (%dx%d, %.1f MB, %.3f%% soft pixels)",
+             outpath, w, h, mo, 100.0 * soft / ((double)w * h));
     dt_control_log(_("raster mask saved"));
   }
   else
