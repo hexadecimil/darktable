@@ -527,21 +527,31 @@ static float *_get_rasterfile_mask(dt_dev_pixelpipe_iop_t *piece,
 
     // safety net: a valid recipe can regenerate a missing or unreadable
     // file. never from a thumbnail pipe (cheap pipes must not flood the
-    // job queue; the full/export pipes will come). scheduling only marks
-    // a table and enqueues -- except under darktable-cli, where the job
-    // system is down and the recompute runs INLINE inside the call (TRUE
-    // return): the file may exist right now, and one immediate retry
-    // turns a broken export into a correct one. leaving cd->hash invalid
-    // otherwise is deliberate: the next pipe run rereads the file
+    // job queue; the full/export pipes will come). two regimes:
+    //  - a pipe whose output leaves the machine (export) or a context
+    //    with no job system at all (darktable-cli, whose export is the
+    //    only reason its pipes run) blocks and recomputes NOW: these
+    //    pipes run once, a wrong output is final;
+    //  - the darkroom schedules asynchronously and gets reprocessed when
+    //    the recompute lands. leaving cd->hash invalid meanwhile is
+    //    deliberate: the next pipe run rereads the file
     if(!cd->mask
        && !(piece->pipe->type & DT_DEV_PIXELPIPE_THUMBNAIL)
-       && dt_rf_recipe_valid(&d->recipe)
-       && dt_object_recipe_schedule_recompute(&d->recipe,
-                                              piece->pipe->image.id))
+       && dt_rf_recipe_valid(&d->recipe))
     {
-      cd->mask = _read_rasterfile(d->filepath, d->mode, d->quiet,
-                                  &cd->width, &cd->height);
-      cd->hash = cd->mask ? hash : DT_INVALID_HASH;
+      const gboolean sync_ctx
+        = (piece->pipe->type & DT_DEV_PIXELPIPE_EXPORT)
+          || !dt_control_running();
+      const gboolean retry_now = sync_ctx
+        ? dt_object_recipe_recompute_now(&d->recipe, piece->pipe->image.id)
+        : dt_object_recipe_schedule_recompute(&d->recipe,
+                                              piece->pipe->image.id);
+      if(retry_now)
+      {
+        cd->mask = _read_rasterfile(d->filepath, d->mode, d->quiet,
+                                    &cd->width, &cd->height);
+        cd->hash = cd->mask ? hash : DT_INVALID_HASH;
+      }
     }
   }
   if(cd->mask)
@@ -695,7 +705,8 @@ void commit_params(dt_iop_module_t *self,
     char *dot = g_strrstr(base, ".");
     if(dot) *dot = '\0';
     gchar *fname = dt_rasterfile_recipe_filename(&p->recipe, base,
-                                                 img->width, img->height);
+                                                 img->width, img->height,
+                                                 img->exif_datetime_taken);
     gchar *root = dt_rasterfile_mask_root();
     fullpath = g_build_filename(root, fname, NULL);
     g_free(root);
@@ -783,7 +794,8 @@ void gui_changed(dt_iop_module_t *self,
       char *dot = g_strrstr(base, ".");
       if(dot) *dot = '\0';
       gchar *fname = dt_rasterfile_recipe_filename(&p->recipe, base,
-                                                   img->width, img->height);
+                                                   img->width, img->height,
+                                                   img->exif_datetime_taken);
       gchar *root = dt_rasterfile_mask_root();
       gchar *fullpath = g_build_filename(root, fname, NULL);
       if(!g_file_test(fullpath, G_FILE_TEST_EXISTS))

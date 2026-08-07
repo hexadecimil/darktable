@@ -1287,18 +1287,30 @@ static gboolean _write_mask_png16(const char *path,
 // PNG signature. a zero-byte or truncated file under a content-addressed
 // name would otherwise be trusted forever ("exists = success") and the
 // broken mask could never self-repair
+// this validation must be at least as strict as the raster module's reader:
+// a file it accepts but the reader rejects would loop forever between the
+// pipe's failed read and a recompute that trusts the existing file. the
+// signature catches wrong files, the trailing IEND chunk catches truncation
+// -- the two ways a PNG breaks without a decoder
 static gboolean _mask_png_valid(const char *path)
 {
   GStatBuf st;
-  if(g_stat(path, &st) != 0 || st.st_size <= 0)
+  // 8 signature bytes + IHDR (25) + IEND (12) is the bare minimum
+  if(g_stat(path, &st) != 0 || st.st_size < 45)
     return FALSE;
   FILE *f = g_fopen(path, "rb");
   if(!f)
     return FALSE;
   guchar sig[8] = { 0 };
-  const size_t got = fread(sig, 1, sizeof(sig), f);
+  guchar tail[12] = { 0 };
+  const gboolean ok =
+    fread(sig, 1, sizeof(sig), f) == sizeof(sig)
+    && png_sig_cmp(sig, 0, sizeof(sig)) == 0
+    && fseek(f, -(long)sizeof(tail), SEEK_END) == 0
+    && fread(tail, 1, sizeof(tail), f) == sizeof(tail)
+    && memcmp(tail + 4, "IEND", 4) == 0;
   fclose(f);
-  return got == sizeof(sig) && png_sig_cmp(sig, 0, sizeof(sig)) == 0;
+  return ok;
 }
 
 // content-addressed write: to a temp name unique to this writer, then an
@@ -1542,7 +1554,8 @@ static gchar *_recipe_outpath(const dt_rf_recipe_t *recipe)
   char *dot = g_strrstr(base, ".");
   if(dot) *dot = '\0';
   gchar *fname = dt_rasterfile_recipe_filename(recipe, base,
-                                               img->width, img->height);
+                                               img->width, img->height,
+                                               img->exif_datetime_taken);
   gchar *root = dt_rasterfile_mask_root();
   gchar *outpath = NULL;
   if(g_mkdir_with_parents(root, 0755) == 0)
@@ -1852,7 +1865,10 @@ static inline float _sample_plane(const float *const restrict src,
 
 static gboolean _finalize_keep_going(void *p)
 {
-  return dt_control_job_get_state((dt_job_t *)p) != DT_JOB_STATE_CANCELLED;
+  // also bail out when the whole job system is going down: a multi-minute
+  // compute must not hold the application's exit hostage
+  return dt_control_running()
+         && dt_control_job_get_state((dt_job_t *)p) != DT_JOB_STATE_CANCELLED;
 }
 
 // request of the native render core below, grouped so the two call sites
@@ -2512,13 +2528,14 @@ static gboolean _launch_native_finalize(_object_data_t *d,
  *    refinement pass succeeded; the replay's own attempt may degrade
  *    differently (model pinning above only guarantees the same weights). */
 
-gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
-                                  const dt_imgid_t imgid,
-                                  gboolean (*keep_going)(void *),
-                                  void *user)
+dt_object_recipe_status_t
+dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
+                         const dt_imgid_t imgid,
+                         gboolean (*keep_going)(void *),
+                         void *user)
 {
   if(!dt_rf_recipe_valid(recipe) || !dt_is_valid_imgid(imgid))
-    return FALSE;
+    return DT_OBJECT_RECIPE_FAILED;
 
   // the recorded decode boundaries drive the replay; the last one produced
   // the mask the finalisation worked from. a recipe without any boundary
@@ -2531,7 +2548,7 @@ gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
   {
     dt_print(DT_DEBUG_AI,
              "[object mask] replay: recipe records no decode boundary");
-    return FALSE;
+    return DT_OBJECT_RECIPE_FAILED;
   }
 
   // pin the models to the recorded versions. the fingerprint names the
@@ -2547,7 +2564,7 @@ gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
              " the recipe records '%s' -- not replaying",
              recipe->seg_model, seg_ver ? seg_ver : "?",
              recipe->seg_model_version);
-    return FALSE;
+    return DT_OBJECT_RECIPE_FAILED;
   }
   if(recipe->ai_refine)
   {
@@ -2569,12 +2586,12 @@ gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
                refine_ver ? refine_ver : "?",
                recipe->refine_model, recipe->refine_model_version);
       g_free(refine_id);
-      return FALSE;
+      return DT_OBJECT_RECIPE_FAILED;
     }
     g_free(refine_id);
   }
 
-  gboolean ok = FALSE;
+  dt_object_recipe_status_t status = DT_OBJECT_RECIPE_FAILED;
   gchar *outpath = NULL;
   float *enc_pts = NULL;
   uint8_t *rgb = NULL;
@@ -2618,6 +2635,22 @@ gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
              "[object mask] replay: distortion state changed since capture, "
              "the regenerated mask may be misaligned");
 
+  // reproduce the FIRST capture's state: the original encoding was made
+  // before this very mask existed, but the loaded history contains the
+  // rasterfile instance carrying our recipe -- during the replay's renders
+  // it would resolve to the missing file and its consumers would render a
+  // zeroed mask, making the regenerated bytes depend on which files happen
+  // to exist. disable the instances that carry OUR recipe (verbatim
+  // compare); other raster masks of the image keep their effect
+  for(GList *l = dev.iop; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *m = l->data;
+    if(!strcmp(m->op, "rasterfile") && m->enabled && m->params
+       && memcmp(&((dt_iop_rasterfile_params_t *)m->params)->recipe,
+                 recipe, sizeof(*recipe)) == 0)
+      m->enabled = FALSE;
+  }
+
   // content-addressed target under the LOCAL mask root, derived from the
   // loaded dev -- never darktable.develop. must mirror what _recipe_outpath
   // and rasterfile.c's commit_params resolve
@@ -2627,7 +2660,8 @@ gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
     char *dot = g_strrstr(base, ".");
     if(dot) *dot = '\0';
     gchar *fname = dt_rasterfile_recipe_filename(recipe, base,
-                                                 img->width, img->height);
+                                                 img->width, img->height,
+                                                 img->exif_datetime_taken);
     gchar *root = dt_rasterfile_mask_root();
     if(g_mkdir_with_parents(root, 0755) == 0)
       outpath = g_build_filename(root, fname, NULL);
@@ -2651,7 +2685,7 @@ gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
     {
       dt_print(DT_DEBUG_AI, "[object mask] replay: %s already exists",
                outpath);
-      ok = TRUE;
+      status = DT_OBJECT_RECIPE_OK;
       goto cleanup;
     }
     dt_print(DT_DEBUG_AI,
@@ -2862,7 +2896,10 @@ gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
   buf_ready = FALSE;
 
   if(keep_going && !keep_going(user))
+  {
+    status = DT_OBJECT_RECIPE_RETRY;   // cancelled, not broken
     goto cleanup;
+  }
 
   // replay the decodes at the recorded boundaries: decode i covers points
   // 0..i, with the threshold recorded when that decode really ran. the
@@ -2877,7 +2914,10 @@ gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
     if(!recipe->points[i].decode_after)
       continue;
     if(keep_going && !keep_going(user))
+    {
+      status = DT_OBJECT_RECIPE_RETRY;
       goto cleanup;
+    }
 
     const int n_prompt = i + 1;
     _decode_job_t *djob = g_malloc0(sizeof(_decode_job_t));
@@ -2987,6 +3027,7 @@ gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
     dt_print(DT_DEBUG_AI,
              "[object mask] replay: a finalisation is already running,"
              " try again later");
+    status = DT_OBJECT_RECIPE_RETRY;
     goto cleanup;
   }
   int pw = 0, ph = 0;
@@ -3002,7 +3043,13 @@ gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
   alpha_full = _finalize_render_alpha(&dev, &req, keep_going, user, &pw, &ph);
   g_atomic_int_set(&_finalize_running, 0);
   if(!alpha_full)
+  {
+    // the render core reports failure and cancellation alike; recover the
+    // distinction here so a cancelled replay frees its anti-respawn slot
+    if(keep_going && !keep_going(user))
+      status = DT_OBJECT_RECIPE_RETRY;
     goto cleanup;
+  }
 
   if(!_write_mask_png16_atomic(outpath, alpha_full, pw, ph))
   {
@@ -3013,7 +3060,7 @@ gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
   dt_print(DT_DEBUG_AI,
            "[object mask] replay: %s regenerated (%dx%d, %.1fs)",
            outpath, pw, ph, dt_get_wtime() - t_start);
-  ok = TRUE;
+  status = DT_OBJECT_RECIPE_OK;
 
 cleanup:
   g_free(rgb);
@@ -3027,27 +3074,83 @@ cleanup:
   if(seg) dt_seg_free(seg);
   if(env) dt_ai_env_destroy(env);
   dt_dev_cleanup(&dev);
-  return ok;
+  // a deterministic failure deserves a visible trace even without -d ai:
+  // the user otherwise faces a silent zeroed mask with no clue
+  if(status == DT_OBJECT_RECIPE_FAILED)
+    dt_print(DT_DEBUG_ALWAYS,
+             "[object mask] could not regenerate the mask of image %d from"
+             " its recipe (run with -d ai for details)", imgid);
+  return status;
 }
 
 // ---------------------------- recompute scheduling --------------------------
 //
 // the anti-respawn table: one entry per (recipe, image) currently being
-// recomputed, or having failed this session. its key is a local hash of the
-// recipe blob and the image id -- cheaper than the file fingerprint (no
-// image-cache access) and just as unique for this purpose. entries are
-// marked BEFORE the job is added: dt_control_add_job runs the job INLINE
-// when the job system is down (CLI), and the very pipe that triggered us
-// would otherwise re-enter through its retry
+// recomputed, or having failed deterministically this session. its key is a
+// local hash of the recipe blob and the image id -- cheaper than the file
+// fingerprint (no image-cache access) and just as unique for this purpose.
+// entries are claimed BEFORE any compute starts, so the pipes the replay
+// itself runs (which traverse the very rasterfile instance being
+// regenerated) cannot re-enter
 
 typedef enum _recompute_state_t
 {
   _RECOMPUTE_RUNNING = 1,
-  _RECOMPUTE_FAILED = 2,   // no automatic retry this session
+  _RECOMPUTE_FAILED = 2,   // deterministic: no automatic retry this session
 } _recompute_state_t;
 
 static GMutex _recompute_mutex;
 static GHashTable *_recompute_table = NULL;   // gint64* key -> state
+
+static gint64 _recompute_key(const dt_rf_recipe_t *recipe,
+                             const dt_imgid_t imgid)
+{
+  dt_hash_t key = dt_hash(DT_INITHASH, recipe, sizeof(*recipe));
+  key = dt_hash(key, &imgid, sizeof(imgid));
+  return (gint64)key;
+}
+
+// claim the slot; FALSE when a recompute is running or has failed for good
+static gboolean _recompute_claim(const gint64 key)
+{
+  g_mutex_lock(&_recompute_mutex);
+  if(!_recompute_table)
+    _recompute_table
+      = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+  if(g_hash_table_lookup(_recompute_table, &key))
+  {
+    g_mutex_unlock(&_recompute_mutex);
+    return FALSE;
+  }
+  gint64 *k = g_new(gint64, 1);
+  *k = key;
+  g_hash_table_insert(_recompute_table, k,
+                      GINT_TO_POINTER(_RECOMPUTE_RUNNING));
+  g_mutex_unlock(&_recompute_mutex);
+  return TRUE;
+}
+
+// settle a claimed slot: only a deterministic failure pins it -- success
+// (the file exists) and transient outcomes (busy, cancelled, never ran)
+// free it for a later attempt
+static void _recompute_settle(const gint64 key,
+                              const dt_object_recipe_status_t status)
+{
+  g_mutex_lock(&_recompute_mutex);
+  if(_recompute_table)
+  {
+    if(status == DT_OBJECT_RECIPE_FAILED)
+    {
+      gint64 *k = g_new(gint64, 1);
+      *k = key;
+      g_hash_table_replace(_recompute_table, k,
+                           GINT_TO_POINTER(_RECOMPUTE_FAILED));
+    }
+    else
+      g_hash_table_remove(_recompute_table, &key);
+  }
+  g_mutex_unlock(&_recompute_mutex);
+}
 
 typedef struct _recompute_job_t
 {
@@ -3055,29 +3158,28 @@ typedef struct _recompute_job_t
   dt_imgid_t imgid;
   gint64 key;
   gboolean ran;
-  gboolean succeeded;
+  dt_object_recipe_status_t status;
 } _recompute_job_t;
 
-// GUI thread: a recompute landed for the displayed image. the failed read
-// left the raster module's cache unhashed (auto-repair), so a new pipe run
-// rereads the file -- all we owe it is that run
+// GUI thread: a recompute landed for the displayed image. the failed reads
+// left the raster module's caches unhashed (auto-repair), so fresh pipe
+// runs reread the file; the thumbnails rendered with a zeroed mask in the
+// meantime are dropped from the mipmap cache
 static gboolean _recompute_landed_idle(gpointer data)
 {
   const dt_imgid_t imgid = GPOINTER_TO_INT(data);
+
+  dt_mipmap_cache_remove(imgid);
+
+  // test the view before touching dev: leaving the darkroom can free the
+  // develop while this idle is already queued
   dt_develop_t *dev = darktable.develop;
-  if(!dev || dev->image_storage.id != imgid
-     || dt_view_get_current() != DT_VIEW_DARKROOM)
+  if(dt_view_get_current() != DT_VIEW_DARKROOM
+     || !dev || dev->image_storage.id != imgid)
     return G_SOURCE_REMOVE;
 
-  for(GList *l = dev->iop; l; l = g_list_next(l))
-  {
-    dt_iop_module_t *m = l->data;
-    if(!strcmp(m->op, "rasterfile"))
-    {
-      dt_dev_reprocess_center(dev, m->iop_order);
-      break;
-    }
-  }
+  // all pipes, not only the center: the preview rendered a zeroed mask too
+  dt_dev_reprocess_all(dev);
   return G_SOURCE_REMOVE;
 }
 
@@ -3085,34 +3187,23 @@ static int32_t _recompute_job_run(dt_job_t *job)
 {
   _recompute_job_t *p = dt_control_job_get_params(job);
   p->ran = TRUE;
-  p->succeeded = dt_object_recipe_compute(&p->recipe, p->imgid,
-                                          _finalize_keep_going, job);
-  if(p->succeeded && dt_control_running())
+  p->status = dt_object_recipe_compute(&p->recipe, p->imgid,
+                                       _finalize_keep_going, job);
+  if(p->status == DT_OBJECT_RECIPE_OK && dt_control_running())
     g_idle_add(_recompute_landed_idle, GINT_TO_POINTER(p->imgid));
-  return p->succeeded ? 0 : 1;
+  return p->status == DT_OBJECT_RECIPE_OK ? 0 : 1;
 }
 
-// runs on every outcome -- finished, cancelled, discarded on shutdown --
-// which is exactly why the table is settled here and nowhere else
+// runs on every outcome the job system takes charge of -- finished,
+// cancelled, replaced, discarded. a job still sitting in the queue when
+// the process exits never reaches it: its params and table entry leak
+// once, harmlessly, with the process
 static void _recompute_job_destroy(void *data)
 {
   _recompute_job_t *p = data;
-  g_mutex_lock(&_recompute_mutex);
-  if(_recompute_table)
-  {
-    if(p->ran && !p->succeeded)
-    {
-      gint64 *key = g_new(gint64, 1);
-      *key = p->key;
-      g_hash_table_replace(_recompute_table, key,
-                           GINT_TO_POINTER(_RECOMPUTE_FAILED));
-    }
-    else
-      // success (the file exists now) or never ran (cancelled): both allow
-      // a future schedule to look again
-      g_hash_table_remove(_recompute_table, &p->key);
-  }
-  g_mutex_unlock(&_recompute_mutex);
+  // a job cancelled before running keeps status FAILED from init: treat
+  // not-ran as transient so a later trigger may claim the slot again
+  _recompute_settle(p->key, p->ran ? p->status : DT_OBJECT_RECIPE_RETRY);
   g_free(p);
 }
 
@@ -3121,51 +3212,50 @@ gboolean dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
 {
   if(!dt_rf_recipe_valid(recipe) || !dt_is_valid_imgid(imgid))
     return FALSE;
-
-  dt_hash_t key64 = dt_hash(DT_INITHASH, recipe, sizeof(*recipe));
-  key64 = dt_hash(key64, &imgid, sizeof(imgid));
-
-  g_mutex_lock(&_recompute_mutex);
-  if(!_recompute_table)
-    _recompute_table
-      = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
-  const gint64 lookup = (gint64)key64;
-  if(g_hash_table_lookup(_recompute_table, &lookup))
-  {
-    // already recomputing, or failed this session: nothing to retry now
-    g_mutex_unlock(&_recompute_mutex);
+  // asynchronous by contract: without a running job system (darktable-cli,
+  // GUI teardown) there is nobody to run the job -- callers needing the
+  // file synchronously use dt_object_recipe_recompute_now instead
+  if(!dt_control_running())
     return FALSE;
-  }
-  gint64 *key = g_new(gint64, 1);
-  *key = (gint64)key64;
-  g_hash_table_insert(_recompute_table, key,
-                      GINT_TO_POINTER(_RECOMPUTE_RUNNING));
-  g_mutex_unlock(&_recompute_mutex);
+
+  const gint64 key = _recompute_key(recipe, imgid);
+  if(!_recompute_claim(key))
+    return FALSE;
 
   _recompute_job_t *p = g_new0(_recompute_job_t, 1);
   p->recipe = *recipe;
   p->imgid = imgid;
-  p->key = (gint64)key64;
+  p->key = key;
+  p->status = DT_OBJECT_RECIPE_FAILED;
 
   dt_job_t *job = dt_control_job_create(_recompute_job_run,
                                         "AI mask recompute");
   if(!job)
   {
-    g_mutex_lock(&_recompute_mutex);
-    g_hash_table_remove(_recompute_table, &p->key);
-    g_mutex_unlock(&_recompute_mutex);
+    _recompute_settle(key, DT_OBJECT_RECIPE_RETRY);
     g_free(p);
     return FALSE;
   }
   dt_control_job_set_params(job, p, _recompute_job_destroy);
   dt_control_job_add_progress(job, _("recomputing AI mask"), TRUE);
-
-  // when the job system is down (darktable-cli) this call runs the job
-  // inline and returns after completion: tell the caller its file may
-  // exist NOW, one immediate retry turns a broken export into a correct one
-  const gboolean ran_inline = !dt_control_running();
   dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
-  return ran_inline;
+  return TRUE;
+}
+
+gboolean dt_object_recipe_recompute_now(const dt_rf_recipe_t *recipe,
+                                        const dt_imgid_t imgid)
+{
+  if(!dt_rf_recipe_valid(recipe) || !dt_is_valid_imgid(imgid))
+    return FALSE;
+
+  const gint64 key = _recompute_key(recipe, imgid);
+  if(!_recompute_claim(key))
+    return FALSE;
+
+  const dt_object_recipe_status_t status
+    = dt_object_recipe_compute(recipe, imgid, NULL, NULL);
+  _recompute_settle(key, status);
+  return status == DT_OBJECT_RECIPE_OK;
 }
 
 // transform mask-space forms to input-normalized coords and register them,

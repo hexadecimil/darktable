@@ -25,6 +25,17 @@
 
 G_BEGIN_DECLS
 
+// outcome of a recipe replay. the distinction matters to the anti-respawn
+// table: a RETRY outcome frees its slot for a later attempt, a FAILED one
+// pins the failure for the session so triggers stop hammering a
+// deterministic dead end (missing or mismatched model, unusable recipe)
+typedef enum dt_object_recipe_status_t
+{
+  DT_OBJECT_RECIPE_OK = 0,
+  DT_OBJECT_RECIPE_RETRY,    // transient: busy, cancelled -- try again later
+  DT_OBJECT_RECIPE_FAILED,   // deterministic: will fail again this session
+} dt_object_recipe_status_t;
+
 #ifdef HAVE_AI
 
 // headless replay of an AI mask provenance recipe: regenerate the finalised
@@ -66,41 +77,60 @@ G_BEGIN_DECLS
 //
 // the implementation lives in object.c, next to the interactive session
 // code it shares its compute path with.
-gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
-                                  const dt_imgid_t imgid,
-                                  gboolean (*keep_going)(void *),
-                                  void *user);
+dt_object_recipe_status_t
+dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
+                         const dt_imgid_t imgid,
+                         gboolean (*keep_going)(void *),
+                         void *user);
 
-// schedule a background recompute of a recipe's mask file, guarded by an
-// anti-respawn table (one recompute in flight per recipe+image; a failure
-// is not retried within the session). safe to call from a pixelpipe thread:
-// it only marks the table and enqueues a job. when the job system is down
-// (darktable-cli) the job runs INLINE inside this call; the return value is
-// TRUE exactly in that case, meaning the file may exist right now and one
-// immediate retry of the read is worth it. GUI callers always get FALSE and
-// are notified by a pipe reprocess when the recompute lands.
+// schedule an ASYNCHRONOUS recompute of a recipe's mask file, guarded by an
+// anti-respawn table (one recompute in flight per recipe+image; a
+// deterministic failure is not retried within the session, a transient one
+// frees its slot). safe to call from a pixelpipe thread: it marks the table
+// and enqueues a job, nothing more. requires a running job system -- with
+// none (darktable-cli, GUI shutdown) it declines and returns FALSE; use
+// dt_object_recipe_recompute_now for synchronous contexts. GUI callers are
+// notified by a darkroom reprocess when the recompute lands.
 gboolean dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
                                              const dt_imgid_t imgid);
+
+// SYNCHRONOUS recompute through the same anti-respawn table: marks the
+// slot, runs the replay in the calling thread (tens of seconds!), settles
+// the slot, returns TRUE when the file exists on return. for contexts that
+// need the file NOW and have no job system or no landing to wait for: a
+// darktable-cli pipe, a GUI export worker. never call from the GUI thread
+gboolean dt_object_recipe_recompute_now(const dt_rf_recipe_t *recipe,
+                                        const dt_imgid_t imgid);
 
 #else
 
 // without AI support a recipe can never be recomputed on this machine; the
 // inline stub keeps future call sites free of conditional compilation
-static inline gboolean dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
-                                                const dt_imgid_t imgid,
-                                                gboolean (*keep_going)(void *),
-                                                void *user)
+static inline dt_object_recipe_status_t
+dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
+                         const dt_imgid_t imgid,
+                         gboolean (*keep_going)(void *),
+                         void *user)
 {
   (void)recipe;
   (void)imgid;
   (void)keep_going;
   (void)user;
-  return FALSE;
+  return DT_OBJECT_RECIPE_FAILED;
 }
 
 static inline gboolean
 dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
                                     const dt_imgid_t imgid)
+{
+  (void)recipe;
+  (void)imgid;
+  return FALSE;
+}
+
+static inline gboolean
+dt_object_recipe_recompute_now(const dt_rf_recipe_t *recipe,
+                               const dt_imgid_t imgid)
 {
   (void)recipe;
   (void)imgid;

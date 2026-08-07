@@ -121,20 +121,27 @@ static inline gboolean dt_rf_recipe_valid(const dt_rf_recipe_t *r)
 gchar *dt_rasterfile_mask_root(void);
 
 // content-addressed fingerprint of a recipe applied to an image: the recipe
-// blob hashed verbatim with the image basename and its sensor dimensions.
-// model versions are part of the blob, so a model update yields a new name
-// and thus a recompute. two same-named images of the same size collide only
-// if every clicked coordinate matches too -- accepted and documented
+// blob hashed verbatim with the image basename, its sensor dimensions and
+// its capture datetime. model versions are part of the blob, so a model
+// update yields a new name and thus a recompute. the capture datetime is
+// what separates two same-named images of the same camera when a history
+// (and thus a verbatim recipe) is copied between them -- without it the
+// wrong image's mask would resolve silently. known limitation, documented:
+// a style or a pasted history carries the ORIGINAL image's clicked
+// coordinates; the recompute then produces a mask that is geometrically
+// meaningless on the target image, under the target's own name
 uint64_t dt_rasterfile_recipe_fingerprint(const dt_rf_recipe_t *recipe,
                                           const char *image_basename,
                                           const int32_t sensor_width,
-                                          const int32_t sensor_height);
+                                          const int32_t sensor_height,
+                                          const int64_t datetime_taken);
 
 // derived cache file name "<image basename>_<fingerprint>.png". caller frees
 gchar *dt_rasterfile_recipe_filename(const dt_rf_recipe_t *recipe,
                                      const char *image_basename,
                                      const int32_t sensor_width,
-                                     const int32_t sensor_height);
+                                     const int32_t sensor_height,
+                                     const int64_t datetime_taken);
 
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py

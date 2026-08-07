@@ -44,7 +44,8 @@ gchar *dt_rasterfile_mask_root(void)
 uint64_t dt_rasterfile_recipe_fingerprint(const dt_rf_recipe_t *recipe,
                                           const char *image_basename,
                                           const int32_t sensor_width,
-                                          const int32_t sensor_height)
+                                          const int32_t sensor_height,
+                                          const int64_t datetime_taken)
 {
   // the blob is hashed verbatim -- deterministic by the layout rules of
   // rasterfile_recipe.h (explicit padding, memset at capture)
@@ -53,16 +54,18 @@ uint64_t dt_rasterfile_recipe_fingerprint(const dt_rf_recipe_t *recipe,
     hash = dt_hash(hash, image_basename, strlen(image_basename));
   hash = dt_hash(hash, &sensor_width, sizeof(sensor_width));
   hash = dt_hash(hash, &sensor_height, sizeof(sensor_height));
+  hash = dt_hash(hash, &datetime_taken, sizeof(datetime_taken));
   return hash;
 }
 
 gchar *dt_rasterfile_recipe_filename(const dt_rf_recipe_t *recipe,
                                      const char *image_basename,
                                      const int32_t sensor_width,
-                                     const int32_t sensor_height)
+                                     const int32_t sensor_height,
+                                     const int64_t datetime_taken)
 {
   const uint64_t fp = dt_rasterfile_recipe_fingerprint
-    (recipe, image_basename, sensor_width, sensor_height);
+    (recipe, image_basename, sensor_width, sensor_height, datetime_taken);
   return g_strdup_printf("%s_%016" PRIx64 ".png",
                          image_basename ? image_basename : "mask", fp);
 }
