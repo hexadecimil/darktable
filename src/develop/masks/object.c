@@ -974,12 +974,14 @@ static gchar *_build_mask_path(const dt_imgid_t imgid)
 {
   if(!dt_is_valid_imgid(imgid)) return NULL;
 
+  // the mask file is a local cache, not part of the library: the recipe
+  // lives in the history/XMP, the file can always be regenerated with a new
+  // finalisation. default to a per-machine data dir rather than erroring out
   gchar *root = dt_conf_get_string("plugins/darkroom/segments/def_path");
   if(!root || !*root)
   {
     g_free(root);
-    dt_control_log(_("set raster mask root folder in preferences"));
-    return NULL;
+    root = g_build_filename(g_get_user_data_dir(), "darktable", "masks", NULL);
   }
   if(g_mkdir_with_parents(root, 0755) != 0)
   {
