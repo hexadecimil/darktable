@@ -1220,6 +1220,52 @@ static void _tree_selection_change(GtkTreeSelection *selection, dt_lib_masks_t *
   _update_all_properties(self);
 }
 
+// number of modules that would actually lose the shape if it was deleted
+// from the mask manager. this walks exactly like dt_masks_form_remove()
+// does: same IOP_FLAGS_SUPPORTS_BLENDING filter, same two ways a module
+// can hold a shape, so the number written in a destructive label is the
+// one that deletion will act on. a module counts once, however many times
+// the shape appears in its group.
+// standalone groups are deliberately ignored: they are not modules, and
+// dt_masks_form_remove() does not walk them either -- hence "module" and
+// never "place" in the label.
+static int _shape_use_count(const dt_mask_id_t formid)
+{
+  if(!dt_is_valid_maskid(formid)) return 0;
+
+  int nb = 0;
+
+  for(const GList *modules = darktable.develop->iop;
+      modules;
+      modules = g_list_next(modules))
+  {
+    dt_iop_module_t *m = modules->data;
+    if(!(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING)) continue;
+
+    if(m->blend_params->mask_id == formid)
+    {
+      nb++;
+      continue;
+    }
+
+    dt_masks_form_t *grp =
+      dt_masks_get_from_id(darktable.develop, m->blend_params->mask_id);
+    if(!(grp && (grp->type & DT_MASKS_GROUP))) continue;
+
+    for(const GList *pts = grp->points; pts; pts = g_list_next(pts))
+    {
+      const dt_masks_point_group_t *pt = pts->data;
+      if(pt->formid == formid)
+      {
+        nb++;
+        break;
+      }
+    }
+  }
+
+  return nb;
+}
+
 static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, double x, double y, dt_lib_module_t *self)
 {
   GtkWidget *treeview = dt_gui_get_widget(gesture);
@@ -1279,7 +1325,14 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
     gboolean is_last_row = FALSE;
     dt_masks_state_t selected_states = DT_MASKS_STATE_NONE;
 
+    // despite its name, grpid receives TREE_FORMID: the id of the selected
+    // row itself. parent_grid is the one holding TREE_GROUPID, i.e. the
+    // group that row belongs to (NO_MASKID for a top-level row)
     int grpid = NO_MASKID;
+    dt_mask_id_t parent_grid = NO_MASKID;
+    // TREE_MODULE of the *selected* row -- unlike `module` above, which
+    // comes from the row under the pointer and is NULL on a blank click
+    dt_iop_module_t *sel_module = NULL;
     int depth = 0;
     dt_masks_form_t *grp = NULL;
 
@@ -1294,7 +1347,7 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
         // form is a group or not
         if(gtk_tree_model_get_iter(model, &iter, it0))
         {
-          _lib_masks_get_values(model, &iter, NULL, NULL, &grpid);
+          _lib_masks_get_values(model, &iter, &sel_module, &parent_grid, &grpid);
           grp = dt_masks_get_from_id(darktable.develop, grpid);
         }
 
@@ -1453,20 +1506,66 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
           g_signal_connect(item, "activate", G_CALLBACK(_tree_duplicate_shape), self);
           gtk_menu_shell_append(menu, item);
         }
-        item = gtk_menu_item_new_with_label(_("delete this shape"));
+        // this does not only remove the row: the shape is dropped from
+        // every module using it. say so, and say how many modules are
+        // concerned -- but only when that number is both defined and
+        // meaningful. it is computed for a single selection only, and a
+        // multiple selection may mix shapes and groups, so every other
+        // case keeps the historical wording rather than claiming a scope
+        // that cannot be backed
+        const int used = (nb == 1) ? _shape_use_count(grpid) : 0;
+
+        if(used > 0)
+        {
+          gchar *label =
+            g_strdup_printf(ngettext("delete everywhere (%d module)",
+                                     "delete everywhere (%d modules)", used), used);
+          item = gtk_menu_item_new_with_label(label);
+          g_free(label);
+        }
+        else
+          item = gtk_menu_item_new_with_label(_("delete this shape"));
+
         g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
         gtk_menu_shell_append(menu, item);
       }
       else
       {
-        item = gtk_menu_item_new_with_label(_("delete group"));
+        item = gtk_menu_item_new_with_label(_("delete group (shapes are kept)"));
         g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
         gtk_menu_shell_append(menu, item);
       }
     }
     else if(nb > 0 && depth < 3)
     {
-      item = gtk_menu_item_new_with_label(_("remove from group"));
+      // here the shape is only detached from the group of that row: it
+      // stays in the mask manager and in every other module. name the
+      // group we are leaving so the difference with a deletion is
+      // readable. parent_grid and sel_module are only filled for a single
+      // selection, so anything else falls back to the plain wording
+      dt_masks_form_t *parent = dt_masks_get_from_id(darktable.develop, parent_grid);
+      gchar *scope = NULL;
+
+      if(parent)
+      {
+        // a group owned by a module is already named after it
+        // ("group `exposure'"), the plain module name reads better here
+        if(sel_module && parent->formid == sel_module->blend_params->mask_id)
+          scope = dt_history_item_get_name(sel_module);
+        else if(*parent->name)
+          scope = g_strdup(parent->name);
+      }
+
+      if(scope)
+      {
+        gchar *label = g_strdup_printf(_("remove from %s"), scope);
+        item = gtk_menu_item_new_with_label(label);
+        g_free(label);
+        g_free(scope);
+      }
+      else
+        item = gtk_menu_item_new_with_label(_("remove from group"));
+
       g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
       gtk_menu_shell_append(menu, item);
     }
