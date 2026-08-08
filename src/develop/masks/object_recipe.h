@@ -23,6 +23,8 @@
 
 #include <glib.h>
 
+struct dt_iop_module_t;
+
 G_BEGIN_DECLS
 
 // outcome of a recipe replay. the distinction matters to the anti-respawn
@@ -52,6 +54,31 @@ typedef enum dt_object_recipe_model_gap_t
   DT_OBJECT_RECIPE_MODELS_UNKNOWN,       // the registry does not know the recorded id
   DT_OBJECT_RECIPE_MODELS_AI_OFF,        // AI processing disabled: no lookup possible
 } dt_object_recipe_model_gap_t;
+
+// the three sources an ai edit session can reopen from. C2 delivers the
+// RASTER family (recipe stored in the rasterfile params); PATHS (recipe in
+// the group trailer) and CONTEXT (no usable recipe, synthetic prev_mask)
+// arrive with C4/C5 on the same entry point
+typedef enum dt_object_edit_kind_t
+{
+  DT_OBJECT_EDIT_RASTER = 0,
+  DT_OBJECT_EDIT_PATHS = 1,
+  DT_OBJECT_EDIT_CONTEXT = 2,
+} dt_object_edit_kind_t;
+
+// a stable description of WHAT is being edited, decoupled from any UI
+// surface. identities are values, never pointers: the raster instance by
+// its multi_priority, the group by its formid (int32_t mirrors
+// dt_mask_id_t without pulling develop/masks.h in) -- the session outlives
+// any widget guarantee and the re-finalisation re-resolves its target
+typedef struct dt_object_edit_target_t
+{
+  dt_object_edit_kind_t kind;
+  int32_t raster_multi_priority;  // RASTER: identity of the edited instance
+  int32_t group_formid;           // PATHS / CONTEXT
+  gboolean has_recipe;
+  dt_rf_recipe_t recipe;          // copy owned by the callee
+} dt_object_edit_target_t;
 
 #ifdef HAVE_AI
 
@@ -157,12 +184,36 @@ void dt_object_recipe_reset_failed(void);
 gboolean dt_object_mask_edit_active(const char *op,
                                     const int32_t multi_priority);
 
+// TRUE while the interactive precise-mask finalisation job is in flight.
+// second gate for the same proactive recompute: the edit gate falls when
+// the session data is freed, which is exactly when the finalisation job
+// starts -- the file it prepares does not exist yet, so without this the
+// recompute of the OLD recipe would race the job that replaces it. covers
+// plain (non-edit) finalisations, which never raised the edit gate
+gboolean dt_object_mask_finalize_running(void);
+
 // session bookkeeping for the flag above, called by the edit session
 // only: set on a successful edit begin, cleared on EVERY session exit
 // (finalise, no-op, cancel, failure, image change)
 void dt_object_mask_edit_set_active(const char *op,
                                     const int32_t multi_priority);
 void dt_object_mask_edit_clear_active(void);
+
+// reopen an interactive object-mask session from a saved provenance
+// recipe: the session encodes with the RECORDED model at the recorded
+// dimensions, replays the recorded decodes at their recorded boundaries
+// with their recorded thresholds, and hands the user the exact working
+// state the original session finalised from. GUI thread only, darkroom
+// only; at most one edit session per process. `target_module` is reserved
+// for the re-finalisation payload (C3) and may be NULL.
+//
+// this entry point is the part of the edit UX that survives any surface
+// redesign (revisable-dressing hypothesis, plan §6): buttons, dialogs and
+// menu items all funnel here. C2 limitation, by design: the reopened
+// session ends through the existing gestures (right-click / shift+right-
+// click), which create a NEW mask -- C3 wires the in-place replacement
+gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
+                                   const dt_object_edit_target_t *target);
 
 #else
 
@@ -227,6 +278,11 @@ static inline gboolean dt_object_mask_edit_active(const char *op,
   return FALSE;
 }
 
+static inline gboolean dt_object_mask_finalize_running(void)
+{
+  return FALSE;
+}
+
 static inline void dt_object_mask_edit_set_active(const char *op,
                                                   const int32_t multi_priority)
 {
@@ -236,6 +292,15 @@ static inline void dt_object_mask_edit_set_active(const char *op,
 
 static inline void dt_object_mask_edit_clear_active(void)
 {
+}
+
+static inline gboolean
+dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
+                          const dt_object_edit_target_t *target)
+{
+  (void)target_module;
+  (void)target;
+  return FALSE;
 }
 
 #endif // HAVE_AI

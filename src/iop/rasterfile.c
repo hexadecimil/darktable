@@ -37,6 +37,7 @@
 #include "common/ras2vect.h"
 #include "common/rasterfile_recipe.h"
 #include "common/utility.h"
+#include "develop/masks.h"
 #include "develop/masks/object_recipe.h"
 #include "imageio/imageio_png.h"
 #include "gui/accelerators.h"
@@ -475,6 +476,19 @@ static void _fbutton_clicked(GtkWidget *widget, dt_iop_module_t *self)
   g_object_unref(filechooser);
 }
 
+// provisional dev trigger for the AI mask edit session, replaced by the
+// validated UX (the planned provenance section with its own edit button):
+// behind a conf key defaulting to FALSE, the 'recompute mask' button
+// becomes 'edit mask' when a valid recipe exists. only the entry point it
+// calls, dt_object_mask_edit_begin, is meant to stay
+#define CONF_RASTERFILE_DEV_EDIT_KEY "plugins/darkroom/masks/object/dev_edit_button"
+
+static gboolean _dev_edit_enabled(void)
+{
+  return dt_conf_key_exists(CONF_RASTERFILE_DEV_EDIT_KEY)
+         && dt_conf_get_bool(CONF_RASTERFILE_DEV_EDIT_KEY);
+}
+
 // redo the mask from its recipe with the models installed NOW. this is the
 // user-consented escape when the recorded model is gone and the pinned
 // replay rightly refuses to run: the recipe is rebound to the active
@@ -485,6 +499,19 @@ static void _recompute_clicked(GtkWidget *widget, dt_iop_module_t *self)
   dt_iop_rasterfile_params_t *p = self->params;
   if(!dt_rf_recipe_valid(&p->recipe) || !self->dev)
     return;
+
+  // provisional dev trigger (see _dev_edit_enabled): reopen the recorded
+  // session interactively instead of recomputing headless
+  if(_dev_edit_enabled())
+  {
+    dt_object_edit_target_t target = { 0 };
+    target.kind = DT_OBJECT_EDIT_RASTER;
+    target.raster_multi_priority = self->multi_priority;
+    target.has_recipe = TRUE;
+    target.recipe = p->recipe;
+    dt_object_mask_edit_begin(self, &target);
+    return;
+  }
 
   dt_rf_recipe_t rebound = p->recipe;
   if(!dt_object_recipe_rebind_models(&rebound))
@@ -831,9 +858,14 @@ void gui_changed(dt_iop_module_t *self,
       // legitimately absent while it prepares a replacement: without the
       // gate every gui_update would schedule a headless recompute
       // concurrent with the session's own inference stack -- and pin a
-      // fresh failure when the recorded model is still missing
+      // fresh failure when the recorded model is still missing. the
+      // session gate falls when the closing gesture frees the session
+      // data, which is exactly when the finalisation job STARTS: the
+      // second gate covers the seconds it then spends rendering and
+      // inferring, when the replacement file still does not exist
       if(!g_file_test(fullpath, G_FILE_TEST_EXISTS)
-         && !dt_object_mask_edit_active(self->op, self->multi_priority))
+         && !dt_object_mask_edit_active(self->op, self->multi_priority)
+         && !dt_object_mask_finalize_running())
         dt_object_recipe_schedule_recompute(&p->recipe, img->id);
       g_free(fullpath);
       g_free(root);
@@ -844,6 +876,20 @@ void gui_changed(dt_iop_module_t *self,
 
   gtk_widget_set_sensitive(g->vectorize, p->path[0] && p->file[0]);
   gtk_widget_set_sensitive(g->recompute, dt_rf_recipe_valid(&p->recipe));
+  // provisional dev trigger (see _dev_edit_enabled): relabel the button
+  // when it opens an edit session instead of a headless recompute -- only
+  // when that session can actually run. without AI support, or with the
+  // model not installed, dt_object_mask_edit_begin declines (the non-AI
+  // stub does so silently) and the relabelled button would do nothing
+#ifdef HAVE_AI
+  const gboolean edits = _dev_edit_enabled()
+                         && dt_rf_recipe_valid(&p->recipe)
+                         && dt_masks_object_available();
+#else
+  const gboolean edits = FALSE;
+#endif
+  gtk_button_set_label(GTK_BUTTON(g->recompute),
+                       edits ? _("edit mask") : _("recompute mask"));
 }
 
 void gui_update(dt_iop_module_t *self)
