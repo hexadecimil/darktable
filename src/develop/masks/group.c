@@ -253,7 +253,10 @@ void dt_group_events_post_expose(cairo_t *cr,
   {
     dt_masks_point_group_t *fpt = fpts->data;
     dt_masks_form_t *sel = dt_masks_get_from_id(darktable.develop, fpt->formid);
-    if(!sel) return;
+    // an entry pointing at a missing shape must not stop the loop, or every
+    // sibling after it silently stops being drawn. pos is deliberately left
+    // untouched: it indexes gui->points, which skips the missing shape too
+    if(!sel) continue;
     if(sel->functions)
       sel->functions->post_expose(cr, zoom_scale, gui, pos, g_list_length(sel->points));
     pos++;

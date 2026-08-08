@@ -282,7 +282,10 @@ void dt_masks_gui_form_test_create(dt_masks_form_t *form,
       {
         const dt_masks_point_group_t *fpt = fpts->data;
         dt_masks_form_t *sel = dt_masks_get_from_id(darktable.develop, fpt->formid);
-        if(!sel) return;
+        // skip, do not bail out: the remaining shapes of the group still have
+        // to be created. pos must not advance either -- dt_masks_gui_form_create()
+        // only appends when the index equals the current list length
+        if(!sel) continue;
         dt_masks_gui_form_create(sel, gui, pos, module);
         pos++;
       }
