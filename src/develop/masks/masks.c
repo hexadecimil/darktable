@@ -1052,6 +1052,31 @@ void dt_masks_read_masks_history(dt_develop_t *dev, const dt_imgid_t imgid)
         memcpy(point, ptbuf + i*point_size, point_size);
         form->points = g_list_append(form->points, point);
       }
+
+      // ai provenance trailer of a group (see masks.h): the blob must hold
+      // exactly the appended size and carry a valid magic and version to
+      // restore it, anything else leaves the trailer zeroed -- never an
+      // error, a blob written by an upstream darktable simply has none.
+      // read before dt_masks_legacy_params on purpose: no v1..v6 migration
+      // touches group point blobs -- revisit this placement if one ever does
+      if((form->type & DT_MASKS_GROUP) && ptbuf)
+      {
+        const int blob_len = sqlite3_column_bytes(stmt, 5);
+        const size_t pts_len = (size_t)nb_points * point_size;
+        dt_masks_ai_trailer_t trailer;
+        // nb_points is signed database (and thus sidecar) input: a negative
+        // value wraps pts_len, and a truncating comparison could still make
+        // the sizes coincide -- guard the sign and compare in size_t, or
+        // the memcpy below reads out of bounds
+        if(nb_points >= 0
+           && (size_t)blob_len == pts_len + sizeof(trailer))
+        {
+          memcpy(&trailer, ptbuf + pts_len, sizeof(trailer));
+          if(trailer.magic == DT_MASKS_AI_TRAILER_MAGIC
+             && trailer.version == DT_MASKS_AI_TRAILER_VERSION)
+            form->ai_trailer = trailer;
+        }
+      }
     }
 
     if(form->version != dt_masks_version())
@@ -1134,14 +1159,26 @@ void dt_masks_write_masks_history_item(const dt_imgid_t imgid,
   {
     const size_t point_size = form->functions->point_struct_size;
     const guint nb = g_list_length(form->points);
-    char *const restrict ptbuf = malloc(nb * point_size);
+    // an ai-created group of paths persists its provenance trailer by
+    // appending it to the point blob (see masks.h): a reader that knows
+    // the layout detects it by exact size + magic, an upstream reader
+    // ignores the excess bytes. groups without a valid trailer keep the
+    // upstream-identical blob
+    const gboolean with_trailer = (form->type & DT_MASKS_GROUP)
+      && form->ai_trailer.magic == DT_MASKS_AI_TRAILER_MAGIC
+      && form->ai_trailer.version == DT_MASKS_AI_TRAILER_VERSION;
+    const size_t blob_size = nb * point_size
+      + (with_trailer ? sizeof(dt_masks_ai_trailer_t) : 0);
+    char *const restrict ptbuf = malloc(blob_size);
     int pos = 0;
     for(GList *points = form->points; points; points = g_list_next(points))
     {
       memcpy(ptbuf + pos, points->data, point_size);
       pos += point_size;
     }
-    DT_DEBUG_SQLITE3_BIND_BLOB(stmt, 6, ptbuf, nb * point_size, SQLITE_TRANSIENT);
+    if(with_trailer)
+      memcpy(ptbuf + pos, &form->ai_trailer, sizeof(dt_masks_ai_trailer_t));
+    DT_DEBUG_SQLITE3_BIND_BLOB(stmt, 6, ptbuf, blob_size, SQLITE_TRANSIENT);
     DT_DEBUG_SQLITE3_BIND_INT(stmt, 7, nb);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);

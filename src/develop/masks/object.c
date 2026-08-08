@@ -1545,6 +1545,75 @@ static gboolean _capture_recipe(_object_data_t *d,
   return TRUE;
 }
 
+// content hash of a group of paths for the ai trailer: the group's own
+// serialized blob (the dt_masks_point_group_t sequence the masks history
+// writes, trailer excluded) followed by each child's point blob in list
+// order. THE single definition shared by the capture at creation time and
+// the re-edit arbitration -- child states (union/difference), opacities,
+// list order and membership all change it. children are resolved in
+// `forms`; a child that does not resolve still contributes its group
+// entry, so the hash cannot accidentally match a later state where the
+// child resolves again
+static int64_t _ai_trailer_group_hash(GList *forms,
+                                      const dt_masks_form_t *grp)
+{
+  dt_hash_t hash = DT_INITHASH;
+  for(GList *l = grp->points; l; l = g_list_next(l))
+    hash = dt_hash(hash, l->data, sizeof(dt_masks_point_group_t));
+  for(GList *l = grp->points; l; l = g_list_next(l))
+  {
+    const dt_masks_point_group_t *pt = l->data;
+    const dt_masks_form_t *child = dt_masks_get_from_id_ext(forms, pt->formid);
+    // nested groups are deliberately skipped, not recursed into: a
+    // non-path child forces the context fallback at edit time anyway.
+    // must mirror the recalculation in outil/verifier_trailer.py
+    if(!child || !child->functions || (child->type & DT_MASKS_GROUP))
+      continue;
+    const size_t point_size = child->functions->point_struct_size;
+    for(GList *p = child->points; p; p = g_list_next(p))
+      hash = dt_hash(hash, p->data, point_size);
+  }
+  return (int64_t)hash;
+}
+
+// identity of the image the session ran on, folded to the trailer's 32-bit
+// field: basename without extension, sensor dimensions, capture datetime --
+// the rasterfile fingerprint's ingredients. detects a history pasted onto
+// another image. mirrored by outil/verifier_trailer.py
+static uint32_t _ai_trailer_image_hash(const dt_image_t *img)
+{
+  gchar *base = g_path_get_basename(img->filename);
+  char *dot = g_strrstr(base, ".");
+  if(dot) *dot = '\0';
+  dt_hash_t h = dt_hash(DT_INITHASH, base, strlen(base));
+  const int32_t w = img->width, ht = img->height;
+  h = dt_hash(h, &w, sizeof(w));
+  h = dt_hash(h, &ht, sizeof(ht));
+  const int64_t taken = img->exif_datetime_taken;
+  h = dt_hash(h, &taken, sizeof(taken));
+  g_free(base);
+  return (uint32_t)h;
+}
+
+// GUI thread: stamp the ai provenance trailer on a freshly created group
+// of paths -- the session recipe plus the content hash of the group as
+// just built. `forms` is the list the group's children live in
+// (dev->forms); must run after the group is fully assembled and before
+// the masks history item is committed
+static void _ai_trailer_stamp(GList *forms,
+                              dt_masks_form_t *grp,
+                              const dt_rf_recipe_t *recipe)
+{
+  memset(&grp->ai_trailer, 0, sizeof(grp->ai_trailer));
+  grp->ai_trailer.magic = DT_MASKS_AI_TRAILER_MAGIC;
+  grp->ai_trailer.version = DT_MASKS_AI_TRAILER_VERSION;
+  grp->ai_trailer.flags = 0;  // no synthetic context on the creation routes
+  grp->ai_trailer.image_hash
+    = _ai_trailer_image_hash(&darktable.develop->image_storage);
+  grp->ai_trailer.recipe = *recipe;
+  grp->ai_trailer.paths_hash = _ai_trailer_group_hash(forms, grp);
+}
+
 // GUI thread: the content-addressed target path of a recipe, under the
 // local mask root. must derive exactly what rasterfile.c's commit_params
 // derives on resolution. NULL when the root folder cannot be created
@@ -1648,12 +1717,20 @@ static gboolean _finalize_apply_idle(gpointer data)
 
     // forms were created on the worker thread; their ids are atomic but
     // unicity against this dev's forms is only checkable here, on the GUI
-    // thread, right before insertion
+    // thread, right before insertion. siblings must be checked too: they
+    // are not in dev->forms yet, and the trailer's content hash resolves
+    // children BY id -- a duplicate id would make it cover the wrong form
     for(GList *l = a->forms; l; l = g_list_next(l))
     {
       dt_masks_form_t *f = l->data;
-      while(dt_masks_get_from_id(dev, f->formid))
-        f->formid++;
+      gboolean clash = TRUE;
+      while(clash)
+      {
+        clash = dt_masks_get_from_id(dev, f->formid) != NULL;
+        for(GList *k = a->forms; !clash && k != l; k = g_list_next(k))
+          clash = ((dt_masks_form_t *)k->data)->formid == f->formid;
+        if(clash) f->formid++;
+      }
     }
 
     const char *group_prefix = _("ai object group");
@@ -1688,6 +1765,13 @@ static gboolean _finalize_apply_idle(gpointer data)
         grpt->state = (grpt->state & ~DT_MASKS_STATE_UNION) | DT_MASKS_STATE_DIFFERENCE;
     }
     dev->forms = g_list_append(dev->forms, grp);
+
+    // stamp the provenance trailer on the fully assembled group: the
+    // recorded session clicks travel with it, a later ai edit can reopen
+    // the group from its exact prompts (the hash detects manual
+    // retouching in between). must precede the history item below
+    if(a->has_recipe)
+      _ai_trailer_stamp(dev->forms, grp, &a->recipe);
 
     // attach to the target module's blend mask group, as the classic path does
     dt_iop_module_t *target = NULL;
@@ -2356,6 +2440,11 @@ static int32_t _finalize_job_run(dt_job_t *job)
     a->has_target = j->has_target;
     memcpy(a->target_op, j->target_op, sizeof(a->target_op));
     a->target_multi_priority = j->target_multi_priority;
+    // the recipe becomes the produced group's provenance trailer, stamped
+    // by the apply idle once the group exists
+    a->has_recipe = j->has_recipe;
+    if(j->has_recipe)
+      a->recipe = j->recipe;
     a->distort_hash = j->distort_hash;
     g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, _finalize_apply_idle, a,
                     _finalize_apply_free);
@@ -2472,21 +2561,23 @@ static gboolean _launch_native_finalize(_object_data_t *d,
   j->feather = d->preview_feather;
   j->distort_hash = launch_distort_hash;
 
-  // the raster file gets a provenance recipe: it makes the file
-  // recomputable and names it by content. sessions the recipe cannot hold
-  // (too many clicks) fall back to a plain sequential file name
-  if(!vectorize)
+  // both finalisation routes capture the provenance recipe. the raster
+  // route additionally derives the content-addressed file name from it
+  // (an outpath failure then falls back to a plain sequential file, and
+  // the recipe is dropped with it); the vector route stores the recipe
+  // with the produced group of paths instead -- its capture is decoupled
+  // from any output path on purpose, a recipe without a file is exactly
+  // what the group trailer needs. sessions the recipe cannot hold (too
+  // many clicks) proceed without provenance on either route
+  j->has_recipe = _capture_recipe(d, gui, &j->recipe);
+  if(!vectorize && j->has_recipe)
   {
-    j->has_recipe = _capture_recipe(d, gui, &j->recipe);
-    if(j->has_recipe)
-    {
-      j->outpath = _recipe_outpath(&j->recipe);
-      if(!j->outpath)
-        j->has_recipe = FALSE;
-    }
-    if(!j->has_recipe)
-      memset(&j->recipe, 0, sizeof(j->recipe));
+    j->outpath = _recipe_outpath(&j->recipe);
+    if(!j->outpath)
+      j->has_recipe = FALSE;
   }
+  if(!j->has_recipe)
+    memset(&j->recipe, 0, sizeof(j->recipe));
 
   if(target)
   {
@@ -3327,9 +3418,12 @@ gboolean dt_object_recipe_recompute_now(const dt_rf_recipe_t *recipe,
 }
 
 // transform mask-space forms to input-normalized coords and register them,
-// takes ownership of `forms` and `signs` lists (forms are appended to dev->forms)
+// takes ownership of `forms` and `signs` lists (forms are appended to dev->forms).
+// `gui` carries the live session whose provenance recipe is captured into
+// the produced group's trailer; NULL skips the capture
 static dt_masks_form_t *
 _register_vectorized_forms(dt_iop_module_t *module,
+                           dt_masks_form_gui_t *gui,
                            GList *forms,
                            GList *signs,
                            const int mask_w,
@@ -3433,6 +3527,23 @@ _register_vectorized_forms(dt_iop_module_t *module,
   dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
   snprintf(grp->name, sizeof(grp->name), "%s #%d", group_prefix, (int)grp_nb);
 
+  // form ids come from a session counter reset at startup: collisions with
+  // loaded forms (or between siblings) are possible, and the provenance
+  // trailer resolves children BY id -- ensure unicity before registration,
+  // like the native route does
+  for(GList *l = forms; l; l = g_list_next(l))
+  {
+    dt_masks_form_t *f = l->data;
+    gboolean clash = TRUE;
+    while(clash)
+    {
+      clash = dt_masks_get_from_id(dev, f->formid) != NULL;
+      for(GList *k = forms; !clash && k != l; k = g_list_next(k))
+        clash = ((dt_masks_form_t *)k->data)->formid == f->formid;
+      if(clash) f->formid++;
+    }
+  }
+
   // register all path forms so they exist in dev->forms
   for(GList *l = forms; l; l = g_list_next(l))
   {
@@ -3457,6 +3568,15 @@ _register_vectorized_forms(dt_iop_module_t *module,
   // assignment)
   dev->forms = g_list_append(dev->forms, grp);
 
+  // stamp the provenance trailer on the fully assembled group: this
+  // classic route finalises a prompt session too, so its group is made
+  // re-editable by ai exactly like the native route's groups. a session
+  // the recipe cannot describe simply leaves the trailer zeroed
+  _object_data_t *sd = gui ? _get_data(gui) : NULL;
+  dt_rf_recipe_t recipe;
+  if(sd && _capture_recipe(sd, gui, &recipe))
+    _ai_trailer_stamp(dev->forms, grp, &recipe);
+
   g_list_free(forms);
   g_list_free(signs);
 
@@ -3479,7 +3599,7 @@ _finalize_from_preview(dt_iop_module_t *module, dt_masks_form_gui_t *gui)
   d->preview_forms = NULL;
   d->preview_signs = NULL;
 
-  return _register_vectorized_forms(module, forms, signs, mw, mh);
+  return _register_vectorized_forms(module, gui, forms, signs, mw, mh);
 }
 
 // finalize: vectorize the mask and register as a group of path forms,
@@ -3510,7 +3630,8 @@ static dt_masks_form_t *_finalize_mask(dt_iop_module_t *module,
                            thresh, cleanup, (double)smoothing, 0.3, &signs);
   g_free(inv_mask);
 
-  return _register_vectorized_forms(module, forms, signs, d->mask_w, d->mask_h);
+  return _register_vectorized_forms(module, gui, forms, signs,
+                                    d->mask_w, d->mask_h);
 }
 
 // --- mask event handlers ---
