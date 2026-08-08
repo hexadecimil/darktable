@@ -2103,6 +2103,20 @@ dt_masks_point_group_t *dt_masks_group_add_form(dt_masks_form_t *grp,
   // add a form to group and check for self inclusion
 
   if(!(grp->type & DT_MASKS_GROUP)) return NULL;
+
+  // a shape can only appear once in a group: every operation that follows
+  // addresses it by formid and stops at the first match, so a second entry
+  // would be rendered but could never be selected, reordered or removed
+  for(const GList *pts = grp->points; pts; pts = g_list_next(pts))
+  {
+    const dt_masks_point_group_t *grpt = pts->data;
+    if(grpt->formid == form->formid)
+    {
+      dt_control_log(_("this shape is already in this group"));
+      return NULL;
+    }
+  }
+
   // either the form to add is not a group, so no risk
   // or we go through all points of form to see if we find a ref to grp->formid
   if(!(form->type & DT_MASKS_GROUP) || _find_in_group(form, grp->formid) == 0)
