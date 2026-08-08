@@ -321,14 +321,16 @@ static int _group_get_mask(const dt_iop_module_t *const module,
   const guint nb = g_list_length(form->points);
   if(nb == 0) return 0;
 
+  // zero-initialised: an entry whose shape is missing leaves its slot
+  // untouched below, and every loop further down walks all nb slots
   float **bufs = calloc(nb, sizeof(float *));
-  int *w = malloc(sizeof(int) * nb);
-  int *h = malloc(sizeof(int) * nb);
-  int *px = malloc(sizeof(int) * nb);
-  int *py = malloc(sizeof(int) * nb);
-  int *ok = malloc(sizeof(int) * nb);
-  int *states = malloc(sizeof(int) * nb);
-  float *op = malloc(sizeof(float) * nb);
+  int *w = calloc(nb, sizeof(int));
+  int *h = calloc(nb, sizeof(int));
+  int *px = calloc(nb, sizeof(int));
+  int *py = calloc(nb, sizeof(int));
+  int *ok = calloc(nb, sizeof(int));
+  int *states = calloc(nb, sizeof(int));
+  float *op = calloc(nb, sizeof(float));
 
   // and we get all masks
   int pos = 0;
@@ -361,6 +363,8 @@ static int _group_get_mask(const dt_iop_module_t *const module,
   int l = INT_MAX, r = INT_MIN, t = INT_MAX, b = INT_MIN;
   for(int i = 0; i < nb; i++)
   {
+    // slots that produced no mask hold no geometry; nb_ok > 0 is granted above
+    if(!ok[i]) continue;
     l = MIN(l, px[i]);
     t = MIN(t, py[i]);
     r = MAX(r, px[i] + w[i]);
@@ -377,6 +381,9 @@ static int _group_get_mask(const dt_iop_module_t *const module,
   // and we copy each buffer inside, row by row
   for(int i = 0; i < nb; i++)
   {
+    // bufs[i] is NULL for those, and the loops below would dereference it
+    if(!ok[i]) continue;
+
     double start = dt_get_debug_wtime();
     if(states[i] & (DT_MASKS_STATE_UNION | DT_MASKS_STATE_SUM))
     {
