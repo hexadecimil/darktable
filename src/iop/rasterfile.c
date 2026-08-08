@@ -525,9 +525,11 @@ static void _recompute_clicked(GtkWidget *widget, dt_iop_module_t *self)
     p->recipe = rebound;
     dt_dev_add_history_item(darktable.develop, self, TRUE);
   }
-  if(dt_object_recipe_schedule_recompute(&p->recipe,
-                                         self->dev->image_storage.id))
-    dt_control_log(_("recomputing the mask with the current model..."));
+  // no toast here: dt_object_recipe_schedule_recompute emits it for the
+  // three triggers at once, so this path cannot drift from the automatic
+  // ones or flash two messages in a row
+  dt_object_recipe_schedule_recompute(&p->recipe,
+                                      self->dev->image_storage.id);
 }
 
 static void _file_callback(GtkWidget *widget, dt_iop_module_t *self)

@@ -442,6 +442,35 @@ static _object_data_t *_get_data(dt_masks_form_gui_t *gui)
   return (gui && gui->scratchpad) ? (_object_data_t *)gui->scratchpad : NULL;
 }
 
+// the queryable form of "a computation owns this session", read STRAIGHT
+// from the session machines -- the encode, the decode and the edit replay.
+// no mirror flag to keep in sync, so a state a later version adds cannot
+// escape the answer by omission; the price is that the three enums below
+// are the contract, and any new one belongs here.
+//
+// the session data IS the scratchpad of the live mask gui: once _free_data
+// cleared it the answer is rightly FALSE whatever threads still finish in
+// the void, because there is no longer a session a new shape could
+// destroy. deliberately NOT covering the finalisation and recompute jobs:
+// they own no session either (the finalisation frees it before enqueuing),
+// they compete for VRAM, which the compute paths already arbitrate on
+// their own. GUI thread
+gboolean dt_masks_object_session_busy(void)
+{
+  const dt_develop_t *dev = darktable.develop;
+  const _object_data_t *d = dev ? _get_data(dev->form_gui) : NULL;
+  if(!d)
+    return FALSE;
+  // MSG_SHOWN counts: the encode is committed, the next expose starts the
+  // thread, and the frame in between must not become a hole in the lock
+  const int es = g_atomic_int_get(&d->encode_state);
+  return es == ENCODE_MSG_SHOWN
+         || es == ENCODE_RUNNING
+         || g_atomic_int_get(&d->decode_state) == DECODE_RUNNING
+         || _edit_frozen(d)
+         || _edit_replay_running(d);
+}
+
 // compute a hash of all distortion module parameters
 // from a develop history — changes on crop/rotate/perspective/lens
 // but NOT on exposure/color/masks
@@ -600,6 +629,13 @@ static void _free_data(dt_masks_form_gui_t *gui)
   // defers -- a later dt_object_mask_edit_begin (GUI thread too) must
   // never observe a stale gate from a session being torn down
   _edit_session_end(d, EDIT_NONE);
+
+  // the session is gone and so is the reason to hold the shape buttons.
+  // this is the ONE exit every teardown funnels through -- finalise, no-op
+  // close, cancel, image or geometry change, module refocus, view change,
+  // module destruction -- and the poll timer that keeps the lock fresh
+  // dies with the data below, so the last word has to be said here
+  dt_masks_update_shapes_sensitivity();
 
   if(g_atomic_int_get(&d->encode_state) == ENCODE_RUNNING
      || g_atomic_int_get(&d->decode_state) == DECODE_RUNNING
@@ -1855,6 +1891,10 @@ typedef struct _finalize_job_t
   dt_rf_recipe_t recipe;
   gboolean has_recipe;
   gchar *outpath;       // owned by the job
+  // TRUE once _finalize_job_run entered: the serialisation token is reset
+  // by the run itself, so the destroy callback needs to know whether a run
+  // ever happened to release it for a job the queue discarded
+  gboolean ran;
 } _finalize_job_t;
 
 // GUI thread: record everything needed to regenerate the finalised mask
@@ -2376,10 +2416,19 @@ gboolean dt_object_mask_finalize_running(void)
   return g_atomic_int_get(&_finalize_running) != 0;
 }
 
+// runs on every outcome the job system takes charge of -- finished,
+// cancelled, replaced, discarded. a job the queue discarded before running
+// never reached the reset at the end of _finalize_job_run, and the token
+// it claimed at launch would then pin dt_object_mask_finalize_running for
+// the rest of the session: no further finalisation, no headless replay
+// (both take the same token), and the proactive recompute gated forever.
+// same shape as _recompute_job_destroy and its `ran` field
 static void _finalize_job_destroy(void *p)
 {
   _finalize_job_t *j = p;
   if(!j) return;
+  if(!j->ran)
+    g_atomic_int_set(&_finalize_running, 0);
   g_free(j->hint);
   g_free(j->outpath);
   g_free(j);
@@ -2403,12 +2452,56 @@ static inline float _sample_plane(const float *const restrict src,
        + src[(size_t)y1 * sw + x1] * ax * ay;
 }
 
+// the step hook of the two long AI mask jobs. both compute paths poll a
+// keep_going between their expensive steps and nowhere else, which makes
+// this the one thing that runs regularly for the whole job without the
+// compute having to report anything -- so it carries the feedback as well
+// as the cancellation:
+//  - the toast: a dt_control_log expires after DT_CTL_LOG_TIMEOUT (5 s)
+//    while these jobs run for tens of seconds, and control.c dedups a
+//    repeated message, so re-emitting it here is what keeps the darkroom
+//    saying that something IS computing. it is thread-safe;
+//  - the progress bar of the background jobs module: created by
+//    dt_control_job_add_progress, it would otherwise sit at 0 for the
+//    whole job, which is indistinguishable from a hung one.
+// the bar carries no fraction on purpose. these jobs poll between steps of
+// wildly unequal cost (a tiled network pass dwarfs a render), so any
+// fraction derived from the poll count reads as stalled on the long step
+// and as almost-done a third of the way in -- worse than no number. what
+// the job does know is WHICH step it is on, and dt_control_job_set_progress
+// with a negative value keeps the bar in its indeterminate state
+static gboolean _job_step(dt_job_t *job, const char *msg)
+{
+  // the cancellation test comes FIRST and returns without emitting: a
+  // cancelled job must not leave its "computing..." toast alive for
+  // another five seconds, nor nudge a bar nobody will finish. also bails
+  // out when the whole job system goes down -- a multi-minute compute
+  // must not hold the application's exit hostage
+  if(!dt_control_running()
+     || dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED)
+    return FALSE;
+
+  if(msg)
+  {
+    // the step name goes to the progress entry (which lives as long as the
+    // job) and the same string is kept alive as a toast: a dt_control_log
+    // expires after five seconds, and control.c deduplicates a repeat
+    dt_control_job_set_progress_message(job, "%s", msg);
+    dt_control_log("%s", msg);
+  }
+  return TRUE;
+}
+
+// the interactive finalisation. the message is the very string its launch
+// toast used, taken from the job's own params: the user reads one message
+// that simply stays alive, not two alternating ones
 static gboolean _finalize_keep_going(void *p)
 {
-  // also bail out when the whole job system is going down: a multi-minute
-  // compute must not hold the application's exit hostage
-  return dt_control_running()
-         && dt_control_job_get_state((dt_job_t *)p) != DT_JOB_STATE_CANCELLED;
+  dt_job_t *job = p;
+  const _finalize_job_t *j = job ? dt_control_job_get_params(job) : NULL;
+  return _job_step(job, (j && j->vectorize)
+                        ? _("computing precise paths...")
+                        : _("computing precise raster mask..."));
 }
 
 // request of the native render core below, grouped so the two call sites
@@ -2776,6 +2869,8 @@ cleanup:
 static int32_t _finalize_job_run(dt_job_t *job)
 {
   _finalize_job_t *const j = dt_control_job_get_params(job);
+  // from here the reset of the serialisation token is ours, on every exit
+  j->ran = TRUE;
   gboolean ok = FALSE;
   float *alpha_full = NULL;
   gchar *outpath = NULL;
@@ -3034,15 +3129,19 @@ static gboolean _launch_native_finalize(_object_data_t *d,
                                         "precise mask finalisation");
   if(!job)
   {
+    // the destroy releases the token itself (j->ran is FALSE): the one
+    // path that frees these params, whether the job system calls it or we
+    // do, is also the one path that gives the token back
     _finalize_job_destroy(j);
-    g_atomic_int_set(&_finalize_running, 0);
     return FALSE;
   }
   dt_control_job_set_params(job, j, _finalize_job_destroy);
   dt_control_job_add_progress(job, _("precise mask finalisation"), TRUE);
-  dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
+  // announce before queueing: a worker may pick the job up at once and
+  // report a failure, and that report must not be overwritten by this
   dt_control_log(vectorize ? _("computing precise paths...")
                            : _("computing precise raster mask..."));
+  dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
   return TRUE;
 }
 
@@ -4323,6 +4422,14 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
   dt_develop_t *dev = darktable.develop;
   if(!target || !target->has_recipe || !dt_rf_recipe_valid(&target->recipe))
     return FALSE;
+  // opening a session goes through dt_masks_change_form_gui, which tears
+  // down whatever session is in flight -- same guard as every other
+  // creation entry point
+  if(dt_masks_shapes_locked())
+  {
+    dt_control_log(_("mask still computing, try again in a moment"));
+    return FALSE;
+  }
   // C2 delivers family 1 (raster masks, recipe in the rasterfile params);
   // the paths and context families arrive with C4/C5 on this same entry
   if(target->kind != DT_OBJECT_EDIT_RASTER)
@@ -4557,9 +4664,25 @@ static gboolean _recompute_landed_idle(gpointer data)
      || !dev || dev->image_storage.id != imgid)
     return G_SOURCE_REMOVE;
 
+  // the image is about to change under the user's eyes, and he did not ask
+  // for it: say what happened. emitted HERE and not from the job thread on
+  // purpose -- past the two tests above, this is exactly the moment the
+  // visible image is replaced. symmetric with the failure toasts below,
+  // which say why it did NOT change
+  dt_control_log_ack_all();
+  dt_control_log(_("AI mask recomputed"));
+
   // all pipes, not only the center: the preview rendered a zeroed mask too
   dt_dev_reprocess_all(dev);
   return G_SOURCE_REMOVE;
+}
+
+// the headless recompute. see _job_step: the message is the very one the
+// scheduling emitted, so the toast the user already reads stays alive for
+// the whole job instead of expiring after five seconds
+static gboolean _recompute_keep_going(void *p)
+{
+  return _job_step((dt_job_t *)p, _("recomputing the AI mask..."));
 }
 
 static int32_t _recompute_job_run(dt_job_t *job)
@@ -4567,7 +4690,7 @@ static int32_t _recompute_job_run(dt_job_t *job)
   _recompute_job_t *p = dt_control_job_get_params(job);
   p->ran = TRUE;
   p->status = dt_object_recipe_compute(&p->recipe, p->imgid,
-                                       _finalize_keep_going, job);
+                                       _recompute_keep_going, job);
   if(p->status == DT_OBJECT_RECIPE_OK && dt_control_running())
     g_idle_add(_recompute_landed_idle, GINT_TO_POINTER(p->imgid));
   else if(p->status == DT_OBJECT_RECIPE_FAILED && dt_control_running())
@@ -4692,7 +4815,17 @@ gboolean dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
   }
   dt_control_job_set_params(job, p, _recompute_job_destroy);
   dt_control_job_add_progress(job, _("recomputing AI mask"), TRUE);
-  dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
+  // announce BEFORE queueing: a worker can pick the job up immediately and
+  // fail with a diagnosis, and that diagnosis must not be overwritten by
+  // this announcement arriving late.
+  // announce it HERE, at the single point the three triggers funnel
+  // through (the pixelpipe safety net and the proactive gui_update of
+  // iop/rasterfile.c, plus its explicit button): a recompute the user
+  // never asked for takes tens of seconds and used to be completely
+  // silent, its only trace an entry at the bottom of the LEFT panel --
+  // out of the darkroom's field of work and often folded away.
+  // dt_control_log is thread-safe, so the pixelpipe trigger may use it
+  dt_control_log(_("recomputing the AI mask..."));
   return TRUE;
 }
 
@@ -5461,6 +5594,14 @@ static int _object_events_mouse_moved(dt_iop_module_t *module,
 static gboolean _modifier_poll(gpointer data)
 {
   (void)data;
+  // the same 100 ms tick carries the shape-button lock. this timer is
+  // created with the encode (and with any decode that outlives it) and
+  // removed with the session data, so it ticks over every instant a
+  // compute can own the session. re-deriving the sensitivity here instead
+  // of pairing it with an inverse call is what makes a stuck button
+  // impossible: a module whose blend gui is built or rebuilt in the middle
+  // of a compute is caught by the next tick, without anybody knowing
+  dt_masks_update_shapes_sensitivity();
   dt_control_queue_redraw_center();
   return G_SOURCE_CONTINUE;
 }

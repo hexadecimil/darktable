@@ -550,7 +550,25 @@ extern const dt_masks_functions_t dt_masks_functions_group;
 extern const dt_masks_functions_t dt_masks_functions_object;
 /** check if AI object mask model is downloaded and AI is enabled */
 gboolean dt_masks_object_available(void);
+/** TRUE while an AI computation owns the object tool session: the eager
+ * encode, an interactive decode, or the replay of a reopened recipe */
+gboolean dt_masks_object_session_busy(void);
 #endif
+
+/** THE question every "add shape" entry point asks before mutating
+ * anything: would starting a new shape destroy work in progress? starting
+ * one goes through dt_masks_change_form_gui, which clears the form gui and
+ * with it the per-type scratchpad of the tool currently computing. keep
+ * this a pure predicate: it is read from gestures AND from the widget
+ * refresh below, which must not have side effects */
+gboolean dt_masks_shapes_locked(void);
+
+/** re-derive the sensitivity (and the explanatory tooltip) of every "add
+ * shape" button of every module from the predicate above. assignment, never
+ * a toggle: no exit path can leave a button stuck, the last call wins and
+ * the truth is re-read each time. cheap and idempotent, made to be called
+ * from a timer as well as from the state transitions */
+void dt_masks_update_shapes_sensitivity(void);
 
 /** init dt_masks_form_gui_t struct with default values */
 void dt_masks_init_form_gui(dt_masks_form_gui_t *gui);

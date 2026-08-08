@@ -640,6 +640,15 @@ static void _lib_masks_inactivate_icons(dt_lib_module_t *self)
 
 static void _tree_add_shape(GtkButton *button, gpointer shape)
 {
+  // the one place both the toolbar buttons and the tree context menu go
+  // through: creating a shape calls dt_masks_change_form_gui, which tears
+  // down a mask computation in flight without a word
+  if(dt_masks_shapes_locked())
+  {
+    dt_control_log(_("mask still computing, try again in a moment"));
+    return;
+  }
+
   dt_iop_module_t *module = NULL;
 
   dt_lib_masks_t *lm = darktable.develop->proxy.masks.module->data;
@@ -676,6 +685,8 @@ static void _bt_add_shape_cb(GtkGestureSingle *gesture, int n_press, double x, d
       return;
     }
 #endif
+    // the busy guard lives in _tree_add_shape, the bottleneck both this
+    // gesture and the tree context menu go through
     _tree_add_shape(NULL, shape);
 
     GdkModifierType state;

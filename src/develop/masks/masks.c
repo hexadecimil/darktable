@@ -1560,6 +1560,67 @@ void dt_masks_reset_show_masks_icons(void)
   }
 }
 
+gboolean dt_masks_shapes_locked(void)
+{
+#ifdef HAVE_AI
+  // the object tool is the only one with an asynchronous session today;
+  // a second one would add its own predicate HERE and nowhere else
+  return dt_masks_object_session_busy();
+#else
+  return FALSE;
+#endif
+}
+
+// where a locked button parks its construction tooltip while the lock
+// borrows the slot to say why. freed with the widget
+#define DT_MASKS_SHAPE_TIP "dt-masks-shape-tooltip"
+
+void dt_masks_update_shapes_sensitivity(void)
+{
+  const dt_develop_t *dev = darktable.develop;
+  if(!dev || dev->first_load) return;
+
+  const gboolean locked = dt_masks_shapes_locked();
+  for(GList *modules = dev->iop; modules; modules = g_list_next(modules))
+  {
+    const dt_iop_module_t *m = modules->data;
+    if(!m) continue;
+    const dt_iop_gui_blend_data_t *bd = m->blend_data;
+    // continue, never break: a module without blending data says nothing
+    // about the next one (see the TODO in dt_masks_reset_show_masks_icons)
+    if(!bd || !bd->masks_support || !bd->masks_inited) continue;
+
+    for(int n = 0; n < DEVELOP_MASKS_NB_SHAPES; n++)
+    {
+      GtkWidget *w = bd->masks_shapes[n];
+      if(!w) continue;
+      // the state is re-derived, never toggled, so this is idempotent;
+      // skipping the no-op keeps a periodic caller from re-triggering a
+      // tooltip query under the pointer at every tick
+      const gboolean want = !locked;
+      if(gtk_widget_get_sensitive(w) == want) continue;
+
+      // park the construction tooltip on the first lock. an insensitive
+      // widget still answers a tooltip query in gtk3, so the greyed button
+      // stays the place that explains itself -- and state and text are
+      // recomputed here together, so they cannot diverge. "" stands for
+      // "had none": the key must exist from then on, or the next unlock
+      // would park the lock message as if it were the original
+      gchar *saved = g_object_get_data(G_OBJECT(w), DT_MASKS_SHAPE_TIP);
+      if(!saved)
+      {
+        gchar *tip = gtk_widget_get_tooltip_text(w);
+        saved = tip ? tip : g_strdup("");
+        g_object_set_data_full(G_OBJECT(w), DT_MASKS_SHAPE_TIP, saved, g_free);
+      }
+      gtk_widget_set_sensitive(w, want);
+      gtk_widget_set_tooltip_text
+        (w, locked ? _("mask still computing, try again in a moment")
+                   : (*saved ? saved : NULL));
+    }
+  }
+}
+
 dt_masks_edit_mode_t dt_masks_get_edit_mode(void)
 {
   return darktable.develop->form_gui
