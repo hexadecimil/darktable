@@ -67,6 +67,11 @@ static int _version_compare(const char *a, const char *b)
   return 0;
 }
 
+int dt_ai_models_version_compare(const char *a, const char *b)
+{
+  return _version_compare(a, b);
+}
+
 static void _model_free(dt_ai_model_t *model)
 {
   if(!model)

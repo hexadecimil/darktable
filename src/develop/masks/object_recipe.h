@@ -36,6 +36,23 @@ typedef enum dt_object_recipe_status_t
   DT_OBJECT_RECIPE_FAILED,   // deterministic: will fail again this session
 } dt_object_recipe_status_t;
 
+// verdict of the model gap diagnostic: how the machine's installed models
+// relate to the ones a recipe records. this is the queryable mirror of the
+// replay gates in dt_object_recipe_compute -- OK if and only if a replay
+// would pass its model checks -- refined, when it would not, into the
+// cause an UX surface can act on. DRIFT is split by direction: only a
+// lagging install is repairable by a download; an ahead one is not and
+// must never grow an install button
+typedef enum dt_object_recipe_model_gap_t
+{
+  DT_OBJECT_RECIPE_MODELS_OK = 0,        // recorded models installed identically
+  DT_OBJECT_RECIPE_MODELS_INSTALLABLE,   // absent, but the registry can install it
+  DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND,  // installed < recorded or update pending: a download may repair
+  DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD,   // installed > recorded: a download would change nothing
+  DT_OBJECT_RECIPE_MODELS_UNKNOWN,       // the registry does not know the recorded id
+  DT_OBJECT_RECIPE_MODELS_AI_OFF,        // AI processing disabled: no lookup possible
+} dt_object_recipe_model_gap_t;
+
 #ifdef HAVE_AI
 
 // headless replay of an AI mask provenance recipe: regenerate the finalised
@@ -110,6 +127,43 @@ gboolean dt_object_recipe_recompute_now(const dt_rf_recipe_t *recipe,
 // params before scheduling. FALSE when no active model can stand in
 gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe);
 
+// diagnose the gap between a recipe's recorded models and the installed
+// state: one combined verdict covering the segmentation model plus, when
+// the recipe enables refinement, the refinement model -- exactly the
+// scope of the replay gates. when the two models disagree the verdict
+// needing the heaviest user action wins: AI_OFF > UNKNOWN > INSTALLABLE
+// > DRIFT_BEHIND > DRIFT_AHEAD > OK. `missing` (nullable) receives a
+// NULL-terminated vector of the model ids a download could move toward
+// the recorded state (the INSTALLABLE and DRIFT_BEHIND ones), NULL when
+// there is nothing to download; free with g_strfreev. never cache the
+// verdict: installs, rebinds and edits all change it under your feet
+dt_object_recipe_model_gap_t
+dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing);
+
+// the situation changed (a model was installed, activated or removed):
+// clear the deterministic failures pinned in the anti-respawn table so
+// the next trigger may attempt those recomputes again. RUNNING slots are
+// preserved -- a recompute in flight owns its slot until its destroy
+// callback settles it; removing it here would let a concurrent duplicate
+// replay race on the same temp files
+void dt_object_recipe_reset_failed(void);
+
+// TRUE while an interactive AI edit session is open on the rasterfile
+// instance identified by (op, multi_priority). gate for the proactive
+// missing-file recompute of iop/rasterfile.c gui_changed: in the nominal
+// repair flow the mask file IS missing for the whole session, so an
+// ungated gui_update would schedule a headless recompute concurrent with
+// the session's own inference stack
+gboolean dt_object_mask_edit_active(const char *op,
+                                    const int32_t multi_priority);
+
+// session bookkeeping for the flag above, called by the edit session
+// only: set on a successful edit begin, cleared on EVERY session exit
+// (finalise, no-op, cancel, failure, image change)
+void dt_object_mask_edit_set_active(const char *op,
+                                    const int32_t multi_priority);
+void dt_object_mask_edit_clear_active(void);
+
 #else
 
 // without AI support a recipe can never be recomputed on this machine; the
@@ -149,6 +203,39 @@ static inline gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe)
 {
   (void)recipe;
   return FALSE;
+}
+
+static inline dt_object_recipe_model_gap_t
+dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing)
+{
+  (void)recipe;
+  if(missing) *missing = NULL;
+  // without AI support there is no registry to interrogate; AI_OFF is
+  // the one verdict that promises no repair on this machine
+  return DT_OBJECT_RECIPE_MODELS_AI_OFF;
+}
+
+static inline void dt_object_recipe_reset_failed(void)
+{
+}
+
+static inline gboolean dt_object_mask_edit_active(const char *op,
+                                                  const int32_t multi_priority)
+{
+  (void)op;
+  (void)multi_priority;
+  return FALSE;
+}
+
+static inline void dt_object_mask_edit_set_active(const char *op,
+                                                  const int32_t multi_priority)
+{
+  (void)op;
+  (void)multi_priority;
+}
+
+static inline void dt_object_mask_edit_clear_active(void)
+{
 }
 
 #endif // HAVE_AI

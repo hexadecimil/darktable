@@ -3191,6 +3191,253 @@ cleanup:
   return status;
 }
 
+// --------------------------- model gap diagnostic ---------------------------
+//
+// the queryable mirror of the replay gates above: OK means exactly "a
+// replay would pass its model checks" -- same version lookup, same string
+// comparison, refinement examined only when the recipe enables it, and
+// the active == recorded rule for the refinement model. a diagnostic
+// that disagreed with the replay would promise repairs that change
+// nothing, so any change to the gates in dt_object_recipe_compute must
+// land here too. anything but OK is refined into the cause an UX surface
+// can act on; the verdict is cheap and never cached (installs, rebinds
+// and edits all change it)
+
+// the priority when the recipe's two models disagree: the verdict
+// needing the heaviest user action wins. NOT the enum order --
+// INSTALLABLE outranks both drifts
+static int _model_gap_rank(const dt_object_recipe_model_gap_t gap)
+{
+  switch(gap)
+  {
+    case DT_OBJECT_RECIPE_MODELS_AI_OFF:       return 5;
+    case DT_OBJECT_RECIPE_MODELS_UNKNOWN:      return 4;
+    case DT_OBJECT_RECIPE_MODELS_INSTALLABLE:  return 3;
+    case DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND: return 2;
+    case DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD:  return 1;
+    default:                                   return 0;
+  }
+}
+
+static const char *_model_gap_name(const dt_object_recipe_model_gap_t gap)
+{
+  switch(gap)
+  {
+    case DT_OBJECT_RECIPE_MODELS_OK:           return "ok";
+    case DT_OBJECT_RECIPE_MODELS_INSTALLABLE:  return "installable";
+    case DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND: return "drift-behind";
+    case DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD:  return "drift-ahead";
+    case DT_OBJECT_RECIPE_MODELS_UNKNOWN:      return "unknown";
+    case DT_OBJECT_RECIPE_MODELS_AI_OFF:       return "ai-off";
+    default:                                   return "?";
+  }
+}
+
+// verdict for one recorded (id, version) pair against the registry.
+// `missing` collects the ids a download could move toward the recorded
+// state (the INSTALLABLE and DRIFT_BEHIND ones)
+static dt_object_recipe_model_gap_t
+_model_gap_one(const char *model_id,
+               const char *recorded_version,
+               GPtrArray *missing)
+{
+  dt_ai_model_t *model = dt_ai_models_get_by_id(model_id);
+  if(!model)
+    // not even the registry knows the id: no download can produce it,
+    // only a local .dtmodel install can
+    return DT_OBJECT_RECIPE_MODELS_UNKNOWN;
+
+  dt_object_recipe_model_gap_t gap = DT_OBJECT_RECIPE_MODELS_OK;
+
+  if(model->status == DT_AI_MODEL_NOT_DOWNLOADED
+     || model->status == DT_AI_MODEL_DOWNLOADING
+     || model->status == DT_AI_MODEL_ERROR)
+    // known deviation from a literal gate mirror: a recipe recording the
+    // "0.0" placeholder version would slip past the replay's version
+    // comparison only to fail at model load time; "install it" is the
+    // truthful verdict either way
+    gap = DT_OBJECT_RECIPE_MODELS_INSTALLABLE;
+  else
+  {
+    // the exact comparison the replay gate refuses on. when it would
+    // refuse, split the drift by direction: only a lagging install is
+    // repairable by a download -- an UPDATE_* status marks the remote as
+    // ahead of the install, so downloading can still move the version
+    // even when the plain "X.Y" comparison cannot order the two strings.
+    // when the versions MATCH the replay passes whatever the update
+    // status says: an available update must not grow a repair button for
+    // a mask that is not broken
+    const char *installed = dt_ai_model_get_version(model_id);
+    if(g_strcmp0(installed, recorded_version) != 0)
+      gap = (dt_ai_models_version_compare(installed, recorded_version) < 0
+             || model->status == DT_AI_MODEL_UPDATE_AVAILABLE
+             || model->status == DT_AI_MODEL_UPDATE_REQUIRED)
+        ? DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND
+        : DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD;
+  }
+  dt_ai_model_free(model);
+
+  if(missing
+     && (gap == DT_OBJECT_RECIPE_MODELS_INSTALLABLE
+         || gap == DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND))
+    g_ptr_array_add(missing, g_strdup(model_id));
+
+  return gap;
+}
+
+// full diagnostic: the combined verdict plus the per-model ones (the
+// failure toast needs to name the model at fault). the public wrapper
+// below discards the details
+static dt_object_recipe_model_gap_t
+_recipe_model_gap(const dt_rf_recipe_t *recipe,
+                  gchar ***missing,
+                  dt_object_recipe_model_gap_t *seg_gap_out,
+                  dt_object_recipe_model_gap_t *refine_gap_out)
+{
+  dt_object_recipe_model_gap_t seg_gap = DT_OBJECT_RECIPE_MODELS_OK;
+  dt_object_recipe_model_gap_t refine_gap = DT_OBJECT_RECIPE_MODELS_OK;
+
+  if(missing) *missing = NULL;
+
+  // an invalid recipe names no models: nothing to diagnose. callers gate
+  // their surfaces on dt_rf_recipe_valid, not on this verdict
+  const gboolean valid = dt_rf_recipe_valid(recipe);
+  if(valid)
+  {
+    if(!dt_ai_registry_is_enabled())
+      // distinct from UNKNOWN: with AI off the registry holds no models,
+      // and every lookup below would misdiagnose the recipe as recording
+      // ids nobody has heard of
+      seg_gap = refine_gap = DT_OBJECT_RECIPE_MODELS_AI_OFF;
+    else
+    {
+      // a registry created while AI was disabled at startup answers NULL
+      // to every lookup: complete the deferred init first, or every
+      // verdict would be a false UNKNOWN. no-op when already initialized
+      dt_ai_models_init_lazy();
+
+      GPtrArray *ids = missing ? g_ptr_array_new() : NULL;
+
+      seg_gap = _model_gap_one(recipe->seg_model,
+                               recipe->seg_model_version, ids);
+
+      if(recipe->ai_refine)
+      {
+        refine_gap = _model_gap_one(recipe->refine_model,
+                                    recipe->refine_model_version, ids);
+        if(refine_gap == DT_OBJECT_RECIPE_MODELS_OK)
+        {
+          // dt_refine_load offers no per-id loading, so the replay gate
+          // additionally demands that the recorded model be the ACTIVE
+          // one (see dt_object_recipe_compute). installed right but not
+          // active is not repairable by any download: report it as
+          // DRIFT_AHEAD, whose UX offer -- redo with the current models
+          // -- is the only repair that exists for it
+          char *active = dt_ai_models_get_active_for_task("refine");
+          if(g_strcmp0(active, recipe->refine_model) != 0)
+            refine_gap = DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD;
+          g_free(active);
+        }
+      }
+
+      if(ids)
+      {
+        if(ids->len)
+        {
+          g_ptr_array_add(ids, NULL);
+          *missing = (gchar **)g_ptr_array_free(ids, FALSE);
+        }
+        else
+          g_ptr_array_free(ids, TRUE);
+      }
+    }
+  }
+
+  const dt_object_recipe_model_gap_t verdict
+    = _model_gap_rank(refine_gap) > _model_gap_rank(seg_gap)
+      ? refine_gap : seg_gap;
+
+  if(valid)
+  {
+    // the headless test surface: every diagnostic states its verdict and
+    // both causes under -d ai
+    gchar *refine_part = !recipe->ai_refine ? NULL
+      : g_strdup_printf(", refine '%s' recorded v%s installed v%s (%s)",
+                        recipe->refine_model,
+                        recipe->refine_model_version,
+                        dt_ai_model_get_version(recipe->refine_model),
+                        _model_gap_name(refine_gap));
+    dt_print(DT_DEBUG_AI,
+             "[object mask] model gap: %s -- seg '%s' recorded v%s"
+             " installed v%s (%s)%s",
+             _model_gap_name(verdict),
+             recipe->seg_model,
+             recipe->seg_model_version,
+             dt_ai_model_get_version(recipe->seg_model),
+             _model_gap_name(seg_gap),
+             refine_part ? refine_part : "");
+    g_free(refine_part);
+  }
+
+  if(seg_gap_out) *seg_gap_out = seg_gap;
+  if(refine_gap_out) *refine_gap_out = refine_gap;
+  return verdict;
+}
+
+dt_object_recipe_model_gap_t
+dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing)
+{
+  return _recipe_model_gap(recipe, missing, NULL, NULL);
+}
+
+// ----------------------------- edit session gate ----------------------------
+//
+// while an interactive AI edit session is open on a rasterfile instance,
+// the proactive missing-file branch of iop/rasterfile.c gui_changed must
+// not schedule a headless recompute of the very mask the session is
+// preparing to replace: in the nominal repair flow the file IS missing
+// for the whole session, so every gui_update (signal, focus change,
+// w == NULL refresh) would otherwise race a second inference stack
+// against the session -- and pin a fresh FAILED slot when the recorded
+// model is still absent. a single (op, multi_priority) slot suffices:
+// edit sessions are modal, at most one per process
+
+static GMutex _edit_active_mutex;
+static gboolean _edit_active = FALSE;
+static char _edit_active_op[32] = { 0 };
+static int32_t _edit_active_priority = -1;
+
+gboolean dt_object_mask_edit_active(const char *op,
+                                    const int32_t multi_priority)
+{
+  g_mutex_lock(&_edit_active_mutex);
+  const gboolean active = _edit_active
+    && op
+    && !g_strcmp0(op, _edit_active_op)
+    && multi_priority == _edit_active_priority;
+  g_mutex_unlock(&_edit_active_mutex);
+  return active;
+}
+
+void dt_object_mask_edit_set_active(const char *op,
+                                    const int32_t multi_priority)
+{
+  g_mutex_lock(&_edit_active_mutex);
+  _edit_active = TRUE;
+  g_strlcpy(_edit_active_op, op ? op : "", sizeof(_edit_active_op));
+  _edit_active_priority = multi_priority;
+  g_mutex_unlock(&_edit_active_mutex);
+}
+
+void dt_object_mask_edit_clear_active(void)
+{
+  g_mutex_lock(&_edit_active_mutex);
+  _edit_active = FALSE;
+  _edit_active_op[0] = '\0';
+  _edit_active_priority = -1;
+  g_mutex_unlock(&_edit_active_mutex);
+}
+
 // ---------------------------- recompute scheduling --------------------------
 //
 // the anti-respawn table: one entry per (recipe, image) currently being
@@ -3260,6 +3507,29 @@ static void _recompute_settle(const gint64 key,
   g_mutex_unlock(&_recompute_mutex);
 }
 
+static gboolean _recompute_entry_failed(gpointer key,
+                                        gpointer value,
+                                        gpointer user_data)
+{
+  (void)key;
+  (void)user_data;
+  return GPOINTER_TO_INT(value) == _RECOMPUTE_FAILED;
+}
+
+void dt_object_recipe_reset_failed(void)
+{
+  guint cleared = 0;
+  g_mutex_lock(&_recompute_mutex);
+  if(_recompute_table)
+    cleared = g_hash_table_foreach_remove(_recompute_table,
+                                          _recompute_entry_failed, NULL);
+  g_mutex_unlock(&_recompute_mutex);
+  if(cleared)
+    dt_print(DT_DEBUG_AI,
+             "[object mask] recompute table: %u pinned failure%s cleared",
+             cleared, cleared > 1 ? "s" : "");
+}
+
 typedef struct _recompute_job_t
 {
   dt_rf_recipe_t recipe;
@@ -3300,13 +3570,80 @@ static int32_t _recompute_job_run(dt_job_t *job)
   if(p->status == DT_OBJECT_RECIPE_OK && dt_control_running())
     g_idle_add(_recompute_landed_idle, GINT_TO_POINTER(p->imgid));
   else if(p->status == DT_OBJECT_RECIPE_FAILED && dt_control_running())
-    // the mask stays zeroed and the user needs to know why, and the way
-    // out: the raster module's recompute button rebinds the recipe to the
-    // models installed NOW
-    dt_control_log(_("AI mask not regenerated: its recorded model is"
-                     " missing or changed.\nuse 'recompute mask' in the"
-                     " raster masks module to redo it with the current"
-                     " model"));
+  {
+    // the mask stays zeroed and the user needs to know WHY, and the way
+    // out: diagnose the model gap the replay refused on and name both
+    // the cause and the actionable place. 'recompute mask' in the raster
+    // masks module rebinds the recipe to the models installed NOW
+    dt_object_recipe_model_gap_t seg_gap;
+    const dt_object_recipe_model_gap_t gap
+      = _recipe_model_gap(&p->recipe, NULL, &seg_gap, NULL);
+    // the model the combined verdict came from; the segmentation model
+    // wins ties, being the one every recipe records
+    const gboolean seg_at_fault = seg_gap == gap;
+    const char *id = seg_at_fault ? p->recipe.seg_model
+                                  : p->recipe.refine_model;
+    const char *recorded = seg_at_fault
+      ? p->recipe.seg_model_version
+      : p->recipe.refine_model_version;
+    const char *installed = dt_ai_model_get_version(id);
+    switch(gap)
+    {
+      case DT_OBJECT_RECIPE_MODELS_INSTALLABLE:
+        dt_control_log(_("AI mask not regenerated: model '%s' (v%s) is"
+                         " not installed.\ninstall it in the AI models"
+                         " preferences, or use 'recompute mask' in the"
+                         " raster masks module to redo it with the"
+                         " current model"),
+                       id, recorded);
+        break;
+      case DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND:
+        dt_control_log(_("AI mask not regenerated: it records model '%s'"
+                         " v%s, v%s is installed.\nupdating the model may"
+                         " restore the exact mask; 'recompute mask' in"
+                         " the raster masks module redoes it with the"
+                         " current model"),
+                       id, recorded, installed);
+        break;
+      case DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD:
+        if(!g_strcmp0(installed, recorded))
+          // the refine edge case: the recorded model is installed at the
+          // recorded version but another model is the active one
+          dt_control_log(_("AI mask not regenerated: model '%s' is"
+                           " installed but not active.\nactivate it in"
+                           " the AI models preferences, or use 'recompute"
+                           " mask' in the raster masks module to redo it"
+                           " with the current model"),
+                         id);
+        else
+          dt_control_log(_("AI mask not regenerated: it records model"
+                           " '%s' v%s, the newer v%s is installed.\nuse"
+                           " 'recompute mask' in the raster masks module"
+                           " to redo it with the installed model"),
+                         id, recorded, installed);
+        break;
+      case DT_OBJECT_RECIPE_MODELS_UNKNOWN:
+        dt_control_log(_("AI mask not regenerated: model '%s' is not"
+                         " known to this darktable.\ninstall its .dtmodel"
+                         " file, or use 'recompute mask' in the raster"
+                         " masks module to redo it with the current"
+                         " model"),
+                       id);
+        break;
+      case DT_OBJECT_RECIPE_MODELS_AI_OFF:
+        dt_control_log(_("AI mask not regenerated: AI processing is"
+                         " disabled.\nenable it in the processing"
+                         " preferences"));
+        break;
+      default:
+        // models check out: the failure has another, rarer cause
+        // (unusable recipe, render failure) -- point at the trace
+        dt_control_log(_("AI mask not regenerated (run with -d ai for"
+                         " details).\nuse 'recompute mask' in the raster"
+                         " masks module to redo it"));
+        break;
+    }
+  }
   return p->status == DT_OBJECT_RECIPE_OK ? 0 : 1;
 }
 

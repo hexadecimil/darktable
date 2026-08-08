@@ -827,7 +827,13 @@ void gui_changed(dt_iop_module_t *self,
                                                    img->exif_datetime_taken);
       gchar *root = dt_rasterfile_mask_root();
       gchar *fullpath = g_build_filename(root, fname, NULL);
-      if(!g_file_test(fullpath, G_FILE_TEST_EXISTS))
+      // an open AI edit session on this instance keeps the file
+      // legitimately absent while it prepares a replacement: without the
+      // gate every gui_update would schedule a headless recompute
+      // concurrent with the session's own inference stack -- and pin a
+      // fresh failure when the recorded model is still missing
+      if(!g_file_test(fullpath, G_FILE_TEST_EXISTS)
+         && !dt_object_mask_edit_active(self->op, self->multi_priority))
         dt_object_recipe_schedule_recompute(&p->recipe, img->id);
       g_free(fullpath);
       g_free(root);

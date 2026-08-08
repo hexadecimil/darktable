@@ -295,6 +295,13 @@ const char *dt_ai_model_get_version(const char *model_id);
 const char *dt_ai_model_get_min_version(const char *model_id);
 
 /**
+ * @brief Compare two model version strings of the form "X.Y".
+ *        NULL or unparsable strings read as "0.0".
+ * @return -1 when a < b, 0 when equal, 1 when a > b
+ */
+int dt_ai_models_version_compare(const char *a, const char *b);
+
+/**
  * @brief Set the active model for a task (exclusive — clears previous).
  *
  * Persists to `plugins/ai/models/active/{task}` in darktablerc.
