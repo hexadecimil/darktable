@@ -1966,7 +1966,10 @@ void dt_masks_form_remove(dt_iop_module_t *module,
       {
         m->blend_params->mask_id = NO_MASKID;
         dt_masks_iop_update(m);
-        dt_dev_add_history_item(darktable.develop, m, TRUE);
+        // do not force the module on: losing a mask is not a reason to
+        // start applying an effect the user had switched off, and without
+        // a mask the module would apply to the whole image
+        dt_dev_add_history_item(darktable.develop, m, FALSE);
       }
       else
       {
