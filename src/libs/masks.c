@@ -204,6 +204,12 @@ typedef enum dt_masks_tree_cols_t
   TREE_IC_USED,
   TREE_IC_USED_VISIBLE,
   TREE_USED_TEXT,
+  // rank of the shape in the application order of its module's mask, ""
+  // where that order carries no meaning. TREE_BASE holds _("base") on the
+  // shape that lays the buffer down, "" everywhere else. both are derived,
+  // never persisted, and written by _set_iter_name only
+  TREE_NUM,
+  TREE_BASE,
   TREE_COUNT
 } dt_masks_tree_cols_t;
 
@@ -756,6 +762,81 @@ static void _tree_group(GtkButton *button, dt_lib_module_t *self)
   // dt_masks_change_form_gui(grp);
 }
 
+// where a shape sits in the application order of its group. index 0 is the
+// base: it lays the buffer down, and it is the only member allowed to carry
+// no operator -- group.c reads a missing operator as "overwrite everything
+// applied so far" (final `else` of _group_get_mask).
+// returns -1 when the group or the shape is unknown.
+//
+// everything that used to be decided from a row's position on screen is
+// decided here instead: the tree is a projection of this list, and after
+// this commit that projection is no longer a mirror.
+static int _group_point_index(const dt_masks_form_t *grp,
+                              const dt_mask_id_t formid)
+{
+  if(!grp || !(grp->type & DT_MASKS_GROUP)) return -1;
+
+  int pos = 0;
+  for(const GList *pts = grp->points; pts; pts = g_list_next(pts))
+  {
+    const dt_masks_point_group_t *pt = pts->data;
+    // we stop at the first match, exactly like dt_masks_form_move() and
+    // _tree_operation, so display and reordering always agree on which
+    // occurrence they mean
+    if(pt->formid == formid) return pos;
+    pos++;
+  }
+  return -1;
+}
+
+// formid of the shape at `index` in the application order, INVALID_MASKID
+// when there is none.
+static dt_mask_id_t _group_point_id(const dt_masks_form_t *grp,
+                                    const int index)
+{
+  if(!grp || !(grp->type & DT_MASKS_GROUP) || index < 0)
+    return INVALID_MASKID;
+
+  const dt_masks_point_group_t *pt =
+    g_list_nth_data(grp->points, (guint)index);
+  return pt ? pt->formid : INVALID_MASKID;
+}
+
+// DT_MASKS_STATE_SHOW is not "this shape is the base": dt_masks_group_add_form
+// sets it on every point it creates. it is read in exactly two places, both in
+// this file (the operator-icon lookups), and means "draw the operator glyph".
+// the base must not draw one, so when a move or a deletion changes which shape
+// sits at index 0 we hand that flag over: the incoming base drops SHOW, the
+// outgoing one gets it back plus a UNION if it had no operator at all --
+// without which group.c would treat it as a fresh buffer and silently drop
+// every shape applied before it.
+//
+// pass INVALID_MASKID as old_base_id when the outgoing base is on its way out
+// (a deletion): there is nothing to hand back to.
+//
+// both ids come from grp->points, never from a row position.
+static void _handover_base_state(dt_masks_form_t *grp,
+                                 const dt_mask_id_t new_base_id,
+                                 const dt_mask_id_t old_base_id)
+{
+  if(!grp || !(grp->type & DT_MASKS_GROUP)) return;
+
+  for(const GList *pts = grp->points; pts; pts = g_list_next(pts))
+  {
+    dt_masks_point_group_t *pt = pts->data;
+
+    if(pt->formid == new_base_id)
+      pt->state &= ~DT_MASKS_STATE_SHOW;
+    else if(pt->formid == old_base_id)
+    {
+      // ensure an operator is defined, as we are going to show one
+      if((pt->state & DT_MASKS_STATE_OP) == DT_MASKS_STATE_NONE)
+        pt->state |= DT_MASKS_STATE_UNION;
+      pt->state |= DT_MASKS_STATE_SHOW;
+    }
+  }
+}
+
 static void _set_iter_name(dt_lib_masks_t *lm,
                            dt_masks_form_t *form,
                            const int state,
@@ -765,6 +846,11 @@ static void _set_iter_name(dt_lib_masks_t *lm,
 {
   if(!form) return;
 
+  // TREE_TEXT must stay exactly form->name on an editable row:
+  // _tree_cell_edited copies the displayed string straight back into
+  // form->name. TREE_EDITABLE is (grp_id == 0), and a root row is always built
+  // with opacity 1.0f, so no "%" suffix can reach it either. the rank and the
+  // base marker live in columns of their own and never in TREE_TEXT
   char str[256] = "";
   g_strlcat(str, form->name, sizeof(str));
 
@@ -773,6 +859,38 @@ static void _set_iter_name(dt_lib_masks_t *lm,
     char str2[256] = "";
     g_strlcpy(str2, str, sizeof(str2));
     snprintf(str, sizeof(str), "%s %d%%", str2, (int)(opacity * 100));
+  }
+
+  // the shapes of a mask are stacked: the first lays the base, the next ones
+  // combine onto it. number them so a module's mask reads like a recipe --
+  // only there: at the root, and inside a stand-alone group no module uses,
+  // the order means nothing on screen and gets no number.
+  // the base MARKER is not tied to that: group.c forbids an operator on index
+  // 0 of *every* group and the context menu greys the five "mode:" entries
+  // accordingly, so the marker has to appear wherever that rule bites --
+  // otherwise the menu is disabled without saying why.
+  // TREE_MODULE and TREE_GROUPID are already set on the row by the time we are
+  // called, so we read them back instead of growing the signature
+  dt_iop_module_t *module = NULL;
+  dt_mask_id_t grid = INVALID_MASKID;
+  dt_mask_id_t id = INVALID_MASKID;
+  _lib_masks_get_values(model, iter, &module, &grid, &id);
+
+  char num[8] = "";
+  const char *base = "";
+
+  if(dt_is_valid_maskid(grid))
+  {
+    const int rank =
+      _group_point_index(dt_masks_get_from_id(darktable.develop, grid), id);
+
+    if(rank >= 0)
+    {
+      if(module) snprintf(num, sizeof(num), "%d", rank + 1);
+      // the base carries no operator and cannot be given one; say so rather
+      // than leave an unexplained empty operator slot and a greyed menu
+      if(rank == 0) base = _("base");
+    }
   }
 
   const gboolean show = state & DT_MASKS_STATE_SHOW;
@@ -796,6 +914,8 @@ static void _set_iter_name(dt_lib_masks_t *lm,
 
   gtk_tree_store_set(GTK_TREE_STORE(model), iter,
                      TREE_TEXT, str,
+                     TREE_NUM, num,
+                     TREE_BASE, base,
                      TREE_IC_OP, icop,
                      TREE_IC_OP_VISIBLE, (icop != NULL) && show,
                      TREE_IC_INVERSE, icinv,
@@ -890,149 +1010,71 @@ static void _add_tree_operation(GtkMenuShell *menu,
   gtk_menu_shell_append(menu, item);
 }
 
-static void _swap_last_secondlast_item_visibility(dt_lib_masks_t *lm,
-                                                   GtkTreeIter *iter,
-                                                   const dt_mask_id_t secondlast_id,
-                                                   const dt_mask_id_t last_id)
-{
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
-
-  dt_mask_id_t grid = INVALID_MASKID;
-  dt_mask_id_t id = INVALID_MASKID;
-  _lib_masks_get_values(model, iter, NULL, &grid, &id);
-
-  dt_masks_form_t *grp = dt_masks_get_from_id(darktable.develop, grid);
-
-  if(grp)
-  {
-    // we search the entries and change the state
-    // the new last entry is removed the SHOW state and
-    // the new second last node is set SHOW state + UNION if no operator defined yet.
-    for(const GList *pts = g_list_last(grp->points); pts; pts = g_list_previous(pts))
-    {
-      dt_masks_point_group_t *pt = pts->data;
-      gboolean changed = FALSE;
-      if(pt->formid == last_id)
-      {
-        pt->state &= ~DT_MASKS_STATE_SHOW;
-        changed = TRUE;
-      }
-      else if(pt->formid == secondlast_id)
-      {
-        // ensure that at least an operator is defined as we are
-        // going to show this mask operator.
-        if((pt->state & DT_MASKS_STATE_OP) == DT_MASKS_STATE_NONE)
-          pt->state |= DT_MASKS_STATE_UNION;
-        pt->state |= DT_MASKS_STATE_SHOW;
-        changed = TRUE;
-      }
-      if(changed)
-        _set_iter_name(lm,
-                       dt_masks_get_from_id(darktable.develop, id),
-                       pt->state, pt->opacity, model,
-                       iter);
-    }
-  }
-}
-
-static gboolean _is_last_tree_item(GtkTreeModel *model, GtkTreeIter *iter)
-{
-  GtkTreeIter *tmp = gtk_tree_iter_copy(iter);
-  const gboolean is_last_item = !gtk_tree_model_iter_next(model, tmp);
-  gtk_tree_iter_free(tmp);
-  return is_last_item;
-}
-
-static void _tree_moveup(GtkButton *button, dt_lib_module_t *self)
+// reordering is a per-shape operation. the old code looped over the whole
+// selection and moved each row against a tree model already stale after the
+// first move; it also called gtk_tree_model_iter_next() without checking its
+// return value and then read the resulting iter, so acting on the bottom row
+// could hand garbage ids to the state swap. we act on the first selected row
+// only, from grp->points, and the menu keeps both entries insensitive unless
+// exactly one row is selected.
+static void _tree_move_shape(dt_lib_module_t *self, const gboolean later)
 {
   dt_lib_masks_t *lm = self->data;
 
-  dt_masks_clear_form_gui(darktable.develop);
-
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
-  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
+  GtkTreeSelection *selection =
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
   GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
+  if(!items) return;
 
-  for(const GList *items_iter = items;
-      items_iter;
-      items_iter = g_list_next(items_iter))
+  GtkTreeIter iter;
+  if(gtk_tree_model_get_iter(model, &iter, items->data))
   {
-    GtkTreePath *item = (GtkTreePath *)items_iter->data;
-    GtkTreeIter iter;
+    dt_mask_id_t grid = INVALID_MASKID;
+    dt_mask_id_t id = INVALID_MASKID;
+    _lib_masks_get_values(model, &iter, NULL, &grid, &id);
 
-    if(gtk_tree_model_get_iter(model, &iter, item))
+    dt_masks_form_t *grp = dt_masks_get_from_id(darktable.develop, grid);
+    const int rank = _group_point_index(grp, id);
+    const int nb_points = grp ? (int)g_list_length(grp->points) : 0;
+
+    // "earlier" means closer to the base, i.e. a lower index in grp->points;
+    // dt_masks_form_move()'s `up` argument means "one step later in the list".
+    // the two are opposites, and after the display flip "earlier" is also the
+    // one that moves the row up on screen.
+    // rank < 0 (root row, unknown group) fails both tests.
+    const gboolean can_move = later ? (rank >= 0 && rank + 1 < nb_points)
+                                    : (rank > 0);
+
+    if(can_move)
     {
-      dt_mask_id_t grid = INVALID_MASKID;
-      dt_mask_id_t id = INVALID_MASKID;
-      _lib_masks_get_values(model, &iter, NULL, &grid, &id);
+      dt_masks_clear_form_gui(darktable.develop);
 
-      GtkTreeIter *prev_iter = gtk_tree_iter_copy(&iter);
-      if(gtk_tree_model_iter_previous(model, prev_iter))
-      {
-        dt_mask_id_t prev_grid = INVALID_MASKID;
-        dt_mask_id_t prev_id = INVALID_MASKID;
-        _lib_masks_get_values(model, prev_iter, NULL, &prev_grid, &prev_id);
+      // crossing index 0 hands the base over to another shape. both ids are
+      // resolved BEFORE the move, and _handover_base_state only touches state
+      // bits, never positions
+      if(later && rank == 0)
+        _handover_base_state(grp, _group_point_id(grp, 1), id);
+      else if(!later && rank == 1)
+        _handover_base_state(grp, id, _group_point_id(grp, 0));
 
-        if(_is_last_tree_item(model, &iter))
-        {
-          _swap_last_secondlast_item_visibility(lm, &iter, id, prev_id);
-        }
-      }
+      dt_masks_form_move(grp, id, later);
 
-      gtk_tree_iter_free(prev_iter);
-
-      dt_masks_form_move(dt_masks_get_from_id(darktable.develop, grid), id, 1);
+      dt_dev_add_masks_history_item(darktable.develop, NULL, TRUE);
+      _lib_masks_recreate_list(self);
     }
   }
   g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
-
-  dt_dev_add_masks_history_item(darktable.develop, NULL, TRUE);
-  _lib_masks_recreate_list(self);
 }
 
-static void _tree_movedown(GtkButton *button, dt_lib_module_t *self)
+static void _tree_apply_earlier(GtkButton *button, dt_lib_module_t *self)
 {
-  dt_lib_masks_t *lm = self->data;
+  _tree_move_shape(self, FALSE);
+}
 
-  dt_masks_clear_form_gui(darktable.develop);
-
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
-  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
-  GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
-
-  for(const GList *items_iter = items;
-      items_iter;
-      items_iter = g_list_next(items_iter))
-  {
-    GtkTreePath *item = (GtkTreePath *)items_iter->data;
-    GtkTreeIter iter;
-
-    if(gtk_tree_model_get_iter(model, &iter, item))
-    {
-      dt_mask_id_t grid = INVALID_MASKID;
-      dt_mask_id_t id = INVALID_MASKID;
-      _lib_masks_get_values(model, &iter, NULL, &grid, &id);
-
-      GtkTreeIter *next_iter = gtk_tree_iter_copy(&iter);
-      gtk_tree_model_iter_next(model, next_iter);
-      dt_mask_id_t next_grid = INVALID_MASKID;
-      dt_mask_id_t next_id = INVALID_MASKID;
-      _lib_masks_get_values(model, next_iter, NULL, &next_grid, &next_id);
-
-      if(_is_last_tree_item(model, next_iter))
-      {
-        _swap_last_secondlast_item_visibility(lm, &iter, next_id, id);
-      }
-
-      gtk_tree_iter_free(next_iter);
-
-      dt_masks_form_move(dt_masks_get_from_id(darktable.develop, grid), id, 0);
-    }
-  }
-  g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
-
-  dt_dev_add_masks_history_item(darktable.develop, NULL, TRUE);
-  _lib_masks_recreate_list(self);
+static void _tree_apply_later(GtkButton *button, dt_lib_module_t *self)
+{
+  _tree_move_shape(self, TRUE);
 }
 
 static void _tree_delete_shape(GtkButton *button, dt_lib_module_t *self)
@@ -1060,26 +1102,35 @@ static void _tree_delete_shape(GtkButton *button, dt_lib_module_t *self)
       GtkTreeIter *next_iter = gtk_tree_iter_copy(&iter);
       const gboolean has_previous = gtk_tree_model_iter_previous(model, prev_iter);
       const gboolean has_next = gtk_tree_model_iter_next(model, next_iter);
-      dt_mask_id_t prev_grid = INVALID_MASKID;
-      dt_mask_id_t prev_id = INVALID_MASKID;
-
       dt_mask_id_t grid = INVALID_MASKID;
       dt_mask_id_t id = INVALID_MASKID;
       _lib_masks_get_values(model, &iter, &module, &grid, &id);
 
+      // moving the selection to a neighbouring row is interface comfort, not
+      // persisted state: it stays as it was, flip or no flip
       if(has_previous)
         gtk_tree_selection_select_iter(selection, prev_iter);
       else if(has_next)
         gtk_tree_selection_select_iter(selection, next_iter);
 
+      // historical quirk, kept deliberately: `module` is re-read from the row
+      // above when there is one, overwriting the one just read from the row
+      // itself. gtk_tree_model_iter_previous() stays among siblings, so for a
+      // row inside a group this is the same module; changing it would alter
+      // which module dt_masks_form_remove() logs its history item against
       if(has_previous)
-      {
-        _lib_masks_get_values(model, prev_iter, &module, &prev_grid, &prev_id);
-        if(_is_last_tree_item(model, &iter))
-        {
-          _swap_last_secondlast_item_visibility(lm, &iter, id, prev_id);
-        }
-      }
+        _lib_masks_get_values(model, prev_iter, &module, NULL, NULL);
+
+      // deleting the base promotes the next shape in the application order; it
+      // must stop showing an operator icon, exactly as when a move hands the
+      // base over. its operator bit is deliberately left alone: clearing it
+      // would change what the mask renders, which a UI commit must never do.
+      // read from the live grp->points, which earlier turns of this loop have
+      // already amputated -- not from a row position, which is what made the
+      // old code promote the row *below* once the display stopped being a mirror
+      dt_masks_form_t *pgrp = dt_masks_get_from_id(darktable.develop, grid);
+      if(_group_point_index(pgrp, id) == 0)
+        _handover_base_state(pgrp, _group_point_id(pgrp, 1), INVALID_MASKID);
       gtk_tree_iter_free(prev_iter);
       gtk_tree_iter_free(next_iter);
       dt_masks_form_remove(module, dt_masks_get_from_id(darktable.develop, grid),
@@ -1321,8 +1372,10 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
     const int nb = gtk_tree_selection_count_selected_rows(selection);
     gboolean from_group = FALSE;
 
-    gboolean is_first_row = FALSE;
-    gboolean is_last_row = FALSE;
+    // read from grp->points, not from the row's position: the base is index 0,
+    // the shape applied last is index n-1
+    gboolean is_base_row = FALSE;
+    gboolean is_last_applied = FALSE;
     dt_masks_state_t selected_states = DT_MASKS_STATE_NONE;
 
     // despite its name, grpid receives TREE_FORMID: the id of the selected
@@ -1351,20 +1404,20 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
           grp = dt_masks_get_from_id(darktable.develop, grpid);
         }
 
-        // if depth > 1 then check if the selected item is the first
-        // or last in the group. This is used to enable/disable some
-        // feature only meaningful for rows with prev/next.
+        // where the selected row sits in its group's application order. the
+        // base is the one shape that must not be given an operator, and the two
+        // ends of the list are the ones that cannot move any further. computed
+        // for a single selection only. parent_grid holds TREE_GROUPID and grpid
+        // holds TREE_FORMID -- a root row has parent_grid == NO_MASKID, so its
+        // rank is -1 and both flags stay FALSE
+        dt_masks_form_t *parent_grp =
+          dt_masks_get_from_id(darktable.develop, parent_grid);
+        const int rank = _group_point_index(parent_grp, grpid);
+        const int nb_points = (parent_grp && (parent_grp->type & DT_MASKS_GROUP))
+          ? (int)g_list_length(parent_grp->points) : 0;
 
-        GtkTreeIter it;
-        GtkTreePath *item = gtk_tree_path_copy(it0);
-        gtk_tree_model_get_iter(model, &it, item);
-        is_last_row = !gtk_tree_model_iter_next(model, &it);
-
-        if(!is_last_row && !gtk_tree_path_prev(item))
-        {
-          is_first_row = TRUE;
-        }
-        gtk_tree_path_free(item);
+        is_base_row = (rank == 0);
+        is_last_applied = (rank >= 0) && (rank == nb_points - 1);
       }
 
       for(const GList *items_iter = selected;
@@ -1586,25 +1639,27 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
 
       gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
       _add_tree_operation(menu, _("mode: union"),
-                          DT_MASKS_STATE_UNION, selected_states, !is_last_row);
+                          DT_MASKS_STATE_UNION, selected_states, !is_base_row);
       _add_tree_operation(menu, _("mode: intersection"),
-                          DT_MASKS_STATE_INTERSECTION, selected_states, !is_last_row);
+                          DT_MASKS_STATE_INTERSECTION, selected_states, !is_base_row);
       _add_tree_operation(menu, _("mode: difference"),
-                          DT_MASKS_STATE_DIFFERENCE, selected_states, !is_last_row);
+                          DT_MASKS_STATE_DIFFERENCE, selected_states, !is_base_row);
       _add_tree_operation(menu, _("mode: sum"),
-                          DT_MASKS_STATE_SUM, selected_states, !is_last_row);
+                          DT_MASKS_STATE_SUM, selected_states, !is_base_row);
       _add_tree_operation(menu, _("mode: exclusion"),
-                          DT_MASKS_STATE_EXCLUSION, selected_states, !is_last_row);
+                          DT_MASKS_STATE_EXCLUSION, selected_states, !is_base_row);
 
       gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-      item = gtk_menu_item_new_with_label(_("move up"));
-      gtk_widget_set_sensitive(item, !is_first_row);
-      g_signal_connect(item, "activate", G_CALLBACK(_tree_moveup), self);
+      // this is time, not space: the list is the order the shapes are applied
+      // in. offered for a single row only -- see _tree_move_shape
+      item = gtk_menu_item_new_with_label(_("apply earlier"));
+      gtk_widget_set_sensitive(item, nb == 1 && !is_base_row);
+      g_signal_connect(item, "activate", G_CALLBACK(_tree_apply_earlier), self);
       gtk_menu_shell_append(menu, item);
 
-      item = gtk_menu_item_new_with_label(_("move down"));
-      gtk_widget_set_sensitive(item, !is_last_row);
-      g_signal_connect(item, "activate", G_CALLBACK(_tree_movedown), self);
+      item = gtk_menu_item_new_with_label(_("apply later"));
+      gtk_widget_set_sensitive(item, nb == 1 && !is_last_applied);
+      g_signal_connect(item, "activate", G_CALLBACK(_tree_apply_later), self);
       gtk_menu_shell_append(menu, item);
     }
 
@@ -1787,8 +1842,11 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
 
     if(toplevel)
     {
-      // we are within a group
-      gtk_tree_store_prepend(treestore, &child, toplevel);
+      // inside a group: rows follow grp->points, so the shape that lays the
+      // base comes first and the list reads top-down in the order the shapes
+      // are applied. TREE_MODULE / TREE_GROUPID are written just below, and
+      // _set_iter_name reads them back -- do not move that call up
+      gtk_tree_store_append(treestore, &child, toplevel);
     }
     else
     {
@@ -1846,7 +1904,16 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
 
     // we add the group node to the tree
     GtkTreeIter child;
-    gtk_tree_store_prepend(treestore, &child, toplevel);
+    if(toplevel)
+      // a group nested in another group is a member of its parent's
+      // application order like any shape: same rule as above
+      gtk_tree_store_append(treestore, &child, toplevel);
+    else
+      // at the root there is no application order to show. keep the historical
+      // stacking so root rows -- and _tree_group, which builds a new group in
+      // the visual order of the selection and is only offered for root rows --
+      // are untouched
+      gtk_tree_store_prepend(treestore, &child, NULL);
     gtk_tree_store_set(treestore, &child,
                        TREE_TEXT, str,
                        TREE_MODULE, module,
@@ -2012,13 +2079,16 @@ void gui_update(dt_lib_module_t *self)
 
   GtkTreeStore *treestore;
   // we store : text ; *module ; groupid ; formid
+  // NOTE: this list and dt_masks_tree_cols_t are two parallel lists kept in
+  // step by hand; a mismatch is a runtime fault, not a build error
   treestore = gtk_tree_store_new(TREE_COUNT,
                                  G_TYPE_STRING, G_TYPE_POINTER,
                                  G_TYPE_INT, G_TYPE_INT,
                                  G_TYPE_BOOLEAN, GDK_TYPE_PIXBUF,
                                  G_TYPE_BOOLEAN, GDK_TYPE_PIXBUF,
                                  G_TYPE_BOOLEAN, GDK_TYPE_PIXBUF,
-                                 G_TYPE_BOOLEAN, G_TYPE_STRING);
+                                 G_TYPE_BOOLEAN, G_TYPE_STRING,
+                                 G_TYPE_STRING, G_TYPE_STRING);
 
   // we first add all groups
   for(const GList *forms = darktable.develop->forms;
@@ -2431,10 +2501,42 @@ void gui_init(dt_lib_module_t *self)
   gtk_tree_view_column_set_title(col, "shapes");
   gtk_tree_view_append_column(GTK_TREE_VIEW(d->treeview), col);
 
-  GtkCellRenderer *renderer = gtk_cell_renderer_pixbuf_new();
+  // the application rank, first thing on the row: read the column top-down and
+  // you read the order the shapes are applied in. right-aligned and two
+  // characters wide so a group reaching ten shapes does not shift every name
+  // sideways. small and insensitive: the theme greys it for us -- dark theme
+  // and light theme alike -- and no colour is hardcoded.
+  // a constant empty gutter reads as a margin; a column that moves reads as a bug
+  GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+  g_object_set(renderer,
+               "xalign", 1.0,
+               "xpad", (guint)DT_PIXEL_APPLY_DPI(2),
+               "width-chars", 2,
+               "scale", PANGO_SCALE_SMALL,
+               "sensitive", FALSE,
+               NULL);
+  gtk_tree_view_column_pack_start(col, renderer, FALSE);
+  gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_NUM);
+
+  renderer = gtk_cell_renderer_pixbuf_new();
   gtk_tree_view_column_pack_start(col, renderer, FALSE);
   gtk_tree_view_column_set_attributes(col, renderer, "pixbuf", TREE_IC_OP, NULL);
   gtk_tree_view_column_add_attribute(col, renderer, "visible", TREE_IC_OP_VISIBLE);
+
+  // "base" sits where the operator glyph would be, on the one row that has no
+  // operator and cannot be given one. a word rather than a glyph: it has to
+  // translate, and it has to follow a theme change -- which the icons,
+  // rasterised once above, do not
+  renderer = gtk_cell_renderer_text_new();
+  g_object_set(renderer,
+               "xalign", 0.0,
+               "xpad", (guint)DT_PIXEL_APPLY_DPI(1),
+               "scale", PANGO_SCALE_SMALL,
+               "sensitive", FALSE,
+               NULL);
+  gtk_tree_view_column_pack_start(col, renderer, FALSE);
+  gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_BASE);
+
   renderer = gtk_cell_renderer_pixbuf_new();
   gtk_tree_view_column_pack_start(col, renderer, FALSE);
   gtk_tree_view_column_set_attributes(col, renderer, "pixbuf", TREE_IC_INVERSE, NULL);
