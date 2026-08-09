@@ -118,9 +118,19 @@ typedef struct dt_lib_masks_t
   // of recreating the store, so the panel scroll never moves. See _forms_structure_hash.
   guint tree_hash;
   gboolean tree_hash_valid;
+
+  // the creation bar: one row, under both lists, saying where the next drawn
+  // shape is about to go and letting it be called off. arm_module is this
+  // panel's claim on the creation in flight, not a second source of truth for
+  // it: a shape button in a module's own blending panel arms the very same
+  // canvas and reaches the very same proxy, and only this tells the two apart
+  GtkWidget *creation_bar, *creation_label;
+  struct dt_iop_module_t *arm_module;
 } dt_lib_masks_t;
 
 static void _resize_update(dt_lib_masks_t *d);
+static void _creation_bar_update(dt_lib_masks_t *d);
+static void _creation_end_continuous(void);
 
 #define DT_MASKS_NVIEWS 2
 
@@ -233,6 +243,11 @@ void expanded_state(dt_lib_module_t *self,
           && bd->masks_shown != DT_MASKS_EDIT_OFF
           && sel_used))
     {
+      // a continuous run is not part of form_gui's own cleanup: dropping the
+      // form alone would leave it set, and the next shape drawn from anywhere
+      // would silently chain on it. this ends whoever's run is up, the same
+      // way the line below ends whoever's creation is in flight
+      _creation_end_continuous();
       dt_masks_change_form_gui(NULL);
       dt_control_queue_redraw_center();
     }
@@ -713,6 +728,9 @@ static void _update_all_properties(dt_lib_masks_t *self)
 
   // shrink/grow applies only to a single path shape
   _resize_update(self);
+
+  // ... and the row that says where the next drawn shape is going
+  _creation_bar_update(self);
 }
 
 static void _lib_masks_get_values(GtkTreeModel *model,
@@ -883,6 +901,104 @@ static dt_iop_module_t *_mask_default_target(dt_lib_module_t *self)
   return last;
 }
 
+/* -------------------------------------------------------------------------
+   the creation bar: the row that says where the next shape is going.
+
+   the catalogue names the target once, in a menu that is gone by the time the
+   shape is drawn. between that click and the first click on the image there is
+   nothing on screen saying what was armed, and no way back short of drawing
+   something and undoing it. this is that missing line.
+   ------------------------------------------------------------------------- */
+
+// a continuous run outlives the form it belongs to: dt_masks_clear_form_gui()
+// resets `creation` and `creation_module` but not these two, so every place
+// that ends a creation from outside the canvas has to end the run as well --
+// which is what a right-click on the image does, in every shape's
+// _*_events_button_pressed(), before dropping the form
+static void _creation_end_continuous(void)
+{
+  dt_masks_form_gui_t *fg = darktable.develop->form_gui;
+  if(!fg) return;
+  fg->creation_continuous = FALSE;
+  fg->creation_continuous_module = NULL;
+}
+
+// the one place the bar is decided, reached from _update_all_properties(), so
+// from all four refresh paths of this panel. what is armed is read back from
+// form_gui rather than mirrored here: the bar then promises exactly what the
+// next click on the image will do, and the shape code stays free to end a
+// creation without telling us -- which is what it does.
+static void _creation_bar_update(dt_lib_masks_t *d)
+{
+  const dt_masks_form_gui_t *fg = darktable.develop->form_gui;
+
+  // a creation is in flight while form_gui carries either half of it, and only
+  // then. `creation_continuous` deliberately does not count: nothing generic
+  // ever resets it -- not dt_masks_clear_form_gui(), so not a focus change, a
+  // tree click or an image change either -- and reading it as proof of an
+  // armament is how this row would end up naming a module long after the
+  // canvas stopped listening. the two halves take turns instead:
+  //   `creation` alone, target still to be filled in, is where a continuous
+  //   run sits while it chains the next shape; `creation_module` alone is
+  //   where a shape sits between being saved and that chain restarting
+  const gboolean pending = fg && (fg->creation || fg->creation_module);
+
+  // ... and it is ours until someone else names a target, which is what a
+  // module's own blending panel does a moment after taking the focus
+  const gboolean stolen =
+    fg && fg->creation_module && fg->creation_module != d->arm_module;
+
+  if(d->arm_module
+     && (!pending || stolen || !_mask_target_alive(d->arm_module)))
+  {
+    // the creation this panel armed is over, so the run it belonged to is too.
+    // it is ended here because here is where we learn of it: a right-click on
+    // the image ends its own run, but a focus change or a new image simply
+    // drops the form, and the next shape drawn from anywhere would chain
+    if(!pending && fg && fg->creation_continuous_module == d->arm_module)
+      _creation_end_continuous();
+    d->arm_module = NULL;
+  }
+
+  if(d->arm_module)
+  {
+    // the module alone, without the "(2 shapes)" the catalogue adds to pick
+    // between entries: inside a sentence that annotation reads as something
+    // the shape about to be drawn is going to do
+    gchar *name = dt_history_item_get_name(d->arm_module);
+    gchar *text = g_strdup_printf(_("next shape goes to %s"), name);
+    gtk_label_set_text(GTK_LABEL(d->creation_label), text);
+    // the left panel is narrow, the row already carries a button and the
+    // module name is what the sentence ends on: the one word the bar exists
+    // to give is the first one the ellipsis takes
+    gtk_widget_set_tooltip_text(d->creation_label, text);
+    g_free(text);
+    g_free(name);
+  }
+
+  gtk_widget_set_visible(d->creation_bar, d->arm_module != NULL);
+}
+
+// call it off without having to find the image first. these are the calls a
+// right-click on the canvas makes; the disarming itself is left to
+// _creation_bar_update(), which change_form_gui() reaches through the
+// selection proxy, so the bar goes down in one place whatever took it down
+static void _creation_bar_cancel(GtkButton *button, dt_lib_masks_t *d)
+{
+  dt_iop_module_t *module = d->arm_module;
+
+  _creation_end_continuous();
+  if(_mask_target_alive(module))
+  {
+    dt_masks_set_edit_mode(module, DT_MASKS_EDIT_FULL);
+    dt_masks_iop_update(module);
+  }
+  else
+    dt_masks_change_form_gui(NULL);
+
+  dt_control_queue_redraw_center();
+}
+
 // the one creation path of this panel. the icon row, the catalogue and the
 // tree context menu all land here, so none of them can produce a shape with no
 // module behind it and all of them refuse with the same words.
@@ -935,11 +1051,18 @@ static gboolean _start_creation(dt_lib_module_t *self,
   // the new form must be editable
   gui->edit_mode = DT_MASKS_EDIT_FULL;
 
-  if(continuous)
-  {
-    gui->creation_continuous = TRUE;
-    gui->creation_continuous_module = module;
-  }
+  // stated both ways round, unlike the shape buttons of a blending panel: a
+  // run left over from an earlier ctrl+click survives dt_masks_clear_form_gui()
+  // and would turn this plain click into a series nobody asked for
+  gui->creation_continuous = continuous;
+  gui->creation_continuous_module = continuous ? module : NULL;
+
+  // the one place the armament is recorded, and all it records is that this
+  // panel is what armed the canvas: where the shape goes is form_gui's answer
+  // just above, read back by _creation_bar_update()
+  dt_lib_masks_t *d = self->data;
+  d->arm_module = module;
+  _creation_bar_update(d);
 
   _lib_masks_inactivate_icons(self);
   dt_control_queue_redraw_center();
@@ -3477,6 +3600,19 @@ void gui_init(dt_lib_module_t *self)
      _("no module uses them\n"
        "\"delete unused shapes\" removes those no history step refers to either"));
 
+  // the creation bar. it belongs to the panel and not to either resize wrapper:
+  // a row added inside one of them would change what
+  // "plugins/darkroom/masks/heightview" measures, and the list would come back
+  // one row shorter at the next start
+  d->creation_label = dt_ui_label_new("");
+  GtkWidget *cancel = dtgtk_button_new(dtgtk_cairo_paint_cancel, 0, NULL);
+  dt_action_define(DT_ACTION(self), N_("shapes"), N_("cancel creation"),
+                   cancel, &dt_action_def_button);
+  gtk_widget_set_tooltip_text(cancel, _("do not create the shape"));
+  g_signal_connect(G_OBJECT(cancel), "clicked",
+                   G_CALLBACK(_creation_bar_cancel), d);
+  d->creation_bar = dt_gui_hbox(dt_gui_expand(d->creation_label), cancel);
+
   // the masks on top, the shapes they are drawn from below. a row in the top
   // list belongs to a mask -- deleting it detaches it. a row in the library IS
   // the shape. that is the whole point of the split.
@@ -3488,7 +3624,8 @@ void gui_init(dt_lib_module_t *self)
      dt_ui_resize_wrap(d->treeview, 200, "plugins/darkroom/masks/heightview"),
      dt_ui_section_label_new(C_("section", "shape library")),
      dt_ui_resize_wrap(d->library, 120, "plugins/darkroom/masks/heightlibrary"),
-     d->lib_unlinked);
+     d->lib_unlinked,
+     d->creation_bar);
 
   // gui_update decides whether the caption is up. show_all first, then
   // no_show_all and an explicit hide, or a later panel show_all brings it back
@@ -3496,6 +3633,13 @@ void gui_init(dt_lib_module_t *self)
   gtk_widget_show_all(d->lib_unlinked);
   gtk_widget_set_no_show_all(d->lib_unlinked, TRUE);
   gtk_widget_hide(d->lib_unlinked);
+
+  // same for the bar: show_all reaches the label and the cross once, then
+  // no_show_all keeps a later panel-wide show_all from putting the row back
+  // up. hidden, a box child takes no height at all, which is the whole point
+  gtk_widget_show_all(d->creation_bar);
+  gtk_widget_set_no_show_all(d->creation_bar, TRUE);
+  gtk_widget_hide(d->creation_bar);
 
   dt_gui_new_collapsible_section
     (&d->cs,
