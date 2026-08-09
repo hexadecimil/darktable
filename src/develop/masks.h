@@ -660,6 +660,18 @@ void dt_masks_clamp_move_pts(float *pts, const float wd, const float ht);
 void dt_masks_gui_form_test_create(dt_masks_form_t *form,
                                    dt_masks_form_gui_t *gui,
                                    const struct dt_iop_module_t *module);
+/** how the next drawn shape combines with the ones already in its mask, armed
+ *  before anything is drawn. DT_MASKS_STATE_NONE clears it, and any bit
+ *  outside DT_MASKS_STATE_OP is dropped. it outlives the form on purpose: a
+ *  run of three subtractions is one click and not three. the base is never
+ *  affected -- it carries no operator and cannot be given one.
+ *  `module` is the module whose mask it was armed for, and it is honoured for
+ *  that one only: every drawn shape in darktable is saved through the same
+ *  funnel, including shapes drawn from another module's blending panel and the
+ *  clone circles iop/spots.c builds when it converts a legacy edit. */
+void dt_masks_set_next_operator(const dt_masks_state_t op,
+                                struct dt_iop_module_t *module);
+
 void dt_masks_gui_form_save_creation(dt_develop_t *dev,
                                      struct dt_iop_module_t *module,
                                      dt_masks_form_t *form,

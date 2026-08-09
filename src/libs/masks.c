@@ -97,6 +97,28 @@ static const struct
     dtgtk_cairo_paint_masks_exclusion },
 };
 
+// the three the bar arms, in M2's order. states and not indices, so a button
+// resolves through _op_index() into the one table above and back out as the
+// glyph the row will show once the shape is in: three entries here, and
+// nothing at all to keep in step.
+// the word on the button is M2's, and it is not the operator's name: a
+// photographer adds and subtracts, and "union" and "difference" are what the
+// result is called. the technical name is one hover away, from the msgid the
+// row's own menu already uses, so the two vocabularies stay tied together.
+// sum and exclusion are left out on purpose. M2 shows three, they are the
+// three a photographer names, and the two others stay one right-click away on
+// the row itself -- where they always were
+static const struct
+{
+  dt_masks_state_t state;
+  const char *label;  // M2's word for it, on the button
+} _arm_operators[] =
+{
+  { DT_MASKS_STATE_UNION,        N_("add") },
+  { DT_MASKS_STATE_DIFFERENCE,   N_("subtract") },
+  { DT_MASKS_STATE_INTERSECTION, N_("intersect") },
+};
+
 // which operator a point carries, as an index into the table above, -1 for
 // none. index 0 of a group legitimately has none -- group.c reads a missing
 // operator as "overwrite everything applied so far"; anywhere else it is
@@ -274,10 +296,29 @@ typedef struct dt_lib_masks_t
   // canvas and reaches the very same proxy, and only this tells the two apart
   GtkWidget *creation_bar, *creation_label;
   struct dt_iop_module_t *arm_module;
+
+  // the operator bar: M2's contextual row, under both lists and above the
+  // creation bar. it says how the NEXT shape will combine, before it is drawn
+  // -- today that choice is made afterwards, shape by shape, in a menu that
+  // has to be found. arm_op is this panel's copy of what
+  // dt_masks_set_next_operator() holds, so the three buttons can show it;
+  // DT_MASKS_STATE_NONE is disarmed.
+  // arm_updating is the re-entry guard the toggles need: setting a
+  // GtkToggleButton active emits "toggled", and the handler would take a
+  // refresh for a click. same pattern, same reason, as resize_updating above
+  GtkWidget *arm_bar, *arm_label;
+  GtkWidget *bt_arm[G_N_ELEMENTS(_arm_operators)];
+  dt_masks_state_t arm_op;
+  // the module whose mask the armament was chosen for, kept beside it so a
+  // different mask being selected puts the armament down instead of
+  // inheriting it. compared, never dereferenced
+  struct dt_iop_module_t *arm_target;
+  gboolean arm_updating;
 } dt_lib_masks_t;
 
 static void _resize_update(dt_lib_masks_t *d);
 static void _creation_bar_update(dt_lib_masks_t *d);
+static void _arm_bar_update(dt_lib_masks_t *d);
 static void _target_row_update(dt_lib_masks_t *d);
 static void _creation_end_continuous(void);
 
@@ -956,6 +997,11 @@ static void _update_all_properties(dt_lib_masks_t *self)
   // ... and the line above the shape buttons, which says the same thing
   // before anything is armed at all
   _target_row_update(self);
+
+  // ... and the row that says how the next shape will combine once it lands.
+  // after _target_row_update on purpose: it reads the very target that call
+  // has just written down
+  _arm_bar_update(self);
 }
 
 static void _lib_masks_get_values(GtkTreeModel *model,
@@ -1074,6 +1120,38 @@ static gboolean _mask_target_alive(const dt_iop_module_t *m)
   return FALSE;
 }
 
+// the module of the row selected in the masks list, if that module is still in
+// the pipe and can take a drawn mask -- nothing otherwise. this is the one
+// answer that comes from a deliberate gesture: the four rules below it are
+// inferences, and the operator bar needs to tell the two apart.
+//
+// deliberately the masks view and not the active one: TREE_MODULE is only
+// written on rows that belong to a module's mask, and the library is flat and
+// module-less by construction -- reading its selection here would always
+// answer NULL and silently demote rule 1 to rule 2.
+//
+// TREE_MODULE holds a raw pointer and the store outlives the pipe it was built
+// from by one refresh: dt_dev_masks_list_change() only queues the rebuild, and
+// this is read on the way there. checked against dev->iop before it is
+// dereferenced -- the alive test only compares pointers
+static dt_iop_module_t *_mask_selected_target(dt_lib_masks_t *lm)
+{
+  dt_iop_module_t *module = NULL;
+  GtkTreeModel *model = NULL;
+  GList *selected = gtk_tree_selection_get_selected_rows
+    (gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview)), &model);
+  if(selected)
+  {
+    GtkTreeIter iter;
+    if(gtk_tree_model_get_iter(model, &iter, selected->data))
+      _lib_masks_get_values(model, &iter, &module, NULL, NULL);
+    g_list_free_full(selected, (GDestroyNotify)gtk_tree_path_free);
+  }
+
+  return (_mask_target_alive(module) && _mask_target_ok(module))
+    ? module : NULL;
+}
+
 // where a new shape goes when nothing said otherwise, in decreasing order of
 // evidence:
 //   1. the module of the selected row -- this is the rule _tree_add_shape has
@@ -1099,27 +1177,9 @@ static gboolean _mask_target_alive(const dt_iop_module_t *m)
 static dt_iop_module_t *_mask_default_target(dt_lib_module_t *self)
 {
   dt_lib_masks_t *lm = self->data;
-  dt_iop_module_t *module = NULL;
 
-  // deliberately the masks view and not the active one: TREE_MODULE is only
-  // written on rows that belong to a module's mask, and the library is flat and
-  // module-less by construction -- reading its selection here would always
-  // answer NULL and silently demote rule 1 to rule 2
-  GtkTreeModel *model = NULL;
-  GList *selected = gtk_tree_selection_get_selected_rows
-    (gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview)), &model);
-  if(selected)
-  {
-    GtkTreeIter iter;
-    if(gtk_tree_model_get_iter(model, &iter, selected->data))
-      _lib_masks_get_values(model, &iter, &module, NULL, NULL);
-    g_list_free_full(selected, (GDestroyNotify)gtk_tree_path_free);
-  }
-  // TREE_MODULE holds a raw pointer and the store outlives the pipe it was
-  // built from by one refresh: dt_dev_masks_list_change() only queues the
-  // rebuild, and this rule is read on the way there. checked against dev->iop
-  // before it is dereferenced -- the alive test only compares pointers
-  if(_mask_target_alive(module) && _mask_target_ok(module)) return module;
+  dt_iop_module_t *module = _mask_selected_target(lm);
+  if(module) return module;
 
   module = darktable.develop->gui_module;
   if(_mask_target_ok(module)) return module;
@@ -1285,6 +1345,86 @@ static void _target_row_update(dt_lib_masks_t *d)
     gtk_widget_set_tooltip_text(d->target_label,
                                 _("where the next shape goes"));
   }
+}
+
+// the operator bar. it is up exactly where arming means something: a mask is
+// SELECTED, and that mask already holds at least one shape -- so the next one
+// will not be the base, which takes no operator.
+//
+// the selection and not _mask_default_target(): M2 draws this bar only on the
+// panel where a mask is selected, and four of that function's five rules are
+// inferences -- an open module, the last masked one, exposure. under them the
+// bar would be up on a panel where the photographer pointed at nothing, naming
+// a mask they never chose.
+//
+// refreshed from _update_all_properties(), so from all four refresh paths of
+// this panel, the selection change included -- which is the one that matters
+static void _arm_bar_update(dt_lib_masks_t *d)
+{
+  dt_iop_module_t *target = d->treeview ? _mask_selected_target(d) : NULL;
+  const dt_masks_form_t *grp = target
+    ? dt_masks_get_from_id(darktable.develop, target->blend_params->mask_id)
+    : NULL;
+  const gboolean armable =
+    grp && (grp->type & DT_MASKS_GROUP) && grp->points != NULL;
+
+  // the armament belongs to the mask it was chosen for and to no other. it
+  // survives the selection going EMPTY, which is not a change of mind but the
+  // panel's own creation path: _start_creation() takes the darkroom focus, and
+  // dt_masks_reset_form_gui() clears this list before the shape is drawn. it
+  // does not survive another mask taking its place, nor the module it was
+  // armed for leaving the pipe -- a freed module's address can be handed back
+  // to the next one allocated, and the pointer is only ever compared
+  if(d->arm_op != DT_MASKS_STATE_NONE
+     && ((armable && target != d->arm_target)
+         || !_mask_target_alive(d->arm_target)))
+  {
+    d->arm_op = DT_MASKS_STATE_NONE;
+    d->arm_target = NULL;
+    dt_masks_set_next_operator(DT_MASKS_STATE_NONE, NULL);
+  }
+
+  if(armable)
+  {
+    // the mask by its name, which is the name its row shows: M2 reads "in
+    // <the mask>:" and then three ways for the next shape to enter it.
+    // unquoted, where M2 draws quotes: every mask a module owns is already
+    // named `group `exposure'' by _set_group_name_from_module(), so a second
+    // pair would nest on every row that was never renamed by hand
+    gchar *text = g_strdup_printf(C_("mask", "in %s:"), grp->name);
+    gtk_label_set_text(GTK_LABEL(d->arm_label), text);
+    g_free(text);
+  }
+
+  d->arm_updating = TRUE;
+  for(int i = 0; i < (int)G_N_ELEMENTS(_arm_operators); i++)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->bt_arm[i]),
+                                 d->arm_op == _arm_operators[i].state);
+  d->arm_updating = FALSE;
+
+  gtk_widget_set_visible(d->arm_bar, armable);
+}
+
+// one of the three, or the same one again to put it down. M2 draws a cross on
+// the lit button; a toggle disarming on a second click is that cross with one
+// target fewer, and it is what every other toggle of this panel already does
+static void _bt_arm_cb(GtkToggleButton *button, gpointer op)
+{
+  dt_lib_module_t *self = darktable.develop->proxy.masks.module;
+  dt_lib_masks_t *d = self ? self->data : NULL;
+  if(!d || d->arm_updating) return;
+
+  d->arm_op = gtk_toggle_button_get_active(button)
+    ? (dt_masks_state_t)GPOINTER_TO_INT(op)
+    : DT_MASKS_STATE_NONE;
+  // the mask this is being armed for, recorded with it: the funnel that saves
+  // a drawn shape is shared with every other way of drawing one, and only the
+  // pair says which of them this answers for
+  d->arm_target = d->arm_op ? _mask_selected_target(d) : NULL;
+  dt_masks_set_next_operator(d->arm_op, d->arm_target);
+  // the other two go down: one operator is armed at a time, and the bar has to
+  // show which
+  _arm_bar_update(d);
 }
 
 // call it off without having to find the image first. these are the calls a
@@ -4726,6 +4866,36 @@ void gui_init(dt_lib_module_t *self)
   gtk_widget_set_tooltip_text(cancel, _("do not create the shape"));
   g_signal_connect(G_OBJECT(cancel), "clicked",
                    G_CALLBACK(_creation_bar_cancel), d);
+  // the operator bar, above the creation bar and below both lists: one says
+  // how the next shape combines, the other where it goes.
+  // words and not glyphs, which is the one thing this row is for. the glyph is
+  // already on the shape's own line once it is drawn, and there it sits beside
+  // a rank and a name that explain it; here it would be three unlabelled
+  // symbols asking to be learned before anything has been drawn at all. M2
+  // spells them out, and the width is affordable: three labelled buttons ask
+  // for about as much as the six shape buttons of the row above, so the panel
+  // gains no new floor
+  d->arm_label = dt_ui_label_new("");
+  d->arm_bar = dt_gui_hbox(dt_gui_expand(d->arm_label));
+
+  for(int i = 0; i < (int)G_N_ELEMENTS(_arm_operators); i++)
+  {
+    const int op = _op_index(_arm_operators[i].state);
+    GtkWidget *w =
+      gtk_toggle_button_new_with_label(_(_arm_operators[i].label));
+    // the operator's own name, from the msgid the row's context menu already
+    // uses: the word on the button and the word in that menu are two names for
+    // one thing, and this is where they are put side by side
+    gchar *tip = g_strdup_printf(_("%s\nthe next shape combines this way"),
+                                 _(_masks_operators[op].name));
+    gtk_widget_set_tooltip_text(w, tip);
+    g_free(tip);
+    g_signal_connect(G_OBJECT(w), "toggled", G_CALLBACK(_bt_arm_cb),
+                     GINT_TO_POINTER(_arm_operators[i].state));
+    d->bt_arm[i] = w;
+    dt_gui_box_add(d->arm_bar, dt_gui_expand(w));
+  }
+
   d->creation_bar = dt_gui_hbox(dt_gui_expand(d->creation_label), cancel);
 
   // the masks on top, the shapes they are drawn from below. a row in the top
@@ -4761,6 +4931,7 @@ void gui_init(dt_lib_module_t *self)
      d->lib_label,
      d->lib_box,
      d->lib_unlinked,
+     d->arm_bar,
      d->creation_bar);
 
   // gui_update decides whether the caption is up. show_all first, then
@@ -4770,9 +4941,17 @@ void gui_init(dt_lib_module_t *self)
   gtk_widget_set_no_show_all(d->lib_unlinked, TRUE);
   gtk_widget_hide(d->lib_unlinked);
 
-  // same for the bar: show_all reaches the label and the cross once, then
-  // no_show_all keeps a later panel-wide show_all from putting the row back
-  // up. hidden, a box child takes no height at all, which is the whole point
+  // same treatment for the operator bar, and for the same reason: raise the
+  // label and the three toggles once, then no_show_all, or the panel-wide
+  // gtk_widget_show_all() of libs/lib.c decides this instead of
+  // _arm_bar_update. hidden, a box child takes no height at all
+  gtk_widget_show_all(d->arm_bar);
+  gtk_widget_set_no_show_all(d->arm_bar, TRUE);
+  gtk_widget_hide(d->arm_bar);
+
+  // same for the creation bar: show_all reaches the label and the cross once,
+  // then no_show_all keeps a later panel-wide show_all from putting the row
+  // back up
   gtk_widget_show_all(d->creation_bar);
   gtk_widget_set_no_show_all(d->creation_bar, TRUE);
   gtk_widget_hide(d->creation_bar);
@@ -4929,6 +5108,9 @@ void gui_cleanup(dt_lib_module_t *self)
   dt_lib_masks_t *d = self->data;
   if(d && d->resize_timer)
     g_source_remove(d->resize_timer);
+  // the armament outlives the form on purpose; it must not outlive the panel
+  // that is the only way to see it and the only way to put it down
+  dt_masks_set_next_operator(DT_MASKS_STATE_NONE, NULL);
   g_free(self->data);
   self->data = NULL;
 }
