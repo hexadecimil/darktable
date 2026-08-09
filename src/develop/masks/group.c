@@ -679,6 +679,17 @@ static int _group_get_mask_roi(const dt_iop_module_t *const restrict module,
         // first see if we need to invert this shape
         const int inverted = (state & DT_MASKS_STATE_INVERSE);
 
+        // the output buffer is not zeroed by our caller, it is meant to
+        // be fully defined by the first shape we compose: that shape is
+        // expected to carry no combination operator and to take the final
+        // 'else' branch below, which writes every pixel.  that expectation
+        // does not always hold, and every combination operator reads the
+        // destination pixel over the whole roi, so define the buffer here
+        // when the first composed shape does carry an operator.  a nested
+        // group needs nothing, its output buffer is the zeroed 'bufs'.
+        if(nb_ok == 0 && (state & DT_MASKS_STATE_OP))
+          memset(buffer, 0, npixels * sizeof(float));
+
         if(state & DT_MASKS_STATE_UNION)
         {
           _combine_masks_union(buffer, bufs, npixels, op, inverted);
