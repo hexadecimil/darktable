@@ -1501,6 +1501,20 @@ static gboolean _blendop_masks_modes_toggle(GtkToggleButton *button,
   return TRUE;
 }
 
+/* switch a module to drawn masking from outside the blending panel. this is the
+   very call its own shape buttons make (_blendop_masks_add_shape), so the focus,
+   the mask indicator, dt_iop_advertise_rastermask and the history item that
+   enables the module all happen here instead of being reimplemented -- and then
+   forgotten -- by the caller. a no-op, returning FALSE, when a drawn or a raster
+   mask is already on. */
+gboolean dt_iop_gui_enable_drawn_mask(dt_iop_module_t *module)
+{
+  const dt_iop_gui_blend_data_t *bd = module ? module->blend_data : NULL;
+  if(!bd || !bd->masks_support || !bd->masks_inited) return FALSE;
+
+  return _blendop_masks_modes_toggle(NULL, module, DEVELOP_MASK_MASK);
+}
+
 static void _blendop_masks_modes_uni_toggled(GtkGestureSingle *gesture,
                                                  gint n_press,
                                                  gdouble x,

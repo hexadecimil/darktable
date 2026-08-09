@@ -501,6 +501,12 @@ void dt_develop_blendif_rgb_jzczhz_blend(dt_dev_pixelpipe_iop_t *piece,
 /** gui related stuff */
 void dt_iop_gui_init_blending(GtkWidget *iopw, dt_iop_module_t *module);
 void dt_iop_gui_update_blending(dt_iop_module_t *module);
+/** turn drawn masking on for a module, exactly as its own shape buttons do.
+    FALSE means nothing was switched: no mask gui, a raster mask already on --
+    drawn and raster are exclusive -- or a drawn mask already on, which is the
+    common case and not an error. FALSE is therefore never a reason to give up
+    on the module, only a statement that no history item was written. */
+gboolean dt_iop_gui_enable_drawn_mask(dt_iop_module_t *module);
 void dt_iop_gui_update_blendif(dt_iop_module_t *module);
 void dt_iop_gui_update_masks(dt_iop_module_t *module);
 void dt_iop_gui_cleanup_blending(dt_iop_module_t *module);
