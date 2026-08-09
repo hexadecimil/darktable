@@ -840,15 +840,17 @@ static void _lib_masks_get_values(GtkTreeModel *model,
 
    until now a shape created from this panel took its target from whatever row
    happened to be selected, silently, and got NO target at all when nothing was
-   selected -- that is where an orphan shape comes from on this side. the rule
-   does not change; what changes is that it is written down before anything is
-   drawn, and that a creation with no target is refused instead of performed.
+   selected -- that is where an orphan shape comes from on this side. that rule
+   is kept and extended until it always answers; what changes is that the
+   answer is written down before anything is drawn, next to the way to change
+   it, and that a creation with no target is refused instead of performed.
    ------------------------------------------------------------------------- */
 
 // a module whose mask gui is actually there. blend_data is only allocated for
 // a module whose blending gui was built, and masks_support already carries
-// !IOP_FLAGS_NO_MASKS, so this says what the two-flag test at line 1241 says
-// plus the one thing that matters here: blend_data exists. the
+// !IOP_FLAGS_NO_MASKS, so this says what the SUPPORTS_BLENDING && !NO_MASKS
+// pair says elsewhere in this file plus the one thing that matters here:
+// blend_data exists. the
 // continuous-creation tail dereferences creation_module->blend_data with no
 // guard at all (masks/circle.c:363 and its four siblings), so a target without
 // it is a crash on ctrl+creation, not a cosmetic problem.
@@ -905,7 +907,11 @@ static gchar *_mask_target_label(const dt_iop_module_t *m)
   if(m->blend_params->mask_mode & DEVELOP_MASK_RASTER)
     note = _("uses a raster mask");
   else if(!m->enabled)
-    note = _("off");
+    // with a context of its own. the bare "off" msgid is a combobox value
+    // everywhere else in darktable, and the translations written for that are
+    // capitalised and inflected: "exposure (2 shapes, Desactive(e))" is what
+    // this line reads like in french once it borrows one
+    note = C_("module", "off");
 
   gchar *count = (shapes > 0)
     ? g_strdup_printf(ngettext("%d shape", "%d shapes", shapes), shapes)
@@ -939,9 +945,22 @@ static gboolean _mask_target_alive(const dt_iop_module_t *m)
 //      always applied, it was simply never said out loud;
 //   2. the module open in the right panel (dev->gui_module);
 //   3. the last module of the pipe that already carries a drawn mask (dev->iop
-//      is sorted, so the last match is the latest one).
-// NULL when nothing qualifies. the catalogue prints the answer, which is the
-// whole reason three rules can coexist without surprising anyone.
+//      is sorted, so the last match is the latest one);
+//   4. exposure, switched on or not. the first three rules are all empty on an
+//      image that was just opened -- dt_dev_change_image() drops the focus --
+//      and a rule that answers nothing there leaves the one button of this
+//      panel opening on a menu with nothing to click. exposure is the module
+//      every image has, the one darktable already singles out (the histogram
+//      drags it through dev->proxy.exposure), and a drawn mask on it is what
+//      dodging and burning is;
+//   5. failing even that -- exposure carrying a raster mask -- the last module
+//      of the pipe that is switched on and could take the shape. no rule falls
+//      back to a module that is off and unnamed: on a jpeg not one switched-on
+//      module supports blending, which is why rule 4 comes first and does not
+//      ask whether exposure is on.
+// nothing here is decided silently: the menu prints the answer and offers to
+// change it before a shape is drawn. NULL only when no module of this pipe can
+// take a drawn mask at all.
 static dt_iop_module_t *_mask_default_target(dt_lib_module_t *self)
 {
   dt_lib_masks_t *lm = self->data;
@@ -966,14 +985,26 @@ static dt_iop_module_t *_mask_default_target(dt_lib_module_t *self)
   module = darktable.develop->gui_module;
   if(_mask_target_ok(module)) return module;
 
-  dt_iop_module_t *last = NULL;
+  // rules 3 to 5 read the pipe once. `preferred` is the exposure instance
+  // darktable itself works through, so a multi-instance edit answers the same
+  // module here as it does everywhere else; without it the first instance in
+  // pipe order does
+  const dt_iop_module_t *preferred = darktable.develop->proxy.exposure.module;
+  dt_iop_module_t *masked = NULL, *exposure = NULL, *switched_on = NULL;
+
   for(const GList *l = darktable.develop->iop; l; l = g_list_next(l))
   {
     dt_iop_module_t *m = l->data;
-    if(_mask_target_listed(m) && _mask_target_ok(m) && _mask_target_shapes(m) > 0)
-      last = m;
+    if(!_mask_target_listed(m) || !_mask_target_ok(m)) continue;
+
+    if(_mask_target_shapes(m) > 0) masked = m;
+    if(m->enabled) switched_on = m;
+    if(!g_strcmp0(m->op, "exposure") && (!exposure || m == preferred))
+      exposure = m;
   }
-  return last;
+
+  if(masked) return masked;
+  return exposure ? exposure : switched_on;
 }
 
 /* -------------------------------------------------------------------------
@@ -1097,9 +1128,12 @@ static gboolean _start_creation(dt_lib_module_t *self,
   if(!_mask_target_alive(module) || !_mask_target_ok(module))
   {
     // a shape with no module is a shape nothing renders: it lands in the
-    // manager, in no pipe, and stays there until "delete unused shapes" is
-    // found. do not create it
-    dt_control_log(_("no module can take a drawn mask"));
+    // library, in no pipe, and stays there until "delete unused shapes" is
+    // found. do not create it -- and say what to do rather than what failed,
+    // since both halves of the sentence are a way out: a selected mask answers
+    // for its module, an open module answers for itself
+    dt_control_log
+      (_("select a mask or open a module to choose where the shape goes"));
     return FALSE;
   }
 
@@ -1155,13 +1189,21 @@ static void _tree_add_shape(GtkWidget *widget, gpointer shape)
   _start_creation(self, module, GPOINTER_TO_INT(shape), FALSE);
 }
 
-// the shape types, in one table. `label` is what a menu shows -- the strings
-// the context menu already used, no new one for translators. `action` is the
-// id the shortcut path is built from and it is frozen: those paths outlived
-// the icon row that used to carry them, and "add object" is what that row
-// registered, tooltip and menu saying "add AI object" or not. DT_MASKS_OBJECT
-// is the one type that can be unavailable at runtime, and the icon row has
-// always had it while the context menu never did: the catalogue settles it
+// the shape types, in one table, ordered by how much work drawing one is: the
+// two that are a single drag, then the one that is a line, then the two that
+// are placed point by point. an icon row is scanned at a glance and its order
+// hardly matters; a menu is read from the top, and the entry reached for most
+// should not be the last one. this is deliberately not the order of the row a
+// blending panel draws, which no longer costs anything: the icon row this
+// panel used to have is gone, and no two lists sit side by side any more.
+// `label` is what a menu shows -- the strings the context menu already used, no
+// new one for translators. `action` is the id the shortcut path is built from
+// and it is frozen: those paths outlived the icon row that used to carry them,
+// and "add object" is what that row registered, tooltip and menu saying "add AI
+// object" or not -- the order of this table is not part of a path, so it is
+// free to change. DT_MASKS_OBJECT is the one type that can be unavailable at
+// runtime, and the icon row has always had it while the context menu never did:
+// the catalogue settles it
 static const struct
 {
   dt_masks_type_t type;
@@ -1169,11 +1211,11 @@ static const struct
   const char *action;  // the action id -- never rename, never retranslate
 } _new_mask_shapes[] =
 {
-  { DT_MASKS_BRUSH,    N_("add brush"),     N_("add brush")    },
   { DT_MASKS_CIRCLE,   N_("add circle"),    N_("add circle")   },
   { DT_MASKS_ELLIPSE,  N_("add ellipse"),   N_("add ellipse")  },
-  { DT_MASKS_PATH,     N_("add path"),      N_("add path")     },
   { DT_MASKS_GRADIENT, N_("add gradient"),  N_("add gradient") },
+  { DT_MASKS_PATH,     N_("add path"),      N_("add path")     },
+  { DT_MASKS_BRUSH,    N_("add brush"),     N_("add brush")    },
 #ifdef HAVE_AI
   { DT_MASKS_OBJECT,   N_("add AI object"), N_("add object")   },
 #endif
@@ -1202,8 +1244,15 @@ static void _add_shape_action(dt_action_t *action)
   {
     if(!g_strcmp0(action->id, _new_mask_shapes[i].action))
     {
-      _start_creation(self, _mask_default_target(self),
-                      _new_mask_shapes[i].type, FALSE);
+      // a key has no menu to fall back on, so it takes the same target the
+      // menu would have opened on, and says the same thing as the menu in the
+      // one case that has none, instead of drawing nothing in silence
+      dt_iop_module_t *target = _mask_default_target(self);
+      if(target)
+        _start_creation(self, target, _new_mask_shapes[i].type, FALSE);
+      else
+        dt_control_log
+          (_("select a mask or open a module to choose where the shape goes"));
       return;
     }
   }
@@ -1215,6 +1264,11 @@ static void _add_shape_action(dt_action_t *action)
 // context menu
 static void _new_mask_shape_items(GtkMenuShell *menu, dt_iop_module_t *target)
 {
+  // a shape list without a target is a list of dead ends, so there is no such
+  // list: every caller resolves one first. what is left below is written per
+  // entry because it really is per entry -- one model that is not installed
+  if(!target) return;
+
   for(int i = 0; i < (int)G_N_ELEMENTS(_new_mask_shapes); i++)
   {
     const gchar *reason = NULL;
@@ -1223,7 +1277,6 @@ static void _new_mask_shape_items(GtkMenuShell *menu, dt_iop_module_t *target)
     if(_new_mask_shapes[i].type == DT_MASKS_OBJECT && !dt_masks_object_available())
       reason = _("AI model not available");
 #endif
-    if(!target) reason = _("no module to attach it to");
 
     // gtk3 delivers no event, hence no tooltip, to an insensitive widget:
     // whatever an entry cannot do has to be readable in the entry itself
@@ -1242,54 +1295,39 @@ static void _new_mask_shape_items(GtkMenuShell *menu, dt_iop_module_t *target)
   }
 }
 
-// the target, spelled out and not clickable. the manager, unlike a blending
-// panel, has no module of its own: where the shape is about to land has to be
-// said before it is drawn. that single line is what makes a shape attached to
-// nothing impossible to create by accident
-static void _new_mask_target_header(GtkMenuShell *menu, const dt_iop_module_t *target)
-{
-  gchar *name = target
-    ? _mask_target_label(target)
-    : g_strdup(_("none"));
-  gchar *header = g_strdup_printf(_("target: %s"), name);
-
-  GtkWidget *item = gtk_menu_item_new_with_label(header);
-  gtk_widget_set_sensitive(item, FALSE);
-  gtk_menu_shell_append(menu, item);
-
-  g_free(header);
-  g_free(name);
-  gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-}
-
-// every other module that could take the shape, each with the same list of
-// types one level down: picking there picks the target AND the shape in one
-// gesture, so no target has to be remembered between two openings of the menu.
-// dev->iop is sorted by iop_order, so two passes give the modules that already
-// carry a drawn mask first -- that is where a second shape usually goes -- then
-// the rest, each pass in pipe order, so the list reads like the module list on
-// the right
+// every module that could take the shape, each with the same list of types one
+// level down: picking there picks the target AND the shape in one gesture, so
+// no target has to be remembered between two openings of the menu. `current`
+// is the module to leave out: it is the one already named on the line this
+// list hangs from
 static gboolean _new_mask_other_modules(GtkMenuShell *menu,
                                         const dt_iop_module_t *current)
 {
-  gboolean any = FALSE, any_masked = FALSE, separated = FALSE;
+  gboolean any = FALSE;
+  int last_rank = -1;
 
-  for(int pass = 0; pass < 2; pass++)
+  // three ranks: the modules that already carry a drawn mask -- where a second
+  // shape usually goes -- then the ones this edit has switched on, then the
+  // rest, which is most of them. inside a rank the walk is backwards, because
+  // dev->iop is sorted by iop_order and the right panel is stacked from its
+  // end (views/darkroom.c walks g_list_last() to g_list_previous()): read this
+  // way the list is in the order the modules are on screen, and not upside
+  // down from it
+  for(int rank = 0; rank < 3; rank++)
   {
-    for(const GList *l = darktable.develop->iop; l; l = g_list_next(l))
+    for(const GList *l = g_list_last(darktable.develop->iop);
+        l;
+        l = g_list_previous(l))
     {
       dt_iop_module_t *m = l->data;
       if(m == current || !_mask_target_listed(m)) continue;
 
-      const gboolean masked = _mask_target_shapes(m) > 0;
-      if(masked != (pass == 0)) continue;
+      const int r = (_mask_target_shapes(m) > 0) ? 0 : (m->enabled ? 1 : 2);
+      if(r != rank) continue;
 
-      if(masked) any_masked = TRUE;
-      else if(any_masked && !separated)
-      {
+      if(last_rank >= 0 && r != last_rank)
         gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-        separated = TRUE;
-      }
+      last_rank = r;
 
       gchar *label = _mask_target_label(m);
       GtkWidget *item = gtk_menu_item_new_with_label(label);
@@ -1314,6 +1352,44 @@ static gboolean _new_mask_other_modules(GtkMenuShell *menu,
   return any;
 }
 
+// the line the menu opens on: where the shape is about to land, and the way to
+// send it elsewhere. the manager, unlike a blending panel, has no module of
+// its own, so this is the only place that can say it -- and it says it before
+// anything is drawn rather than after.
+//
+// "apply to" and not "target": everywhere else in darktable a target is a
+// value to reach (target black luminance, target gamma, target color), never a
+// destination. one line for both jobs and not two, because naming the module
+// and changing it are the same question asked twice
+static void _new_mask_target_header(GtkMenuShell *menu,
+                                    const dt_iop_module_t *target)
+{
+  gchar *name = _mask_target_label(target);
+  gchar *header = g_strdup_printf(_("apply to: %s"), name);
+  g_free(name);
+
+  GtkWidget *item = gtk_menu_item_new_with_label(header);
+  g_free(header);
+
+  GtkWidget *others = gtk_menu_new();
+  if(_new_mask_other_modules(GTK_MENU_SHELL(others), target))
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), others);
+  else
+  {
+    // nothing else in this pipe is even worth listing, so the line states the
+    // target and stops there. no item ever took this submenu and nothing ever
+    // sank its floating reference: gtk_widget_destroy() only runs dispose,
+    // which would leave the object alive at one reference, so sink it first,
+    // as dt_gui_menu_popup does with the menu it is handed
+    g_object_ref_sink(others);
+    g_object_unref(others);
+    gtk_widget_set_sensitive(item, FALSE);
+  }
+
+  gtk_menu_shell_append(menu, item);
+  gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+}
+
 // built at click, never in gui_update: _forms_structure_hash() mixes
 // dev->gui_module in but gui_update only runs on dt_dev_masks_list_change, so a
 // menu built there would show a stale target after a mere change of focus
@@ -1321,28 +1397,26 @@ static void _new_mask_clicked(GtkButton *button, dt_lib_module_t *self)
 {
   dt_iop_module_t *target = _mask_default_target(self);
 
+  // this is the only button the panel has, and a menu with nothing to click is
+  // what it must never open on. _mask_default_target() answers for any pipe
+  // holding a module that can take a drawn mask, so getting here means this
+  // one holds none: say it once and open nothing, the way darkroom.c and
+  // export.c refuse a style list with no style in it
+  if(!target)
+  {
+    dt_control_log
+      (_("select a mask or open a module to choose where the shape goes"));
+    return;
+  }
+
   GtkMenuShell *menu = GTK_MENU_SHELL(gtk_menu_new());
 
+  // where it lands, then what to draw. the shapes are at the top level and
+  // clickable the moment the menu opens -- on an image just opened as on any
+  // other -- and the line above them is both the answer to "where?" and the
+  // way to change it
   _new_mask_target_header(menu, target);
   _new_mask_shape_items(menu, target);
-
-  GtkWidget *others = gtk_menu_new();
-  if(_new_mask_other_modules(GTK_MENU_SHELL(others), target))
-  {
-    gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-    GtkWidget *item = gtk_menu_item_new_with_label(_("on another module"));
-    gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), others);
-    gtk_menu_shell_append(menu, item);
-  }
-  else
-  {
-    // no other module qualifies, so no menu item ever took this submenu and
-    // nothing ever sank its floating reference. gtk_widget_destroy() only runs
-    // dispose, which would leave the object alive at one reference: sink it
-    // first, exactly as dt_gui_menu_popup does with the menu it is handed
-    g_object_ref_sink(others);
-    g_object_unref(others);
-  }
 
   // dt_gui_menu_popup takes the floating ref and drops it on "deactivate"
   dt_gui_menu_popup(GTK_MENU(menu), GTK_WIDGET(button),
@@ -2280,12 +2354,16 @@ static void _tree_context_menu(dt_lib_module_t *self,
     // answers nothing, so the target is resolved and then written down,
     // exactly as the catalogue does it
     dt_iop_module_t *ctx = _mask_target_ok(sel_module) ? sel_module : NULL;
-    if(!ctx)
+    if(ctx)
+      _new_mask_shape_items(menu, ctx);
+    else if((ctx = _mask_default_target(self)))
     {
-      ctx = _mask_default_target(self);
+      // same two lines as the button, in the same order. no target at all
+      // leaves the shapes out, which is harmless here and would not be in the
+      // button: this menu has items of its own below
       _new_mask_target_header(menu, ctx);
+      _new_mask_shape_items(menu, ctx);
     }
-    _new_mask_shape_items(menu, ctx);
   }
 
   if(grp && grp->type & DT_MASKS_GROUP)
