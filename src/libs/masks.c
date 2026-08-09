@@ -66,6 +66,50 @@ static dt_masks_shape_scope_t _shape_scope(const dt_mask_id_t formid,
                                            char *groups,
                                            const size_t groups_length);
 
+// the five composition operators, in the order they have always been listed
+// in. ONE table: the context menu entries, the glyph a row shows, the pixbuf
+// rasterised at start-up and the operator a click sets all read it -- four
+// parallel lists before this, and four places to forget.
+// the labels are the menu's own strings, unchanged: building the entries from
+// a shorter word and a "mode: " prefix would be a new msgid, and the context
+// menu would fall back to English in every locale until the translators catch
+// up.
+// the order is also the order the state bits used to be tested in, so a point
+// that somehow carries two of them resolves to the same operator it always did
+static const struct
+{
+  dt_masks_state_t state;
+  const char *label;              // the context menu entry
+  const char *name;               // the operator alone, for the cell tooltip
+  DTGTKCairoPaintIconFunc paint;  // the glyph drawn on the row
+} _masks_operators[] =
+{
+  { DT_MASKS_STATE_UNION,        N_("mode: union"),        N_("union"),
+    dtgtk_cairo_paint_masks_union },
+  { DT_MASKS_STATE_INTERSECTION, N_("mode: intersection"), N_("intersection"),
+    dtgtk_cairo_paint_masks_intersection },
+  { DT_MASKS_STATE_DIFFERENCE,   N_("mode: difference"),   N_("difference"),
+    dtgtk_cairo_paint_masks_difference },
+  { DT_MASKS_STATE_SUM,          N_("mode: sum"),          N_("sum"),
+    dtgtk_cairo_paint_masks_sum },
+  { DT_MASKS_STATE_EXCLUSION,    N_("mode: exclusion"),    N_("exclusion"),
+    dtgtk_cairo_paint_masks_exclusion },
+};
+
+// which operator a point carries, as an index into the table above, -1 for
+// none. index 0 of a group legitimately has none -- group.c reads a missing
+// operator as "overwrite everything applied so far"; anywhere else it is
+// stale data no current code path creates.
+// >= 0 is exactly `state & DT_MASKS_STATE_OP`, that constant being the OR of
+// the five states listed above and nothing else -- but it is the table, and
+// not the constant, that the rest of this file may then index with
+static int _op_index(const dt_masks_state_t state)
+{
+  for(int i = 0; i < (int)G_N_ELEMENTS(_masks_operators); i++)
+    if(state & _masks_operators[i].state) return i;
+  return -1;
+}
+
 typedef struct dt_lib_masks_t
 {
   /* vbox with managed history items */
@@ -88,6 +132,16 @@ typedef struct dt_lib_masks_t
   // editor on the row the photographer pointed at
   GtkTreeViewColumn *lib_col;
   GtkCellRenderer *lib_name_cell;
+  // the masks zone's operator column, and the whole of the click target: a
+  // click is "on the operator" when GTK hands back THIS column, never when a
+  // pixel offset falls inside a range. one field for both lists, and it only
+  // ever names a column of the masks zone: the library builds none, so a
+  // hit-test run there hands back one of ITS columns and cannot match -- which
+  // is what makes one pointer comparison enough to tell the two views apart.
+  // written under if(!library) in _build_masks_view: written unconditionally
+  // the second call would leave the library's column here, and the gesture
+  // would be dead in one list and live in the other
+  GtkTreeViewColumn *op_col;
   // caption under the library, shown only when at least one shape is not
   // linked to a module: it names exactly the set the cleanup is about
   GtkWidget *lib_unlinked;
@@ -105,8 +159,10 @@ typedef struct dt_lib_masks_t
   guint resize_timer;       // debounce source id (0 = none)
   gboolean resize_updating; // guard: programmatic slider change, don't commit
 
-  GdkPixbuf *ic_inverse, *ic_union, *ic_intersection;
-  GdkPixbuf *ic_difference, *ic_sum, *ic_exclusion, *ic_used;
+  GdkPixbuf *ic_inverse, *ic_used;
+  // the operator glyphs, indexed by _masks_operators: same table, same order,
+  // so a sixth operator is one line there and nothing at all here
+  GdkPixbuf *ic_op[G_N_ELEMENTS(_masks_operators)];
 
   // a selection requested (e.g. right after creating a shape) before the tree
   // had the matching row: re-applied once gui_update rebuilds the tree. 0 = none.
@@ -1333,19 +1389,30 @@ static void _tree_group(GtkButton *button, dt_lib_module_t *self)
   // dt_masks_change_form_gui(grp);
 }
 
-// where a shape sits in the application order of its group. index 0 is the
-// base: it lays the buffer down, and it is the only member allowed to carry
-// no operator -- group.c reads a missing operator as "overwrite everything
-// applied so far" (final `else` of _group_get_mask).
-// returns -1 when the group or the shape is unknown.
+// the group member for `formid`, and where it sits in the application order.
+// NULL when the group is unknown, is not a group, or does not hold that shape.
+//
+// index 0 is the base: it lays the buffer down, and it is the only member
+// allowed to carry no operator -- group.c reads a missing operator as
+// "overwrite everything applied so far" (final `else` of _group_get_mask_roi,
+// which is also the branch that initialises a buffer nothing else zeroes).
 //
 // everything that used to be decided from a row's position on screen is
-// decided here instead: the tree is a projection of this list, and after
-// this commit that projection is no longer a mirror.
-static int _group_point_index(const dt_masks_form_t *grp,
-                              const dt_mask_id_t formid)
+// decided here instead: the tree is a projection of this list, and since the
+// rank commit that projection is no longer a mirror. one walker, so the rank
+// printed on a row, the glyph drawn next to it and the cell that reacts to a
+// click can never be computed three slightly different ways.
+//
+// const on the way out as well as on the way in: _tree_operation() is the one
+// place a member's state changes, and it walks grp->points for itself, behind
+// the check that keeps an operator off the base.
+static const dt_masks_point_group_t *
+_group_point_get(const dt_masks_form_t *grp,
+                 const dt_mask_id_t formid,
+                 int *index)
 {
-  if(!grp || !(grp->type & DT_MASKS_GROUP)) return -1;
+  if(index) *index = -1;
+  if(!grp || !(grp->type & DT_MASKS_GROUP)) return NULL;
 
   int pos = 0;
   for(const GList *pts = grp->points; pts; pts = g_list_next(pts))
@@ -1354,10 +1421,24 @@ static int _group_point_index(const dt_masks_form_t *grp,
     // we stop at the first match, exactly like dt_masks_form_move() and
     // _tree_operation, so display and reordering always agree on which
     // occurrence they mean
-    if(pt->formid == formid) return pos;
+    if(pt->formid == formid)
+    {
+      if(index) *index = pos;
+      return pt;
+    }
     pos++;
   }
-  return -1;
+  return NULL;
+}
+
+// where a shape sits in the application order of its group, -1 when the group
+// or the shape is unknown. see _group_point_get above for the contract.
+static int _group_point_index(const dt_masks_form_t *grp,
+                              const dt_mask_id_t formid)
+{
+  int pos = -1;
+  _group_point_get(grp, formid, &pos);
+  return pos;
 }
 
 // formid of the shape at `index` in the application order, INVALID_MASKID
@@ -1374,13 +1455,18 @@ static dt_mask_id_t _group_point_id(const dt_masks_form_t *grp,
 }
 
 // DT_MASKS_STATE_SHOW is not "this shape is the base": dt_masks_group_add_form
-// sets it on every point it creates. it is read in exactly two places, both in
-// this file (the operator-icon lookups), and means "draw the operator glyph".
-// the base must not draw one, so when a move or a deletion changes which shape
-// sits at index 0 we hand that flag over: the incoming base drops SHOW, the
-// outgoing one gets it back plus a UNION if it had no operator at all --
-// without which group.c would treat it as a fresh buffer and silently drop
-// every shape applied before it.
+// sets it on every point it creates and _tree_group() on none of them. it has
+// no reader left -- what a row draws is decided from the application rank now,
+// which is the rule group.c actually enforces. the handover below is kept for
+// the one thing in it that changes what a mask renders: the outgoing base gets
+// a UNION if it had no operator at all, without which group.c would treat it
+// as a fresh buffer and silently drop every shape applied before it.
+//
+// the bit itself is still handed over, on purpose: dt_masks_point_group_t goes
+// into the XMP as a raw blob (common/exif.cc), so every stored edit carries it
+// and a darktable predating this commit reads it back and still draws its
+// operator glyph from it. keeping it in step costs two lines here and stops a
+// round trip through such a version from putting a glyph on the base.
 //
 // pass INVALID_MASKID as old_base_id when the outgoing base is on its way out
 // (a deletion): there is nothing to hand back to.
@@ -1400,7 +1486,8 @@ static void _handover_base_state(dt_masks_form_t *grp,
       pt->state &= ~DT_MASKS_STATE_SHOW;
     else if(pt->formid == old_base_id)
     {
-      // ensure an operator is defined, as we are going to show one
+      // this shape is not at index 0 any more, and group.c reads a missing
+      // operator as "overwrite everything applied so far": it must have one
       if((pt->state & DT_MASKS_STATE_OP) == DT_MASKS_STATE_NONE)
         pt->state |= DT_MASKS_STATE_UNION;
       pt->state |= DT_MASKS_STATE_SHOW;
@@ -1447,12 +1534,13 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   dt_mask_id_t id = INVALID_MASKID;
   _lib_masks_get_values(model, iter, &module, &grid, &id);
 
+  int rank = -1;
   char num[8] = "";
   const char *base = "";
 
   if(dt_is_valid_maskid(grid))
   {
-    const int rank =
+    rank =
       _group_point_index(dt_masks_get_from_id(darktable.develop, grid), id);
 
     if(rank >= 0)
@@ -1478,22 +1566,21 @@ static void _set_iter_name(dt_lib_masks_t *lm,
      && _shape_scope(form->formid, NULL, 0) != DT_MASKS_SCOPE_MODULE)
     link = _("no module");
 
-  const gboolean show = state & DT_MASKS_STATE_SHOW;
+  // the glyph is drawn exactly where the shape HAS an operator: inside a
+  // group, past the base, with an operator bit set. that is the very test
+  // _tree_operation() enforces, so what is shown is what can be changed.
+  // _op_cell_at_bin() is stricter by one condition, depth 2 -- because the
+  // context menu is -- so a shape inside a group nested in a group shows its
+  // operator and neither gesture offers to change it. it is shown all the
+  // same: group.c honours that operator whatever the nesting, and a row that
+  // hid it would be the one row lying about what it renders.
+  // it used to be DT_MASKS_STATE_SHOW, which is not that predicate:
+  // _tree_group() never sets it, so every group built with "group the forms"
+  // drew no operator at all although group.c was honouring one
+  const int op = (rank > 0) ? _op_index(state) : -1;
+  GdkPixbuf *icop = (op >= 0) ? lm->ic_op[op] : NULL;
 
-  GdkPixbuf *icop = NULL;
   GdkPixbuf *icinv = NULL;
-
-  if(state & DT_MASKS_STATE_UNION)
-    icop = lm->ic_union;
-  else if(state & DT_MASKS_STATE_INTERSECTION)
-    icop = lm->ic_intersection;
-  else if(state & DT_MASKS_STATE_DIFFERENCE)
-    icop = lm->ic_difference;
-  else if(state & DT_MASKS_STATE_SUM)
-    icop = lm->ic_sum;
-  else if(state & DT_MASKS_STATE_EXCLUSION)
-    icop = lm->ic_exclusion;
-
   if(state & DT_MASKS_STATE_INVERSE)
     icinv = lm->ic_inverse;
 
@@ -1503,7 +1590,7 @@ static void _set_iter_name(dt_lib_masks_t *lm,
                      TREE_BASE, base,
                      TREE_LINK, link,
                      TREE_IC_OP, icop,
-                     TREE_IC_OP_VISIBLE, (icop != NULL) && show,
+                     TREE_IC_OP_VISIBLE, (icop != NULL),
                      TREE_IC_INVERSE, icinv,
                      TREE_IC_INVERSE_VISIBLE, (icinv != NULL),
                      -1);
@@ -1598,6 +1685,23 @@ static void _add_tree_operation(GtkMenuShell *menu,
   g_signal_connect(item, "activate", G_CALLBACK(_tree_operation),
                     GINT_TO_POINTER(state));
   gtk_menu_shell_append(menu, item);
+}
+
+// the five operator entries, shared verbatim by the context menu and by the
+// operator column of a row: same table, same order, same labels, same rule
+// about the base. inversion is NOT one of them -- DT_MASKS_STATE_OP is the OR
+// of these five and nothing else, and the inverse glyph is a different cell.
+// _tree_operation() reads the view's selection itself, so these items take no
+// row argument: the caller's only duty is to have selected the right row
+// before the menu is shown.
+static void _add_tree_operations(GtkMenuShell *menu,
+                                 const dt_masks_state_t selected_states,
+                                 const gboolean is_base_row)
+{
+  for(int i = 0; i < (int)G_N_ELEMENTS(_masks_operators); i++)
+    _add_tree_operation(menu, _(_masks_operators[i].label),
+                        _masks_operators[i].state, selected_states,
+                        !is_base_row);
 }
 
 // reordering is a per-shape operation. the old code looped over the whole
@@ -2323,16 +2427,7 @@ static void _tree_context_menu(dt_lib_module_t *self,
                         DT_MASKS_STATE_INVERSE, selected_states, TRUE);
 
     gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-    _add_tree_operation(menu, _("mode: union"),
-                        DT_MASKS_STATE_UNION, selected_states, !is_base_row);
-    _add_tree_operation(menu, _("mode: intersection"),
-                        DT_MASKS_STATE_INTERSECTION, selected_states, !is_base_row);
-    _add_tree_operation(menu, _("mode: difference"),
-                        DT_MASKS_STATE_DIFFERENCE, selected_states, !is_base_row);
-    _add_tree_operation(menu, _("mode: sum"),
-                        DT_MASKS_STATE_SUM, selected_states, !is_base_row);
-    _add_tree_operation(menu, _("mode: exclusion"),
-                        DT_MASKS_STATE_EXCLUSION, selected_states, !is_base_row);
+    _add_tree_operations(menu, selected_states, is_base_row);
 
     gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
     // this is time, not space: the list is the order the shapes are applied
@@ -2360,6 +2455,130 @@ static void _tree_context_menu(dt_lib_module_t *self,
   gdk_event_free(event);
 }
 
+// what the operator column has to say at a point, if anything
+typedef enum dt_masks_op_hit_t
+{
+  DT_MASKS_OP_HIT_NONE = 0,  // not the operator column, or nothing to say
+  DT_MASKS_OP_HIT_BASE,      // the base: says why it has none, not clickable
+  DT_MASKS_OP_HIT_OPERATOR   // an operator a click may change
+} dt_masks_op_hit_t;
+
+// what sits under bin-window coords (bx,by) in `view`. the whole hit-test is
+// the column comparison below: GTK hands us the column under the pointer and
+// we compare it with the one we built. no pixel offset is computed anywhere --
+// gui/preferences_ai.c runs the same test on the same GTK version, and reads a
+// model column back the same way to decide whether the cell is live.
+// `view` is a parameter and not lm->treeview: both lists share this file's
+// handlers, and hit-testing one list against the other's rows and scroll
+// offset is the kind of thing that only misbehaves once there is content.
+// op_col only ever names a column of the masks zone, so hit-testing the
+// library hands back one of its own columns and never matches.
+//
+// a row qualifies only where the context menu offers the five "mode:" entries
+// AND offers them enabled: depth 2 (the menu's `from_group && depth < 3`), not
+// the shape at index 0, and carrying an operator bit -- which is exactly what
+// _tree_operation() will accept. clicking anywhere else in the column stays a
+// plain selection, because a menu whose every entry does nothing is worse than
+// no menu at all.
+// the depth-2 test is also what keeps us off the expander: _build_masks_view
+// puts the expander on the name column for that reason, see the note there.
+// the operator test is spelled _op_index() >= 0 and not the DT_MASKS_STATE_OP
+// mask _tree_operation() uses. same predicate today, the constant being the OR
+// of the five table entries -- but this way the caller of *state_out is holding
+// a state the table is known to answer for, rather than one a sixth operator
+// added to the enum alone would leave it unable to index.
+static dt_masks_op_hit_t _op_cell_at_bin(dt_lib_masks_t *lm,
+                                         GtkWidget *view,
+                                         const gint bx,
+                                         const gint by,
+                                         dt_masks_state_t *state_out)
+{
+  if(!lm->op_col) return DT_MASKS_OP_HIT_NONE;
+
+  GtkTreeView *tv = GTK_TREE_VIEW(view);
+  GtkTreeModel *model = gtk_tree_view_get_model(tv);
+  GtkTreePath *path = NULL;
+  GtkTreeViewColumn *column = NULL;
+  dt_masks_op_hit_t hit = DT_MASKS_OP_HIT_NONE;
+
+  if(model
+     && gtk_tree_view_get_path_at_pos(tv, bx, by, &path, &column, NULL, NULL)
+     && column == lm->op_col
+     && gtk_tree_path_get_depth(path) == 2)
+  {
+    GtkTreeIter iter;
+    if(gtk_tree_model_get_iter(model, &iter, path))
+    {
+      dt_mask_id_t grid = INVALID_MASKID;
+      dt_mask_id_t id = INVALID_MASKID;
+      _lib_masks_get_values(model, &iter, NULL, &grid, &id);
+
+      // read from grp->points, never from the row's position: the same walk,
+      // the same function, as the rank and the "base" marker on screen. a row
+      // whose group no longer holds its shape yields NULL and the click stays
+      // a plain selection
+      int rank = -1;
+      const dt_masks_point_group_t *pt =
+        _group_point_get(dt_masks_get_from_id(darktable.develop, grid),
+                         id, &rank);
+
+      if(rank == 0)
+        hit = DT_MASKS_OP_HIT_BASE;
+      else if(pt && rank > 0 && _op_index(pt->state) >= 0)
+      {
+        if(state_out) *state_out = pt->state;
+        hit = DT_MASKS_OP_HIT_OPERATOR;
+      }
+    }
+  }
+
+  if(path) gtk_tree_path_free(path);
+  return hit;
+}
+
+// exactly the zone the click reacts to, and back to NULL as soon as we leave
+// it -- a cursor set on the bin window and never reset stays a hand over the
+// whole panel. the base gets no hand: nothing there opens
+static void _tree_motion_cb(GtkEventControllerMotion *controller,
+                            double x,
+                            double y,
+                            dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
+  GtkWidget *view = dt_gui_get_widget(controller);
+  GdkWindow *bin = gtk_tree_view_get_bin_window(GTK_TREE_VIEW(view));
+  if(!bin) return;
+
+  gint bx, by;
+  gtk_tree_view_convert_widget_to_bin_window_coords(GTK_TREE_VIEW(view),
+                                                    (gint)x, (gint)y, &bx, &by);
+
+  // this runs on every motion event over the list, so touch the window only
+  // when the answer changes. nothing else puts a cursor on it, so its current
+  // cursor is a faithful record of what we last decided
+  const gboolean over =
+    _op_cell_at_bin(lm, view, bx, by, NULL) == DT_MASKS_OP_HIT_OPERATOR;
+  if(over == (gdk_window_get_cursor(bin) != NULL)) return;
+
+  if(over)
+  {
+    GdkCursor *cursor =
+      gdk_cursor_new_from_name(gdk_window_get_display(bin), "pointer");
+    gdk_window_set_cursor(bin, cursor);
+    if(cursor) g_object_unref(cursor);
+  }
+  else
+    gdk_window_set_cursor(bin, NULL);
+}
+
+static void _tree_leave_cb(GtkEventControllerMotion *controller,
+                           dt_lib_module_t *self)
+{
+  GtkWidget *view = dt_gui_get_widget(controller);
+  GdkWindow *bin = gtk_tree_view_get_bin_window(GTK_TREE_VIEW(view));
+  if(bin) gdk_window_set_cursor(bin, NULL);
+}
+
 // what the click hit, and with which button -- nothing else. the right button
 // hands over to _tree_context_menu() above; everything that used to be built
 // here is there now
@@ -2381,12 +2600,25 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
     gtk_tree_view_get_selection(GTK_TREE_VIEW(treeview));
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(treeview));
 
+  // gesture coordinates are relative to the widget allocation, while
+  // gtk_tree_view_get_path_at_pos() wants bin-window ones. the two happen to
+  // coincide here -- headers hidden, and dt_ui_resize_wrap sets the horizontal
+  // policy to GTK_POLICY_NEVER so the view never scrolls sideways -- which is
+  // why passing x/y straight through got away with it. a COLUMN hit-test
+  // depends on the horizontal offset being right, so convert once and use the
+  // result everywhere, as libs/collect.c, libs/geotagging.c and
+  // gui/preferences_ai.c already do
+  gint bin_x, bin_y;
+  gtk_tree_view_convert_widget_to_bin_window_coords(GTK_TREE_VIEW(treeview),
+                                                    (gint)x, (gint)y,
+                                                    &bin_x, &bin_y);
+
   GtkTreePath *mouse_path = NULL;
   GtkTreeIter iter;
   dt_iop_module_t *module = NULL;
   gboolean on_row = FALSE;
   if(gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(treeview),
-                                   (gint)x, (gint)y, &mouse_path, NULL,
+                                   bin_x, bin_y, &mouse_path, NULL,
                                    NULL, NULL))
   {
     on_row = TRUE;
@@ -2401,8 +2633,58 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
   const guint button = gtk_gesture_single_get_current_button(gesture);
   if(button == GDK_BUTTON_PRIMARY)
   {
+    // dt_gui_current_state() and not gtk_get_current_event_state(): a press
+    // emitted by a shortcut carries no current event, which leaves that call
+    // writing nothing at all into its out parameter. the helper hands back the
+    // effect's own modifiers there, and "no modifier" is the one answer we
+    // must not get wrong -- it is what decides whether a menu opens
+    const GdkModifierType mods = dt_gui_current_state(gesture);
+    dt_masks_state_t op_state = DT_MASKS_STATE_NONE;
+
+    // a plain left click on the operator column of a shape that carries one
+    // opens the five modes right where the glyph is. a modified click still
+    // belongs to the selection -- ctrl and shift build a multiple one, and it
+    // would be unbuildable if this vertical strip swallowed those clicks. the
+    // "pressed" signal fires once per press, so without n_press a double click
+    // would pop the menu twice.
+    // note what we do NOT do: dt_gui_claim(gesture). this handler has never
+    // claimed the sequence and must not start: claiming cancels the
+    // treeview's own gesture, and with it selection, the rename double click
+    // and the expanders
+    if(n_press == 1
+       && mouse_path
+       && dt_modifier_is(mods, 0)
+       && _op_cell_at_bin(lm, treeview, bin_x, bin_y, &op_state)
+          == DT_MASKS_OP_HIT_OPERATOR)
+    {
+      // _tree_operation() acts on the view's selection and not on a row handed
+      // to it, so the selection has to BE the clicked row before the menu can
+      // open. we do it here rather than trust the treeview's own gesture: GTK
+      // defers collapsing a multiple selection onto the clicked row until the
+      // button is released, and the menu's grab swallows that release
+      if(gtk_tree_selection_count_selected_rows(selection) != 1
+         || !gtk_tree_selection_path_is_selected(selection, mouse_path))
+      {
+        gtk_tree_selection_unselect_all(selection);
+        gtk_tree_selection_select_path(selection, mouse_path);
+      }
+
+      // the pointer is about to be grabbed by the menu and GTK3 does not
+      // reliably deliver a leave event for a grab crossing: drop the hand now
+      // rather than leave it hanging over the panel until the menu closes
+      GdkWindow *bin = gtk_tree_view_get_bin_window(GTK_TREE_VIEW(treeview));
+      if(bin) gdk_window_set_cursor(bin, NULL);
+
+      // the very entries of the context menu, from the very table: one row,
+      // never the base, so all five are enabled and the one in force is ticked
+      GtkMenuShell *menu = GTK_MENU_SHELL(gtk_menu_new());
+      _add_tree_operations(menu, op_state, FALSE);
+      // dt_gui_menu_popup takes the floating ref and drops it on "deactivate",
+      // and pops at the pointer when handed no widget
+      dt_gui_menu_popup(GTK_MENU(menu), NULL, 0, 0);
+    }
     // if click on a blank space, then deselect all
-    if(!on_row)
+    else if(!on_row)
     {
       gtk_tree_selection_unselect_all(selection);
     }
@@ -2481,6 +2763,48 @@ static gboolean _tree_query_tooltip(GtkWidget *widget,
   if(!gtk_tree_view_get_tooltip_context(tree_view, &x, &y,
                                         keyboard_tip, &model, &path, &iter))
     return FALSE;
+
+  // the operator column answers for itself, on the CELL and not on the row:
+  // what the glyph means and that a click changes it, and on the base why it
+  // has none -- which is the whole compensation for a click there doing
+  // nothing. in the non-keyboard branch gtk_tree_view_get_tooltip_context()
+  // has just rewritten x/y into bin-window coordinates, which is what the
+  // column lookup wants; a keyboard tooltip has no column under a pointer, so
+  // there the row tooltip answers as it always did.
+  // it answers first and returns, because two tooltips on one row erase each
+  // other. in practice they never meet: TREE_USED_TEXT is only ever filled on
+  // a root row, and this column only ever answers inside a group
+  if(!keyboard_tip)
+  {
+    dt_lib_masks_t *lm = data;
+    dt_masks_state_t op_state = DT_MASKS_STATE_NONE;
+    const dt_masks_op_hit_t hit =
+      _op_cell_at_bin(lm, widget, x, y, &op_state);
+
+    if(hit == DT_MASKS_OP_HIT_BASE)
+      gtk_tooltip_set_text(tooltip,
+                           _("the shape the others are applied onto\n"
+                             "it takes no operator"));
+    else if(hit == DT_MASKS_OP_HIT_OPERATOR)
+    {
+      // the word behind the glyph, and the one thing a glyph cannot say
+      gchar *text =
+        g_strdup_printf("%s\n%s",
+                        _(_masks_operators[_op_index(op_state)].name),
+                        _("click to change how this shape combines"));
+      gtk_tooltip_set_text(tooltip, text);
+      g_free(text);
+    }
+
+    if(hit != DT_MASKS_OP_HIT_NONE)
+    {
+      // a hit means the column is lm->op_col, so there is nothing to look up
+      gtk_tree_view_set_tooltip_cell(tree_view, tooltip, path,
+                                     lm->op_col, NULL);
+      gtk_tree_path_free(path);
+      return TRUE;
+    }
+  }
 
   gtk_tree_model_get(model, &iter, TREE_USED_TEXT, &tmp, -1);
   // it used to be tied to the "used" badge being visible, so the one row that
@@ -2616,26 +2940,13 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
   // we create the text entry
   char str[256] = "";
   g_strlcat(str, form->name, sizeof(str));
-  // we get the right pixbufs
-  GdkPixbuf *icop = NULL;
-  GdkPixbuf *icinv = NULL;
+  // no operator or inverse work here. both gtk_tree_store_set() below are
+  // followed by _set_iter_name(), which derives the glyph, the rank, the
+  // "base" marker and the inverse icon from the very same state -- this block
+  // computed them only to be overwritten a few lines later. one writer for
+  // what a row displays, so "refresh in place" and "full rebuild" cannot
+  // disagree
   GdkPixbuf *icuse = NULL;
-
-  const gboolean show = gstate & DT_MASKS_STATE_SHOW;
-
-  if(gstate & DT_MASKS_STATE_UNION)
-    icop = lm->ic_union;
-  else if(gstate & DT_MASKS_STATE_INTERSECTION)
-    icop = lm->ic_intersection;
-  else if(gstate & DT_MASKS_STATE_DIFFERENCE)
-    icop = lm->ic_difference;
-  else if(gstate & DT_MASKS_STATE_SUM)
-    icop = lm->ic_sum;
-  else if(gstate & DT_MASKS_STATE_EXCLUSION)
-    icop = lm->ic_exclusion;
-
-  if(gstate & DT_MASKS_STATE_INVERSE)
-    icinv = lm->ic_inverse;
 
   char str2[1000] = "";
   int nbuse = 0;
@@ -2702,10 +3013,6 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
                        TREE_GROUPID, grp_id,
                        TREE_FORMID, form->formid,
                        TREE_EDITABLE, (grp_id == 0),
-                       TREE_IC_OP, icop,
-                       TREE_IC_OP_VISIBLE, (icop != NULL) && show,
-                       TREE_IC_INVERSE, icinv,
-                       TREE_IC_INVERSE_VISIBLE, (icinv != NULL),
                        TREE_IC_USED, icuse,
                        TREE_IC_USED_VISIBLE, (nbuse > 0),
                        TREE_USED_TEXT, str2,
@@ -2748,10 +3055,6 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
                        TREE_GROUPID, grp_id,
                        TREE_FORMID, form->formid,
                        TREE_EDITABLE, (grp_id == 0),
-                       TREE_IC_OP, icop,
-                       TREE_IC_OP_VISIBLE, (icop != NULL) && show,
-                       TREE_IC_INVERSE, icinv,
-                       TREE_IC_INVERSE_VISIBLE, (icinv != NULL),
                        TREE_IC_USED, icuse,
                        TREE_IC_USED_VISIBLE, (nbuse > 0),
                        TREE_USED_TEXT, str2,
@@ -3373,14 +3676,20 @@ static void _build_masks_view(dt_lib_module_t *self,
                               const gboolean library)
 {
   dt_lib_masks_t *d = self->data;
-
-  GtkTreeViewColumn *col = gtk_tree_view_column_new();
-  gtk_tree_view_column_set_title(col, "shapes");
-  gtk_tree_view_append_column(GTK_TREE_VIEW(view), col);
   GtkCellRenderer *renderer;
 
   if(!library)
   {
+    // a column of its own, and the whole reason there are two: a click is "on
+    // the operator" when GTK reports THIS column under the pointer -- no pixel
+    // arithmetic, nothing to keep in step with a renderer's padding. the same
+    // test gui/preferences_ai.c runs on its info column.
+    // rank, operator, "base": everything that says where the shape sits in the
+    // application order, in one strip that does not move with depth
+    d->op_col = gtk_tree_view_column_new();
+    gtk_tree_view_column_set_title(d->op_col, "operator");
+    gtk_tree_view_append_column(GTK_TREE_VIEW(view), d->op_col);
+
     // the application rank, first thing on the row: read the column top-down and
     // you read the order the shapes are applied in. right-aligned and two
     // characters wide so a group reaching ten shapes does not shift every name
@@ -3396,18 +3705,27 @@ static void _build_masks_view(dt_lib_module_t *self,
                  "scale", PANGO_SCALE_SMALL,
                  "sensitive", FALSE,
                  NULL);
-    gtk_tree_view_column_pack_start(col, renderer, FALSE);
-    gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_NUM);
+    gtk_tree_view_column_pack_start(d->op_col, renderer, FALSE);
+    gtk_tree_view_column_add_attribute(d->op_col, renderer, "text", TREE_NUM);
 
+    // the operator, and the one thing in this strip left at full contrast: it
+    // is the one thing here a click can change, and that difference in weight
+    // is the whole hierarchy of the column
     renderer = gtk_cell_renderer_pixbuf_new();
-    gtk_tree_view_column_pack_start(col, renderer, FALSE);
-    gtk_tree_view_column_set_attributes(col, renderer, "pixbuf", TREE_IC_OP, NULL);
-    gtk_tree_view_column_add_attribute(col, renderer, "visible", TREE_IC_OP_VISIBLE);
+    gtk_tree_view_column_pack_start(d->op_col, renderer, FALSE);
+    gtk_tree_view_column_set_attributes(d->op_col, renderer,
+                                        "pixbuf", TREE_IC_OP, NULL);
+    gtk_tree_view_column_add_attribute(d->op_col, renderer,
+                                       "visible", TREE_IC_OP_VISIBLE);
 
     // "base" sits where the operator glyph would be, on the one row that has no
     // operator and cannot be given one. a word rather than a glyph: it has to
     // translate, and it has to follow a theme change -- which the icons,
-    // rasterised once above, do not
+    // rasterised once in gui_init, do not.
+    // it is in this column and not next to the name on purpose: the strip has
+    // to read vertically. a click on the word is therefore a click "on the
+    // operator", which is why the base is a case _op_cell_at_bin() answers for
+    // rather than a case it ignores
     renderer = gtk_cell_renderer_text_new();
     g_object_set(renderer,
                  "xalign", 0.0,
@@ -3415,13 +3733,38 @@ static void _build_masks_view(dt_lib_module_t *self,
                  "scale", PANGO_SCALE_SMALL,
                  "sensitive", FALSE,
                  NULL);
-    gtk_tree_view_column_pack_start(col, renderer, FALSE);
-    gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_BASE);
+    gtk_tree_view_column_pack_start(d->op_col, renderer, FALSE);
+    gtk_tree_view_column_add_attribute(d->op_col, renderer, "text", TREE_BASE);
+  }
+
+  GtkTreeViewColumn *col = gtk_tree_view_column_new();
+  gtk_tree_view_column_set_title(col, "shapes");
+  // the leftover width goes to the names, not to the strip on their left:
+  // without this the name cell stops giving way and the ellipsize below has no
+  // boundary to ellipsize against. set on both lists, needed by one: in the
+  // library the names ARE the only column, and the last column of a view is
+  // handed the leftover width whether or not it is marked expanding
+  gtk_tree_view_column_set_expand(col, TRUE);
+  gtk_tree_view_append_column(GTK_TREE_VIEW(view), col);
+
+  if(!library)
+  {
+    // the expander -- and the per-depth indentation with it -- belongs to the
+    // name column, not to the strip. GTK would otherwise leave it in the first
+    // column, and gtk_tree_view_get_path_at_pos() reports the expander area as
+    // part of that column: on a group nested in a group, which is a depth-2
+    // row and therefore a row carrying an operator, one click would both
+    // unfold the row and open the operator menu, with nothing to tell the two
+    // apart. it also means the ranks line up under each other instead of
+    // stepping right with depth
+    gtk_tree_view_set_expander_column(GTK_TREE_VIEW(view), col);
 
     renderer = gtk_cell_renderer_pixbuf_new();
     gtk_tree_view_column_pack_start(col, renderer, FALSE);
-    gtk_tree_view_column_set_attributes(col, renderer, "pixbuf", TREE_IC_INVERSE, NULL);
-    gtk_tree_view_column_add_attribute(col, renderer, "visible", TREE_IC_INVERSE_VISIBLE);
+    gtk_tree_view_column_set_attributes(col, renderer,
+                                        "pixbuf", TREE_IC_INVERSE, NULL);
+    gtk_tree_view_column_add_attribute(col, renderer,
+                                       "visible", TREE_IC_INVERSE_VISIBLE);
   }
 
   renderer = gtk_cell_renderer_text_new();
@@ -3470,8 +3813,14 @@ static void _build_masks_view(dt_lib_module_t *self,
   gtk_tree_selection_set_select_function(selection, _tree_restrict_select, d, NULL);
   gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(view), FALSE);
   gtk_widget_set_has_tooltip(view, TRUE);
-  g_signal_connect(view, "query-tooltip", G_CALLBACK(_tree_query_tooltip), NULL);
+  // `d` and no longer NULL: the tooltip has to know which column is the
+  // operator one
+  g_signal_connect(view, "query-tooltip", G_CALLBACK(_tree_query_tooltip), d);
   g_signal_connect(selection, "changed", G_CALLBACK(_tree_selection_change), d);
+  // a click target inside a list does not announce itself; the pointer does.
+  // masks zone only: the library has no operator column, so nothing to point at
+  if(!library)
+    dt_gui_connect_motion(view, _tree_motion_cb, NULL, _tree_leave_cb, self);
   dt_gui_connect_click_all(view, _tree_button_pressed_cb, NULL, self);
 }
 
@@ -3486,15 +3835,12 @@ void gui_init(dt_lib_module_t *self)
   const int bs2 = DT_PIXEL_APPLY_DPI(13);
   d->ic_inverse = _get_pixbuf_from_cairo(dtgtk_cairo_paint_masks_inverse, bs2, bs2);
   d->ic_used = _get_pixbuf_from_cairo(dtgtk_cairo_paint_masks_used, bs2, bs2);
-  d->ic_union = _get_pixbuf_from_cairo(dtgtk_cairo_paint_masks_union, bs2 * 2, bs2);
-  d->ic_intersection =
-    _get_pixbuf_from_cairo(dtgtk_cairo_paint_masks_intersection, bs2 * 2, bs2);
-  d->ic_difference =
-    _get_pixbuf_from_cairo(dtgtk_cairo_paint_masks_difference, bs2 * 2, bs2);
-  d->ic_sum =
-    _get_pixbuf_from_cairo(dtgtk_cairo_paint_masks_sum, bs2 * 2, bs2);
-  d->ic_exclusion =
-    _get_pixbuf_from_cairo(dtgtk_cairo_paint_masks_exclusion, bs2 * 2, bs2);
+  // the operator glyphs, from the one table that also builds the menu entries
+  // and decides which one a row shows. twice as wide as they are high, as they
+  // have always been
+  for(int i = 0; i < (int)G_N_ELEMENTS(_masks_operators); i++)
+    d->ic_op[i] = _get_pixbuf_from_cairo(_masks_operators[i].paint,
+                                         bs2 * 2, bs2);
 
   // initialise widgets
   d->bt_gradient = dtgtk_togglebutton_new(dtgtk_cairo_paint_masks_gradient, 0, NULL);
