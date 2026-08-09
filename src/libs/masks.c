@@ -24,6 +24,7 @@
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
+#include "dtgtk/paint_cell.h"
 #include "gui/accelerators.h"
 #include "gui/draw.h"
 #include "gui/gtk.h"
@@ -202,6 +203,12 @@ typedef struct dt_lib_masks_t
   // the second call would leave the library's column here, and the gesture
   // would be dead in one list and live in the other
   GtkTreeViewColumn *op_col;
+  // the masks zone's power column, hit-tested the same way and for the same
+  // reason: one pointer comparison, no pixel arithmetic. it is a column of its
+  // own and not a cell packed beside the name, because a click has to be able
+  // to tell "switch the module off" from "select this mask", and a column is
+  // the only boundary GTK reports back
+  GtkTreeViewColumn *power_col;
   // caption under the library, shown only when at least one shape is not
   // linked to a module: it names exactly the set the cleanup is about
   GtkWidget *lib_unlinked;
@@ -489,6 +496,13 @@ typedef enum dt_masks_tree_cols_t
   // opposite senses -- "strikethrough" on the name, "sensitive" around it
   TREE_MODULE_OFF,
   TREE_MODULE_ON,
+  // whether this row carries the power cell at all: a mask row, whose module
+  // is still in the pipe and has a switch a click may reach. it is written
+  // here and read back by _op_cell_at_bin(), so the cell a click reacts to and
+  // the cell that is drawn are one decision and not two -- the same thing
+  // gui/preferences_ai.c does with its info column. derived, written by
+  // _set_iter_name only
+  TREE_POWER,
   TREE_COUNT
 } dt_masks_tree_cols_t;
 
@@ -527,6 +541,7 @@ static GtkTreeStore *_masks_store_new(void)
       [TREE_TARGET] = G_TYPE_STRING,
       [TREE_MODULE_OFF] = G_TYPE_BOOLEAN,
       [TREE_MODULE_ON] = G_TYPE_BOOLEAN,
+      [TREE_POWER] = G_TYPE_BOOLEAN,
     };
 
   return gtk_tree_store_newv(TREE_COUNT, types);
@@ -1934,6 +1949,17 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   // group, every library row) is not off, it is unattached: full contrast
   const gboolean moff = (live != NULL) && !live->enabled;
 
+  // ... and M2's power switch, on the mask rows only: a shape inside a mask
+  // does not own the module, the mask does -- the same rule TREE_TARGET above
+  // follows, and grp_id is what tells the two apart. a module whose switch is
+  // hidden (hide_enable_button) gets no cell: dt_iop_gui_init() makes its own
+  // button insensitive, and _enable_module_callback() refuses outright, so a
+  // cell here would be the one control in darktable that pretends otherwise
+  const gboolean power = (live != NULL)
+    && !dt_is_valid_maskid(grid)
+    && live->off != NULL
+    && !live->hide_enable_button;
+
   // the glyph is drawn exactly where the shape HAS an operator: inside a
   // group, past the base, with an operator bit set. that is the very test
   // _tree_operation() enforces, so what is shown is what can be changed.
@@ -1983,6 +2009,7 @@ static void _set_iter_name(dt_lib_masks_t *lm,
                      TREE_TARGET, target,
                      TREE_MODULE_OFF, moff,
                      TREE_MODULE_ON, !moff,
+                     TREE_POWER, power,
                      -1);
 
   g_free(target);
@@ -2851,13 +2878,37 @@ static void _tree_context_menu(dt_lib_module_t *self,
   gdk_event_free(event);
 }
 
-// what the operator column has to say at a point, if anything
+// what one of the clickable columns has to say at a point, if anything
 typedef enum dt_masks_op_hit_t
 {
-  DT_MASKS_OP_HIT_NONE = 0,  // not the operator column, or nothing to say
+  DT_MASKS_OP_HIT_NONE = 0,  // not a clickable column, or nothing to say
   DT_MASKS_OP_HIT_BASE,      // the base: says why it has none, not clickable
-  DT_MASKS_OP_HIT_OPERATOR   // an operator a click may change
+  DT_MASKS_OP_HIT_OPERATOR,  // an operator a click may change
+  DT_MASKS_OP_HIT_POWER      // the module switch of a mask row
 } dt_masks_op_hit_t;
+
+// the module a row's cell hands over, or nothing. `live` is the model column
+// that says whether the cell is there at all -- TREE_POWER for the switch,
+// TREE_SHOW for the show-mask cell -- so what a click may reach is read off
+// the very column that decided what is drawn
+static dt_iop_module_t *_row_cell_module(GtkTreeModel *model,
+                                         GtkTreePath *path,
+                                         const dt_masks_tree_cols_t live)
+{
+  GtkTreeIter iter;
+  if(!gtk_tree_model_get_iter(model, &iter, path)) return NULL;
+
+  gboolean live_cell = FALSE;
+  gtk_tree_model_get(model, &iter, live, &live_cell, -1);
+  if(!live_cell) return NULL;
+
+  // TREE_MODULE holds a raw pointer and the store outlives the pipe it was
+  // built from by one refresh, so the same check _mask_default_target and
+  // _set_iter_name make before reading through it
+  dt_iop_module_t *m = NULL;
+  _lib_masks_get_values(model, &iter, &m, NULL, NULL);
+  return _mask_target_alive(m) ? m : NULL;
+}
 
 // what sits under bin-window coords (bx,by) in `view`. the whole hit-test is
 // the column comparison below: GTK hands us the column under the pointer and
@@ -2883,13 +2934,21 @@ typedef enum dt_masks_op_hit_t
 // of the five table entries -- but this way the caller of *state_out is holding
 // a state the table is known to answer for, rather than one a sixth operator
 // added to the enum alone would leave it unable to index.
+//
+// the power column answers the same way and is decided elsewhere: the cell is
+// live exactly where TREE_POWER is set, so _row_cell_module() above reads that
+// column back rather than restating the rule. one writer for what a row shows
+// AND for what a click may reach -- restated here, the two would drift and a
+// hand would appear over an empty cell.
 static dt_masks_op_hit_t _op_cell_at_bin(dt_lib_masks_t *lm,
                                          GtkWidget *view,
                                          const gint bx,
                                          const gint by,
-                                         dt_masks_state_t *state_out)
+                                         dt_masks_state_t *state_out,
+                                         dt_iop_module_t **module_out)
 {
-  if(!lm->op_col) return DT_MASKS_OP_HIT_NONE;
+  if(!lm->op_col && !lm->power_col)
+    return DT_MASKS_OP_HIT_NONE;
 
   GtkTreeView *tv = GTK_TREE_VIEW(view);
   GtkTreeModel *model = gtk_tree_view_get_model(tv);
@@ -2927,6 +2986,15 @@ static dt_masks_op_hit_t _op_cell_at_bin(dt_lib_masks_t *lm,
       }
     }
   }
+  else if(model && path && column == lm->power_col)
+  {
+    dt_iop_module_t *m = _row_cell_module(model, path, TREE_POWER);
+    if(m)
+    {
+      if(module_out) *module_out = m;
+      hit = DT_MASKS_OP_HIT_POWER;
+    }
+  }
 
   if(path) gtk_tree_path_free(path);
   return hit;
@@ -2934,7 +3002,9 @@ static dt_masks_op_hit_t _op_cell_at_bin(dt_lib_masks_t *lm,
 
 // exactly the zone the click reacts to, and back to NULL as soon as we leave
 // it -- a cursor set on the bin window and never reset stays a hand over the
-// whole panel. the base gets no hand: nothing there opens
+// whole panel. the base gets no hand: nothing there acts.
+// three zones now, one cursor: the operator glyph, the power switch and the
+// show-mask cell. they are the only cells in either list a click acts on
 static void _tree_motion_cb(GtkEventControllerMotion *controller,
                             double x,
                             double y,
@@ -2952,8 +3022,9 @@ static void _tree_motion_cb(GtkEventControllerMotion *controller,
   // this runs on every motion event over the list, so touch the window only
   // when the answer changes. nothing else puts a cursor on it, so its current
   // cursor is a faithful record of what we last decided
-  const gboolean over =
-    _op_cell_at_bin(lm, view, bx, by, NULL) == DT_MASKS_OP_HIT_OPERATOR;
+  const dt_masks_op_hit_t hit = _op_cell_at_bin(lm, view, bx, by, NULL, NULL);
+  const gboolean over = (hit == DT_MASKS_OP_HIT_OPERATOR)
+                     || (hit == DT_MASKS_OP_HIT_POWER);
   if(over == (gdk_window_get_cursor(bin) != NULL)) return;
 
   if(over)
@@ -3037,21 +3108,30 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
     const GdkModifierType mods = dt_gui_current_state(gesture);
     dt_masks_state_t op_state = DT_MASKS_STATE_NONE;
 
-    // a plain left click on the operator column of a shape that carries one
-    // opens the five modes right where the glyph is. a modified click still
-    // belongs to the selection -- ctrl and shift build a multiple one, and it
-    // would be unbuildable if this vertical strip swallowed those clicks. the
-    // "pressed" signal fires once per press, so without n_press a double click
-    // would pop the menu twice.
+    // a plain left click on one of this list's click targets. a modified click
+    // still belongs to the selection -- ctrl and shift build a multiple one,
+    // and it would be unbuildable if these vertical strips swallowed those
+    // clicks.
     // note what we do NOT do: dt_gui_claim(gesture). this handler has never
     // claimed the sequence and must not start: claiming cancels the
     // treeview's own gesture, and with it selection, the rename double click
     // and the expanders
-    if(n_press == 1
-       && mouse_path
-       && dt_modifier_is(mods, 0)
-       && _op_cell_at_bin(lm, treeview, bin_x, bin_y, &op_state)
-          == DT_MASKS_OP_HIT_OPERATOR)
+    dt_iop_module_t *row_module = NULL;
+    dt_masks_op_hit_t hit = (mouse_path && dt_modifier_is(mods, 0))
+      ? _op_cell_at_bin(lm, treeview, bin_x, bin_y, &op_state, &row_module)
+      : DT_MASKS_OP_HIT_NONE;
+
+    // the menu is the one target that must not answer twice: "pressed" fires
+    // once per press, so a double click on the glyph would pop it and then pop
+    // a second one over the first. the cells beside it are switches, and two
+    // quick clicks on a switch are two switches -- switch the module off, look
+    // at the photograph, switch it back on IS a double click at one pixel, and
+    // it is the whole gesture M2 asks the power column for. a guard written
+    // once for the menu must not decide for them
+    if(hit == DT_MASKS_OP_HIT_OPERATOR && n_press != 1)
+      hit = DT_MASKS_OP_HIT_NONE;
+
+    if(hit == DT_MASKS_OP_HIT_OPERATOR)
     {
       // _tree_operation() acts on the view's selection and not on a row handed
       // to it, so the selection has to BE the clicked row before the menu can
@@ -3078,6 +3158,32 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
       // dt_gui_menu_popup takes the floating ref and drops it on "deactivate",
       // and pops at the pointer when handed no widget
       dt_gui_menu_popup(GTK_MENU(menu), NULL, 0, 0);
+    }
+    // M2, the comparison gesture: switch off the module this mask serves and
+    // the photograph goes back to what it was, without leaving the panel.
+    //
+    // the module's OWN switch and never module->enabled: the toggle carries
+    // the history item, the pipe recompute, the fold rule
+    // ("darkroom/ui/activate_expand"), the accelerators and the header class
+    // with it -- _gui_off_callback does all of that and nothing here repeats
+    // any of it. read the button's state and not the module's, as
+    // _enable_module_callback (develop/imageop.c) and views/darkroom.c both
+    // do; dt_iop_gui_set_enable_button keeps the two in step.
+    //
+    // the way back is already paid for: _gui_off_callback ends in
+    // dt_dev_masks_list_update(), which rewrites every derived column of every
+    // row in place -- TREE_POWER included. no loop: that path sets store cells
+    // and touches no toggle, and dt_dev_add_history_item() rebuilds no list.
+    //
+    // the selection is deliberately left alone. the operator branch above
+    // forces it because the menu acts on the selection; this acts on a module
+    // the row hands over, and the tree view's own gesture will select the row
+    // on release like any other click
+    else if(hit == DT_MASKS_OP_HIT_POWER && row_module && row_module->off)
+    {
+      const gboolean on =
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(row_module->off));
+      gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(row_module->off), !on);
     }
     // if click on a blank space, then deselect all
     else if(!on_row)
@@ -3174,8 +3280,9 @@ static gboolean _tree_query_tooltip(GtkWidget *widget,
   {
     dt_lib_masks_t *lm = data;
     dt_masks_state_t op_state = DT_MASKS_STATE_NONE;
+    dt_iop_module_t *row_module = NULL;
     const dt_masks_op_hit_t hit =
-      _op_cell_at_bin(lm, widget, x, y, &op_state);
+      _op_cell_at_bin(lm, widget, x, y, &op_state, &row_module);
 
     if(hit == DT_MASKS_OP_HIT_BASE)
       gtk_tooltip_set_text(tooltip,
@@ -3191,12 +3298,35 @@ static gboolean _tree_query_tooltip(GtkWidget *widget,
       gtk_tooltip_set_text(tooltip, text);
       g_free(text);
     }
+    else if(hit == DT_MASKS_OP_HIT_POWER && row_module)
+    {
+      // the first line is the very sentence the module's own switch puts in
+      // its tooltip (develop/imageop.c), from the same two msgids: one switch,
+      // two places to reach it, one wording. the second says what THIS click
+      // does, which is not the same sentence in both directions
+      gchar *name = dt_history_item_get_name(row_module);
+      gchar *line = g_strdup_printf(row_module->enabled
+                                      ? _("'%s' is switched on")
+                                      : _("'%s' is switched off"),
+                                    name);
+      gchar *text =
+        g_strdup_printf("%s\n%s", line,
+                        row_module->enabled
+                          ? _("click to see the photograph without it")
+                          : _("click to switch it back on"));
+      gtk_tooltip_set_text(tooltip, text);
+      g_free(text);
+      g_free(line);
+      g_free(name);
+    }
 
     if(hit != DT_MASKS_OP_HIT_NONE)
     {
-      // a hit means the column is lm->op_col, so there is nothing to look up
+      // the hit names the column it came from, so there is nothing to look up
+      GtkTreeViewColumn *hit_col = lm->op_col;
+      if(hit == DT_MASKS_OP_HIT_POWER) hit_col = lm->power_col;
       gtk_tree_view_set_tooltip_cell(tree_view, tooltip, path,
-                                     lm->op_col, NULL);
+                                     hit_col, NULL);
       gtk_tree_path_free(path);
       return TRUE;
     }
@@ -4250,6 +4380,44 @@ static void _build_masks_view(dt_lib_module_t *self,
                  NULL);
     gtk_tree_view_column_pack_end(col, renderer, FALSE);
     gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_TARGET);
+  }
+
+  if(!library)
+  {
+    // M2's power switch, at the right edge and in a column of its own -- a
+    // click target beside the operator strip, and the last thing the row
+    // reads. appended after the name column, which is the one marked
+    // expanding, so the leftover width still goes to the names and this strip
+    // keeps its own.
+    //
+    // a fixed width and not a natural one: the cell asks for the row's line
+    // height, which follows the theme's font, and a click target whose cost in
+    // panel width cannot be stated is a click target that gets argued about.
+    // sixteen points is what ic_inverse and ic_used are rasterised near
+    // (thirteen), so the glyph sits in the same optical column as theirs
+    d->power_col = gtk_tree_view_column_new();
+    gtk_tree_view_column_set_title(d->power_col, "power");
+    gtk_tree_view_column_set_sizing(d->power_col,
+                                    GTK_TREE_VIEW_COLUMN_FIXED);
+    gtk_tree_view_column_set_fixed_width(d->power_col,
+                                         DT_PIXEL_APPLY_DPI(16));
+    gtk_tree_view_append_column(GTK_TREE_VIEW(view), d->power_col);
+
+    // ONE renderer and not two, which is the whole of what the paint cell's
+    // own state buys: the cell reads that state now, so "off" is the theme's
+    // insensitive colour on the same glyph rather than a second pixbuf and a
+    // branch on the row. dtgtk_cairo_paint_switch is the glyph the module's
+    // own button draws (dt_iop_gui_set_enable_button_icon), so the two
+    // switches of one module are the same drawing.
+    // "visible" is TREE_POWER -- a mask row with a reachable switch -- and
+    // "sensitive" is TREE_MODULE_ON, already written for the struck-through
+    // name: on at full contrast, off stepped back, which is M2 note 7
+    renderer = dtgtk_paint_cell_new(dtgtk_cairo_paint_switch, 0, NULL);
+    gtk_tree_view_column_pack_start(d->power_col, renderer, FALSE);
+    gtk_tree_view_column_add_attribute(d->power_col, renderer,
+                                       "visible", TREE_POWER);
+    gtk_tree_view_column_add_attribute(d->power_col, renderer,
+                                       "sensitive", TREE_MODULE_ON);
   }
 
   if(library)
