@@ -483,6 +483,12 @@ typedef enum dt_masks_tree_cols_t
   // nowhere else: a shape inside a mask does not belong to a module, the mask
   // does. derived, written by _set_iter_name only
   TREE_TARGET,
+  // whether the module this row's mask serves is switched off. two booleans
+  // and not one: a model column is bound to a cell property as it stands, with
+  // no way to negate it on the way, and the two properties that read this want
+  // opposite senses -- "strikethrough" on the name, "sensitive" around it
+  TREE_MODULE_OFF,
+  TREE_MODULE_ON,
   TREE_COUNT
 } dt_masks_tree_cols_t;
 
@@ -519,6 +525,8 @@ static GtkTreeStore *_masks_store_new(void)
       [TREE_IC_TYPE_VISIBLE] = G_TYPE_BOOLEAN,
       [TREE_OPACITY] = G_TYPE_STRING,
       [TREE_TARGET] = G_TYPE_STRING,
+      [TREE_MODULE_OFF] = G_TYPE_BOOLEAN,
+      [TREE_MODULE_ON] = G_TYPE_BOOLEAN,
     };
 
   return gtk_tree_store_newv(TREE_COUNT, types);
@@ -1919,6 +1927,13 @@ static void _set_iter_name(dt_lib_masks_t *lm,
     g_free(mname);
   }
 
+  // M2 note 7: a mask whose module is switched off is struck through, and the
+  // kind icon beside its name steps back with it. the whole mask and not just
+  // its top row -- the shapes under it carry the same module, and nothing
+  // under an off module renders. a row with no module at all (a stand-alone
+  // group, every library row) is not off, it is unattached: full contrast
+  const gboolean moff = (live != NULL) && !live->enabled;
+
   // the glyph is drawn exactly where the shape HAS an operator: inside a
   // group, past the base, with an operator bit set. that is the very test
   // _tree_operation() enforces, so what is shown is what can be changed.
@@ -1966,6 +1981,8 @@ static void _set_iter_name(dt_lib_masks_t *lm,
                      TREE_IC_TYPE, ictype,
                      TREE_IC_TYPE_VISIBLE, (ictype != NULL),
                      TREE_TARGET, target,
+                     TREE_MODULE_OFF, moff,
+                     TREE_MODULE_ON, !moff,
                      -1);
 
   g_free(target);
@@ -4164,12 +4181,28 @@ static void _build_masks_view(dt_lib_module_t *self,
                                       "pixbuf", TREE_IC_TYPE, NULL);
   gtk_tree_view_column_add_attribute(col, renderer,
                                      "visible", TREE_IC_TYPE_VISIBLE);
+  // the one cell M2 note 7 steps back beside the struck-through name, and the
+  // only one of them that reaches a mask row at all. the operator glyph and
+  // the inverse marker are left alone on purpose: they exist on shape rows
+  // only, the operator is still what a click changes there whatever the module
+  // does, and note 7 does not name them
+  gtk_tree_view_column_add_attribute(col, renderer,
+                                     "sensitive", TREE_MODULE_ON);
 
   renderer = gtk_cell_renderer_text_new();
   g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, NULL);
   gtk_tree_view_column_pack_start(col, renderer, TRUE);
   gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_TEXT);
   gtk_tree_view_column_add_attribute(col, renderer, "editable", TREE_EDITABLE);
+  // struck through, never greyed: an insensitive cell is not editable, and
+  // greying the name is the one change that would make a mask unrenamable.
+  // both properties bound, not just the first: "strikethrough" is ignored
+  // while "strikethrough-set" is false, and one renderer draws the whole
+  // column -- set once on one row it would stay set on every row below
+  gtk_tree_view_column_add_attribute(col, renderer,
+                                     "strikethrough", TREE_MODULE_OFF);
+  gtk_tree_view_column_add_attribute(col, renderer,
+                                     "strikethrough-set", TREE_MODULE_OFF);
   g_signal_connect(renderer, "edited", G_CALLBACK(_tree_cell_edited), view);
   dt_gui_commit_on_focus_loss(renderer, NULL);
   if(library)
