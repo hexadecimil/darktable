@@ -3113,23 +3113,52 @@ gboolean dt_iop_show_hide_header_buttons(dt_iop_module_t *module,
   return TRUE;
 }
 
+void dt_iop_set_mask_display(dt_iop_module_t *module, const gboolean display)
+{
+  // blend_data is the guard this code never had. it was reached from the
+  // header indicator only, which no path builds without a blending gui, so
+  // `bd->showmask` on a NULL bd has never fired -- but the test was on the
+  // field and not on the pointer, and a public function that dereferences
+  // blend_data unchecked is one caller away from being wrong
+  dt_iop_gui_blend_data_t *bd = module ? module->blend_data : NULL;
+  if(!bd) return;
+
+  module->request_mask_display &= ~DT_DEV_PIXELPIPE_DISPLAY_MASK;
+  module->request_mask_display |=
+    (display ? DT_DEV_PIXELPIPE_DISPLAY_MASK : DT_DEV_PIXELPIPE_DISPLAY_NONE);
+
+  // the module's two buttons follow, whichever way the call came in. under the
+  // gui-update guard: setting either of them active emits "toggled", and the
+  // header indicator's handler is the one that called us
+  DT_ENTER_GUI_UPDATE();
+  if(bd->showmask)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bd->showmask), display);
+  if(module->mask_indicator)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(module->mask_indicator),
+                                 display);
+  DT_LEAVE_GUI_UPDATE();
+
+  // the engine only honours the request of the module that has the focus
+  // (develop/blend.c, `valid_request`), and taking it clears the request of
+  // whoever had it, through dt_iop_gui_blending_lose_focus(). that is what
+  // makes this a radio and not a switch, and it is the moving part the mask
+  // manager's column has to live with.
+  // outside the guard above, and it has to be: both that call and the
+  // lose_focus it ends in return early under DT_IN_GUI_UPDATE()
+  dt_iop_request_focus(module);
+  dt_iop_refresh_center(module);
+
+  // the mask manager states on every mask row whether that module's mask is
+  // the one on screen. nothing else refreshes it: the focus change above ends
+  // in a selection change, which rebuilds no row
+  dt_dev_masks_list_update(module->dev);
+}
+
 static void _display_mask_indicator_callback(GtkToggleButton *bt,
                                              dt_iop_module_t *module)
 {
   DT_GUARD_GUI_UPDATE();
-
-  const gboolean is_active = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(bt));
-  const dt_iop_gui_blend_data_t *bd = module->blend_data;
-
-  module->request_mask_display &= ~DT_DEV_PIXELPIPE_DISPLAY_MASK;
-  module->request_mask_display |= (is_active ? DT_DEV_PIXELPIPE_DISPLAY_MASK : DT_DEV_PIXELPIPE_DISPLAY_NONE);
-
-  // set the module show mask button too
-  if(bd->showmask)
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bd->showmask), is_active);
-
-  dt_iop_request_focus(module);
-  dt_iop_refresh_center(module);
+  dt_iop_set_mask_display(module, gtk_toggle_button_get_active(bt));
 }
 
 static gboolean _mask_indicator_tooltip(GtkWidget *treeview,

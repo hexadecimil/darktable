@@ -546,6 +546,14 @@ gboolean dt_iop_show_hide_header_buttons(dt_iop_module_t *module,
 /** add/remove mask indicator to iop module header */
 void dt_iop_add_remove_mask_indicator(dt_iop_module_t *module, gboolean add);
 
+/** show, or stop showing, this module's mask filled over the photograph.
+ *  it takes the darkroom focus: the engine only honours a display request for
+ *  the module that has it (develop/blend.c, `valid_request`), so a request
+ *  made without the focus would set a flag and change nothing on screen.
+ *  the module's own two buttons -- the header indicator and the blending
+ *  panel's show-mask -- follow whichever way the call came in. */
+void dt_iop_set_mask_display(dt_iop_module_t *module, const gboolean display);
+
 /** Set the trouble message for the module.  If non-empty, also flag
  ** the module as being in trouble; if empty or NULL, clear the
  ** trouble flag.  If 'toast_message' is non-NULL/non-empty, pop up a
