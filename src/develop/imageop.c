@@ -1281,6 +1281,24 @@ static void _gui_off_callback(GtkToggleButton *togglebutton,
 
   _update_module_active_class(module);
 
+  // the mask manager states, on every mask row, which module it serves; a mask
+  // whose module is off is struck through there. nothing else refreshes it
+  // when a module is toggled: the branch above ends in
+  // dt_dev_add_history_item(), which never touches the mask list.
+  // outside the DT_IN_GUI_UPDATE guard on purpose, and for one path in
+  // particular: an edit arriving on an off module switches it back on from
+  // inside _dev_add_history_item_ext(), which drives this toggle under
+  // DT_ENTER_GUI_UPDATE and, again, rebuilds no list. gated here, a mask would
+  // stay struck through under a module that had just come back on.
+  // dt_dev_masks_list_update() rewrites the derived columns of the rows in
+  // place -- no store rebuilt, no selection moved, and nothing in that path
+  // comes back here.
+  // costs, assumed: dt_dev_pop_history_items() walks every module's toggle
+  // through here and then rebuilds the whole list at the end anyway, so an
+  // undo or a style pays one in-place refresh per module for nothing. the
+  // alternative is a second guard for a case that is already correct
+  dt_dev_masks_list_update(module->dev);
+
   // rebuild the accelerators
   dt_iop_connect_accels_multi(module->so);
 
