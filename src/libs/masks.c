@@ -479,6 +479,10 @@ typedef enum dt_masks_tree_cols_t
   // gradient is 85% in one mask and 100% in the next -- so it is written on
   // group members and nowhere else. derived, written by _set_iter_name only
   TREE_OPACITY,
+  // the module this mask serves, as "-> exposure", on the mask rows and
+  // nowhere else: a shape inside a mask does not belong to a module, the mask
+  // does. derived, written by _set_iter_name only
+  TREE_TARGET,
   TREE_COUNT
 } dt_masks_tree_cols_t;
 
@@ -514,6 +518,7 @@ static GtkTreeStore *_masks_store_new(void)
       [TREE_IC_TYPE] = GDK_TYPE_PIXBUF,
       [TREE_IC_TYPE_VISIBLE] = G_TYPE_BOOLEAN,
       [TREE_OPACITY] = G_TYPE_STRING,
+      [TREE_TARGET] = G_TYPE_STRING,
     };
 
   return gtk_tree_store_newv(TREE_COUNT, types);
@@ -1859,6 +1864,14 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   dt_mask_id_t id = INVALID_MASKID;
   _lib_masks_get_values(model, iter, &module, &grid, &id);
 
+  // TREE_MODULE holds a raw pointer and the store outlives the pipe it was
+  // built from by one refresh: dt_dev_masks_list_change() only queues the
+  // rebuild and an in-place refresh runs on the way there. the rank below has
+  // only ever tested this pointer for NULL, which is why nothing needed the
+  // check until a column read THROUGH it. same test, and the same reason, as
+  // _mask_default_target
+  dt_iop_module_t *live = _mask_target_alive(module) ? module : NULL;
+
   int rank = -1;
   char num[8] = "";
   const char *base = "";
@@ -1890,6 +1903,21 @@ static void _set_iter_name(dt_lib_masks_t *lm,
      && !(form->type & DT_MASKS_GROUP)
      && _shape_scope(form->formid, NULL, 0) != DT_MASKS_SCOPE_MODULE)
     link = _("no module");
+
+  // M2: "what is this group for?" answered on the row that raises the
+  // question. the mask rows only -- which is a root row carrying a module:
+  // grp_id is 0 there, and a library row carries no module at all.
+  // dt_history_item_get_name and the same "→ %s" the target line at the top
+  // of the panel is built from: one says where a mask lives, the other where
+  // the next shape goes, and they have to read as the same statement
+  gchar *target = NULL;
+
+  if(live && !dt_is_valid_maskid(grid))
+  {
+    gchar *mname = dt_history_item_get_name(live);
+    target = g_strdup_printf("→ %s", mname);
+    g_free(mname);
+  }
 
   // the glyph is drawn exactly where the shape HAS an operator: inside a
   // group, past the base, with an operator bit set. that is the very test
@@ -1937,7 +1965,10 @@ static void _set_iter_name(dt_lib_masks_t *lm,
                      TREE_IC_INVERSE_VISIBLE, (icinv != NULL),
                      TREE_IC_TYPE, ictype,
                      TREE_IC_TYPE_VISIBLE, (ictype != NULL),
+                     TREE_TARGET, target,
                      -1);
+
+  g_free(target);
 }
 
 static void _tree_cleanup(GtkButton *button, dt_lib_module_t *self)
@@ -4165,6 +4196,27 @@ static void _build_masks_view(dt_lib_module_t *self,
                  NULL);
     gtk_tree_view_column_pack_end(col, renderer, FALSE);
     gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_OPACITY);
+
+    // which module this mask serves, between the name and the opacity -- pack
+    // order is right to left, so packing it after puts it on the left of it.
+    // ellipsized by the end: a module name cut short is still the same
+    // statement, where a cut short name is a different mask.
+    // and capped, which is the whole of the priority rule. this cell does not
+    // expand, so it asks for its natural width and a panel too narrow to grant
+    // everything shares what is left: "diffuse or sharpen" would take its
+    // sixteen characters out of the name. sixteen is the cap because it is
+    // what M2 shows fitting -- "→ local contrast", uncut
+    renderer = gtk_cell_renderer_text_new();
+    g_object_set(renderer,
+                 "xalign", 1.0,
+                 "xpad", (guint)DT_PIXEL_APPLY_DPI(2),
+                 "ellipsize", PANGO_ELLIPSIZE_END,
+                 "max-width-chars", 16,
+                 "scale", PANGO_SCALE_SMALL,
+                 "sensitive", FALSE,
+                 NULL);
+    gtk_tree_view_column_pack_end(col, renderer, FALSE);
+    gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_TARGET);
   }
 
   if(library)
