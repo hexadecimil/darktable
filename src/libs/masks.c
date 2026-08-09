@@ -161,6 +161,20 @@ static const struct
 #endif
 };
 
+// which of the six kinds a shape is, as an index into the table above, -1 for
+// none -- the same contract as _op_index() and the same reason for a table
+// rather than a switch. form->type is a bitmask that also carries
+// DT_MASKS_GROUP and the clone bits, so it is tested against the table and
+// never compared to it. -1 is a real answer: a group is not a kind of shape,
+// and DT_MASKS_OBJECT leaves the table entirely in a build without the AI,
+// where an object shape read back from an XMP written by one still has to draw
+static int _type_index(const dt_masks_type_t type)
+{
+  for(int i = 0; i < (int)G_N_ELEMENTS(_new_mask_shapes); i++)
+    if(type & _new_mask_shapes[i].type) return i;
+  return -1;
+}
+
 typedef struct dt_lib_masks_t
 {
   // the manager shows two lists now. `treeview` holds the masks: the groups,
@@ -219,6 +233,9 @@ typedef struct dt_lib_masks_t
   // the operator glyphs, indexed by _masks_operators: same table, same order,
   // so a sixth operator is one line there and nothing at all here
   GdkPixbuf *ic_op[G_N_ELEMENTS(_masks_operators)];
+  // the kind glyphs, indexed by _new_mask_shapes: same table, same order, so a
+  // seventh kind is one line there and nothing at all here
+  GdkPixbuf *ic_type[G_N_ELEMENTS(_new_mask_shapes)];
 
   // a selection requested (e.g. right after creating a shape) before the tree
   // had the matching row: re-applied once gui_update rebuilds the tree. 0 = none.
@@ -449,6 +466,13 @@ typedef enum dt_masks_tree_cols_t
   // rows that can carry it: the library holds one row per shape, nothing
   // nested, and every other row in either store leaves before that walk
   TREE_LINK,
+  // what kind of shape the row is -- circle, ellipse, gradient, path, brush,
+  // object -- as a pixbuf out of ic_type[]. derived like the three above and
+  // written in the same single place. a mask holding exactly ONE shape carries
+  // that shape's icon: it is the only case where a group has a kind at all,
+  // and the only one a mask row can state without lying
+  TREE_IC_TYPE,
+  TREE_IC_TYPE_VISIBLE,
   TREE_COUNT
 } dt_masks_tree_cols_t;
 
@@ -481,6 +505,8 @@ static GtkTreeStore *_masks_store_new(void)
       [TREE_NUM] = G_TYPE_STRING,
       [TREE_BASE] = G_TYPE_STRING,
       [TREE_LINK] = G_TYPE_STRING,
+      [TREE_IC_TYPE] = GDK_TYPE_PIXBUF,
+      [TREE_IC_TYPE_VISIBLE] = G_TYPE_BOOLEAN,
     };
 
   return gtk_tree_store_newv(TREE_COUNT, types);
@@ -1875,6 +1901,22 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   if(state & DT_MASKS_STATE_INVERSE)
     icinv = lm->ic_inverse;
 
+  // M2.2: every shape says what it is. a group has no kind of its own -- but a
+  // group holding exactly one shape has that shape's, and a mask made of a
+  // single gradient IS a gradient. one is the only count at which the icon
+  // cannot come to mean something else the moment a second shape is added.
+  // read from grp->points and not from the row's children: on a first pass the
+  // row is being built and has none yet
+  const dt_masks_form_t *tform = form;
+
+  if(form->type & DT_MASKS_GROUP)
+    tform = (g_list_length(form->points) == 1)
+      ? dt_masks_get_from_id(darktable.develop, _group_point_id(form, 0))
+      : NULL;
+
+  const int ty = tform ? _type_index(tform->type) : -1;
+  GdkPixbuf *ictype = (ty >= 0) ? lm->ic_type[ty] : NULL;
+
   gtk_tree_store_set(GTK_TREE_STORE(model), iter,
                      TREE_TEXT, str,
                      TREE_NUM, num,
@@ -1884,6 +1926,8 @@ static void _set_iter_name(dt_lib_masks_t *lm,
                      TREE_IC_OP_VISIBLE, (icop != NULL),
                      TREE_IC_INVERSE, icinv,
                      TREE_IC_INVERSE_VISIBLE, (icinv != NULL),
+                     TREE_IC_TYPE, ictype,
+                     TREE_IC_TYPE_VISIBLE, (ictype != NULL),
                      -1);
 }
 
@@ -3236,11 +3280,10 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
   char str[256] = "";
   g_strlcat(str, form->name, sizeof(str));
   // no operator or inverse work here. both gtk_tree_store_set() below are
-  // followed by _set_iter_name(), which derives the glyph, the rank, the
-  // "base" marker and the inverse icon from the very same state -- this block
-  // computed them only to be overwritten a few lines later. one writer for
-  // what a row displays, so "refresh in place" and "full rebuild" cannot
-  // disagree
+  // followed by _set_iter_name(), which derives every displayed column of the
+  // row from the very same state -- this block computed some of them only to
+  // be overwritten a few lines later. one writer for what a row displays, so
+  // "refresh in place" and "full rebuild" cannot disagree
   GdkPixbuf *icuse = NULL;
 
   char str2[1000] = "";
@@ -4071,6 +4114,17 @@ static void _build_masks_view(dt_lib_module_t *self,
                                        "visible", TREE_IC_INVERSE_VISIBLE);
   }
 
+  // the kind of shape, on both lists and in the same place on the row: after
+  // the inverse marker, before the name. M3 reads a row left to right as one
+  // sentence -- "intersect, with the inverse of this circle" -- and the kind is
+  // the noun of it
+  renderer = gtk_cell_renderer_pixbuf_new();
+  gtk_tree_view_column_pack_start(col, renderer, FALSE);
+  gtk_tree_view_column_set_attributes(col, renderer,
+                                      "pixbuf", TREE_IC_TYPE, NULL);
+  gtk_tree_view_column_add_attribute(col, renderer,
+                                     "visible", TREE_IC_TYPE_VISIBLE);
+
   renderer = gtk_cell_renderer_text_new();
   g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, NULL);
   gtk_tree_view_column_pack_start(col, renderer, TRUE);
@@ -4145,6 +4199,13 @@ void gui_init(dt_lib_module_t *self)
   for(int i = 0; i < (int)G_N_ELEMENTS(_masks_operators); i++)
     d->ic_op[i] = _get_pixbuf_from_cairo(_masks_operators[i].paint,
                                          bs2 * 2, bs2);
+
+  // the kind glyphs, from the table that also draws the six buttons above the
+  // list: a row and the button that made it show the same drawing. square,
+  // like the inverse and "used" badges -- only the operators are twice as wide
+  for(int i = 0; i < (int)G_N_ELEMENTS(_new_mask_shapes); i++)
+    d->ic_type[i] = _get_pixbuf_from_cairo(_new_mask_shapes[i].paint,
+                                           bs2, bs2);
 
   // the six shape toggles are back, and with them the only registration of the
   // six "shapes/add ..." paths. there can be exactly one: dt_action_locate()
