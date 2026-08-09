@@ -379,6 +379,31 @@ void dt_masks_register_forms(dt_develop_t *dev,
   dt_dev_add_masks_history_item(dev, NULL, TRUE);
 }
 
+// how the next shape combines, as armed from the mask manager. it is held here
+// and not in form_gui: the continuous-creation tail of every shape file calls
+// dt_masks_change_form_gui() and then restores creation_module,
+// creation_continuous and creation_continuous_module by hand -- a field added
+// there would be lost on the second shape of a run unless five more files
+// restored it too. DT_MASKS_STATE_NONE is every creation that was not armed,
+// which is all of them until the bar is used
+static dt_masks_state_t _next_operator = DT_MASKS_STATE_NONE;
+// ... and the module it was armed for. this funnel is the one every drawn
+// shape goes through, whoever drew it: without the pair, an operator armed on
+// one module's mask would land on a shape drawn from another module's blending
+// panel, and on the clone circles iop/spots.c builds while converting a legacy
+// edit -- shapes the mask manager never lists, so nobody could see the bit nor
+// take it off again
+static dt_iop_module_t *_next_operator_module = NULL;
+
+void dt_masks_set_next_operator(const dt_masks_state_t op,
+                                dt_iop_module_t *module)
+{
+  // masked down to the five composition bits: nothing else has any business
+  // reaching a group point's state through this door
+  _next_operator = op & DT_MASKS_STATE_OP;
+  _next_operator_module = _next_operator ? module : NULL;
+}
+
 void dt_masks_gui_form_save_creation(dt_develop_t *dev,
                                      dt_iop_module_t *module,
                                      dt_masks_form_t *form,
@@ -446,7 +471,23 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
     grpt->state = DT_MASKS_STATE_SHOW | DT_MASKS_STATE_USE;
     if(grp->points)
     {
-      if(form->type == DT_MASKS_BRUSH)
+      // an armed operator only ever reaches a shape that has something to
+      // combine with, because this branch is exactly "the group is not empty".
+      // index 0 keeps taking none, which is what group.c requires and what the
+      // "base" marker of the panel states
+      if(_next_operator && module == _next_operator_module)
+      {
+        // "add" is how this mask already adds, and not a fourth thing to
+        // choose: a brush accumulates where every other shape takes the
+        // maximum (group.c, _combine_masks_sum against _combine_masks_union),
+        // and the bar offers one "add", not one per shape type. arming the
+        // default must not change it
+        grpt->state |= (_next_operator == DT_MASKS_STATE_UNION
+                        && form->type == DT_MASKS_BRUSH)
+          ? DT_MASKS_STATE_SUM
+          : _next_operator;
+      }
+      else if(form->type == DT_MASKS_BRUSH)
         grpt->state |= DT_MASKS_STATE_SUM;
       else
         grpt->state |= DT_MASKS_STATE_UNION;
