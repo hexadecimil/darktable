@@ -231,6 +231,8 @@ typedef struct dt_lib_masks_t
   // to tell "switch the module off" from "select this mask", and a column is
   // the only boundary GTK reports back
   GtkTreeViewColumn *power_col;
+  // and the show-mask column, hit-tested exactly like the two before it
+  GtkTreeViewColumn *show_col;
   // caption under the library, shown only when at least one shape is not
   // linked to a module: it names exactly the set the cleanup is about
   GtkWidget *lib_unlinked;
@@ -544,6 +546,13 @@ typedef enum dt_masks_tree_cols_t
   // gui/preferences_ai.c does with its info column. derived, written by
   // _set_iter_name only
   TREE_POWER,
+  // whether this row carries the show-mask cell, and whether that module's
+  // mask is the one currently on screen. same pair of senses as
+  // TREE_MODULE_OFF / TREE_MODULE_ON and for the same reason: "visible" and
+  // "sensitive" are two cell properties and a model column cannot be negated
+  // on the way in. derived, written by _set_iter_name only
+  TREE_SHOW,
+  TREE_SHOW_ON,
   TREE_COUNT
 } dt_masks_tree_cols_t;
 
@@ -583,6 +592,8 @@ static GtkTreeStore *_masks_store_new(void)
       [TREE_MODULE_OFF] = G_TYPE_BOOLEAN,
       [TREE_MODULE_ON] = G_TYPE_BOOLEAN,
       [TREE_POWER] = G_TYPE_BOOLEAN,
+      [TREE_SHOW] = G_TYPE_BOOLEAN,
+      [TREE_SHOW_ON] = G_TYPE_BOOLEAN,
     };
 
   return gtk_tree_store_newv(TREE_COUNT, types);
@@ -2100,6 +2111,28 @@ static void _set_iter_name(dt_lib_masks_t *lm,
     && live->off != NULL
     && !live->hide_enable_button;
 
+  // M2: see this module's mask filled over the photograph. the mask rows only,
+  // like the switch beside it, and only where there is a drawn mask to fill.
+  // NOT conditioned on the module being switched on: M2 note 7 steps the whole
+  // row back when it is, it does not empty it, and darktable itself does the
+  // same with the module's own indicator -- dt_iop_gui_set_enable_button()
+  // makes it insensitive, never absent. spelled out rather than derived from
+  // `power` above: the two cells sit side by side but a hidden enable button
+  // says nothing about whether a mask can be shown. blend_data is what the
+  // public call needs
+  const gboolean show = (live != NULL)
+    && !dt_is_valid_maskid(grid)
+    && live->blend_data != NULL
+    && (live->blend_params->mask_mode & DEVELOP_MASK_MASK);
+  // ... and whether it is the one on screen. at most one module carries the
+  // flag: dt_iop_gui_blending_lose_focus() clears it on the module losing the
+  // focus, so this is a radio the engine keeps, not one this panel enforces.
+  // a module that is off is stepped back here too: it renders no blend, so
+  // whatever it may still be requesting is not what is on the photograph
+  const gboolean show_on = show
+    && live->enabled
+    && (live->request_mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK);
+
   // the glyph is drawn exactly where the shape HAS an operator: inside a
   // group, past the base, with an operator bit set. that is the very test
   // _tree_operation() enforces, so what is shown is what can be changed.
@@ -2150,6 +2183,8 @@ static void _set_iter_name(dt_lib_masks_t *lm,
                      TREE_MODULE_OFF, moff,
                      TREE_MODULE_ON, !moff,
                      TREE_POWER, power,
+                     TREE_SHOW, show,
+                     TREE_SHOW_ON, show_on,
                      -1);
 
   g_free(target);
@@ -3060,7 +3095,9 @@ typedef enum dt_masks_op_hit_t
   DT_MASKS_OP_HIT_NONE = 0,  // not a clickable column, or nothing to say
   DT_MASKS_OP_HIT_BASE,      // the base: says why it has none, not clickable
   DT_MASKS_OP_HIT_OPERATOR,  // an operator a click may change
-  DT_MASKS_OP_HIT_POWER      // the module switch of a mask row
+  DT_MASKS_OP_HIT_POWER,     // the module switch of a mask row
+  DT_MASKS_OP_HIT_SHOW,      // the show-mask cell of a mask row
+  DT_MASKS_OP_HIT_SHOW_OFF   // ... whose module is off: says so, not clickable
 } dt_masks_op_hit_t;
 
 // the module a row's cell hands over, or nothing. `live` is the model column
@@ -3123,7 +3160,7 @@ static dt_masks_op_hit_t _op_cell_at_bin(dt_lib_masks_t *lm,
                                          dt_masks_state_t *state_out,
                                          dt_iop_module_t **module_out)
 {
-  if(!lm->op_col && !lm->power_col)
+  if(!lm->op_col && !lm->power_col && !lm->show_col)
     return DT_MASKS_OP_HIT_NONE;
 
   GtkTreeView *tv = GTK_TREE_VIEW(view);
@@ -3171,6 +3208,18 @@ static dt_masks_op_hit_t _op_cell_at_bin(dt_lib_masks_t *lm,
       hit = DT_MASKS_OP_HIT_POWER;
     }
   }
+  else if(model && path && column == lm->show_col)
+  {
+    dt_iop_module_t *m = _row_cell_module(model, path, TREE_SHOW);
+    if(m)
+    {
+      if(module_out) *module_out = m;
+      // a module that is switched off renders no blend, so its mask cannot be
+      // put on screen: the cell is there, stepped back, and says why rather
+      // than setting a request nothing would honour
+      hit = m->enabled ? DT_MASKS_OP_HIT_SHOW : DT_MASKS_OP_HIT_SHOW_OFF;
+    }
+  }
 
   if(path) gtk_tree_path_free(path);
   return hit;
@@ -3178,7 +3227,8 @@ static dt_masks_op_hit_t _op_cell_at_bin(dt_lib_masks_t *lm,
 
 // exactly the zone the click reacts to, and back to NULL as soon as we leave
 // it -- a cursor set on the bin window and never reset stays a hand over the
-// whole panel. the base gets no hand: nothing there acts.
+// whole panel. the base gets no hand, and neither does a show-mask cell whose
+// module is off: nothing there acts.
 // three zones now, one cursor: the operator glyph, the power switch and the
 // show-mask cell. they are the only cells in either list a click acts on
 static void _tree_motion_cb(GtkEventControllerMotion *controller,
@@ -3200,7 +3250,8 @@ static void _tree_motion_cb(GtkEventControllerMotion *controller,
   // cursor is a faithful record of what we last decided
   const dt_masks_op_hit_t hit = _op_cell_at_bin(lm, view, bx, by, NULL, NULL);
   const gboolean over = (hit == DT_MASKS_OP_HIT_OPERATOR)
-                     || (hit == DT_MASKS_OP_HIT_POWER);
+                     || (hit == DT_MASKS_OP_HIT_POWER)
+                     || (hit == DT_MASKS_OP_HIT_SHOW);
   if(over == (gdk_window_get_cursor(bin) != NULL)) return;
 
   if(over)
@@ -3360,6 +3411,17 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
       const gboolean on =
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(row_module->off));
       gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(row_module->off), !on);
+    }
+    // M2: see this mask filled over the photograph. one click, never a hover
+    // -- each toggle costs a pipe recompute.
+    // the known cost, and it is not a design choice: this takes the darkroom
+    // focus, so the cell of every other row goes out. develop/blend.c only
+    // honours a display request for the module that has the focus
+    else if(hit == DT_MASKS_OP_HIT_SHOW && row_module)
+    {
+      dt_iop_set_mask_display
+        (row_module,
+         !(row_module->request_mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK));
     }
     // if click on a blank space, then deselect all
     else if(!on_row)
@@ -3544,12 +3606,26 @@ static gboolean _tree_query_tooltip(GtkWidget *widget,
       g_free(line);
       g_free(name);
     }
+    else if(hit == DT_MASKS_OP_HIT_SHOW && row_module)
+    {
+      gtk_tooltip_set_text
+        (tooltip,
+         (row_module->request_mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK)
+           ? _("this mask is on screen\nclick to hide it")
+           : _("see this mask filled over the photograph\n"
+               "it takes the focus, so only one is shown at a time"));
+    }
+    else if(hit == DT_MASKS_OP_HIT_SHOW_OFF)
+      gtk_tooltip_set_text(tooltip,
+                           _("switch the module on to see its mask"));
 
     if(hit != DT_MASKS_OP_HIT_NONE)
     {
       // the hit names the column it came from, so there is nothing to look up
       GtkTreeViewColumn *hit_col = lm->op_col;
       if(hit == DT_MASKS_OP_HIT_POWER) hit_col = lm->power_col;
+      else if(hit == DT_MASKS_OP_HIT_SHOW
+              || hit == DT_MASKS_OP_HIT_SHOW_OFF) hit_col = lm->show_col;
       gtk_tree_view_set_tooltip_cell(tree_view, tooltip, path,
                                      hit_col, NULL);
       gtk_tree_path_free(path);
@@ -4643,6 +4719,33 @@ static void _build_masks_view(dt_lib_module_t *self,
                                        "visible", TREE_POWER);
     gtk_tree_view_column_add_attribute(d->power_col, renderer,
                                        "sensitive", TREE_MODULE_ON);
+
+    // M2 reads the row left to right and ends on the switch, with the
+    // show-mask cell just before it. INSERTED and not appended, at the index
+    // the switch built ten lines above now occupies: appending would put this
+    // to the right of it. counted rather than written down, so a column added
+    // before this block does not silently move it
+    d->show_col = gtk_tree_view_column_new();
+    gtk_tree_view_column_set_title(d->show_col, "show mask");
+    gtk_tree_view_column_set_sizing(d->show_col, GTK_TREE_VIEW_COLUMN_FIXED);
+    gtk_tree_view_column_set_fixed_width(d->show_col,
+                                         DT_PIXEL_APPLY_DPI(16));
+    gtk_tree_view_insert_column
+      (GTK_TREE_VIEW(view), d->show_col,
+       gtk_tree_view_get_n_columns(GTK_TREE_VIEW(view)) - 1);
+
+    // dtgtk_cairo_paint_showmask is the glyph the module's own header
+    // indicator draws (dt_iop_add_remove_mask_indicator), so the two ways to
+    // reach the same request are the same drawing. lit on the module whose
+    // mask is on screen, stepped back on the others -- the same polarity the
+    // switch beside it uses, and the same single renderer a paint cell that
+    // reads its own state makes possible
+    renderer = dtgtk_paint_cell_new(dtgtk_cairo_paint_showmask, 0, NULL);
+    gtk_tree_view_column_pack_start(d->show_col, renderer, FALSE);
+    gtk_tree_view_column_add_attribute(d->show_col, renderer,
+                                       "visible", TREE_SHOW);
+    gtk_tree_view_column_add_attribute(d->show_col, renderer,
+                                       "sensitive", TREE_SHOW_ON);
   }
 
   if(library)

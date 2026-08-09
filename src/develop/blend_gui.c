@@ -3415,7 +3415,16 @@ void dt_iop_gui_blending_lose_focus(dt_iop_module_t *module)
 
     // reprocess main center image if needed
     if(has_mask_display || suppress)
+    {
       dt_iop_refresh_center(module);
+      // the mask manager states on every mask row whether that module's mask
+      // is the one on screen, and the request was just dropped two dozen lines
+      // above. nothing else tells it: taking the focus ends in a selection
+      // change, which rebuilds no row. without this the row of the module that
+      // just lost the focus keeps saying its mask is displayed while the
+      // photograph no longer shows it
+      dt_dev_masks_list_update(module->dev);
+    }
   }
 }
 
