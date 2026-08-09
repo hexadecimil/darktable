@@ -1895,6 +1895,16 @@ treeview#delete-dialog:selected
   padding-left: 1em;
 }
 
+/* mask manager: the shape library stands on its own ground, one shade below the
+   masks above it. derived from the theme's background, like the dialog just
+   above, so light and dark follow -- and so do the four elegant-* themes, which
+   @import this file. :selected is deliberately not overridden: a selection must
+   keep looking like a selection here as it does everywhere else. */
+treeview#masks-library
+{
+  background-color: shade(@bg_color, 0.9);
+}
+
   /* set active menu items: needed for some Pango issues not rendering synthetic bold for all OS */
 .active_menu_item,
 .active_menu_item label

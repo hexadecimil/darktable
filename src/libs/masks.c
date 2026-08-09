@@ -54,6 +54,18 @@ static void _lib_masks_get_values(GtkTreeModel *model,
 static gboolean
 _update_foreach(GtkTreeModel *model, GtkTreePath *path, GtkTreeIter *iter, gpointer data);
 
+// three states, computed once per library row by _shape_scope() below
+typedef enum dt_masks_shape_scope_t
+{
+  DT_MASKS_SCOPE_MODULE = 0,  // at least one module renders it
+  DT_MASKS_SCOPE_GROUP_ONLY,  // only filed in groups no module renders
+  DT_MASKS_SCOPE_ORPHAN       // nothing references it at all
+} dt_masks_shape_scope_t;
+
+static dt_masks_shape_scope_t _shape_scope(const dt_mask_id_t formid,
+                                           char *groups,
+                                           const size_t groups_length);
+
 typedef struct dt_lib_masks_t
 {
   /* vbox with managed history items */
@@ -61,7 +73,24 @@ typedef struct dt_lib_masks_t
 #ifdef HAVE_AI
   GtkWidget *bt_object;
 #endif
-  GtkWidget *treeview;
+  // the manager shows two lists now. `treeview` holds the masks: the groups,
+  // with their members in the order they are applied. `library` holds the
+  // shapes, each exactly once, as itself -- where a shape is named, duplicated
+  // and deleted for good. a shape used by three modules is ONE library row and
+  // three mask rows. two views mean two stores and two selections, so
+  // everything that used to read "the" selection reads _masks_active_view()
+  GtkWidget *treeview, *library;
+  // the view the last selection change or right-click happened in. the context
+  // menu is built now and its entries read the selection back when they fire,
+  // so which list they act on has to be decided when the menu opens, once
+  GtkWidget *active_view;
+  // the library's column and name cell, so "rename" can open the in-place
+  // editor on the row the photographer pointed at
+  GtkTreeViewColumn *lib_col;
+  GtkCellRenderer *lib_name_cell;
+  // caption under the library, shown only when at least one shape is not
+  // linked to a module: it names exactly the set the cleanup is about
+  GtkWidget *lib_unlinked;
   dt_gui_collapsible_section_t cs;
   GtkWidget *property[DT_MASKS_PROPERTY_LAST];
   GtkWidget *pressure, *smoothing;
@@ -92,6 +121,22 @@ typedef struct dt_lib_masks_t
 } dt_lib_masks_t;
 
 static void _resize_update(dt_lib_masks_t *d);
+
+#define DT_MASKS_NVIEWS 2
+
+// 0 = the masks, 1 = the shape library. an index rather than two named fields
+// so that "do it to both" stays a one-line loop everywhere below
+static GtkWidget *_masks_view(dt_lib_masks_t *lm, const int v)
+{
+  return v == 0 ? lm->treeview : lm->library;
+}
+
+// the view an action applies to. pinned by every right-click before the menu
+// exists, and by every selection that is not a deselection
+static GtkWidget *_masks_active_view(dt_lib_masks_t *lm)
+{
+  return lm->active_view ? lm->active_view : lm->treeview;
+}
 
 const char *name(dt_lib_module_t *self)
 {
@@ -164,16 +209,29 @@ void expanded_state(dt_lib_module_t *self,
     */
 
     dt_lib_masks_t *lm = self->data;
-    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
-    GtkTreeModel *model = NULL;
-    GList *selected = gtk_tree_selection_get_selected_rows(selection, &model);
+
+    // the selection can be in either list; the module keeps its mask shown if
+    // what is selected -- wherever it is selected -- is used by that module.
+    // the list of rows was never freed here either
+    gboolean sel_used = FALSE;
+
+    for(int v = 0; v < DT_MASKS_NVIEWS; v++)
+    {
+      GtkWidget *view = _masks_view(lm, v);
+      if(!view) continue;
+
+      GtkTreeModel *model = NULL;
+      GList *selected = gtk_tree_selection_get_selected_rows
+        (gtk_tree_view_get_selection(GTK_TREE_VIEW(view)), &model);
+      if(selected && _selected_masks_are_used(model, selected, mod)) sel_used = TRUE;
+      g_list_free_full(selected, (GDestroyNotify)gtk_tree_path_free);
+    }
 
     if (!(mod
           && mod->enabled
           && (mod->blend_params->mask_mode & DEVELOP_MASK_MASK)
           && bd->masks_shown != DT_MASKS_EDIT_OFF
-          && selected
-          && _selected_masks_are_used(model, selected, mod)))
+          && sel_used))
     {
       dt_masks_change_form_gui(NULL);
       dt_control_queue_redraw_center();
@@ -210,8 +268,48 @@ typedef enum dt_masks_tree_cols_t
   // never persisted, and written by _set_iter_name only
   TREE_NUM,
   TREE_BASE,
+  // library rows only: one word when no module renders the shape, "" on every
+  // other row. derived like the two above, and written in the same single
+  // place, _set_iter_name -- which does walk dev->iop for it, but only on the
+  // rows that can carry it: the library holds one row per shape, nothing
+  // nested, and every other row in either store leaves before that walk
+  TREE_LINK,
   TREE_COUNT
 } dt_masks_tree_cols_t;
+
+// the store's column types, written once and indexed by the enum itself.
+// gtk_tree_store_new() takes a positional variadic list, which is a second list
+// to keep in step with dt_masks_tree_cols_t by hand: a mismatch there is a
+// runtime fault, not a build error -- and with more than one store the list
+// would have to be copied, which is exactly how two copies drift apart.
+// designated initializers remove both problems: adding a column is one line
+// next to the enum entry it belongs to, in one place.
+// filled on the spot rather than declared `static const`: GDK_TYPE_PIXBUF is a
+// function call, not a constant expression, so C will not let this be static
+// initializer data.
+static GtkTreeStore *_masks_store_new(void)
+{
+  GType types[TREE_COUNT] =
+    {
+      [TREE_TEXT] = G_TYPE_STRING,
+      [TREE_MODULE] = G_TYPE_POINTER,
+      [TREE_GROUPID] = G_TYPE_INT,
+      [TREE_FORMID] = G_TYPE_INT,
+      [TREE_EDITABLE] = G_TYPE_BOOLEAN,
+      [TREE_IC_OP] = GDK_TYPE_PIXBUF,
+      [TREE_IC_OP_VISIBLE] = G_TYPE_BOOLEAN,
+      [TREE_IC_INVERSE] = GDK_TYPE_PIXBUF,
+      [TREE_IC_INVERSE_VISIBLE] = G_TYPE_BOOLEAN,
+      [TREE_IC_USED] = GDK_TYPE_PIXBUF,
+      [TREE_IC_USED_VISIBLE] = G_TYPE_BOOLEAN,
+      [TREE_USED_TEXT] = G_TYPE_STRING,
+      [TREE_NUM] = G_TYPE_STRING,
+      [TREE_BASE] = G_TYPE_STRING,
+      [TREE_LINK] = G_TYPE_STRING,
+    };
+
+  return gtk_tree_store_newv(TREE_COUNT, types);
+}
 
 // boolean = TRUE renders as a checkbox; min/max/relative are unused
 const struct
@@ -756,6 +854,10 @@ static dt_iop_module_t *_mask_default_target(dt_lib_module_t *self)
   dt_lib_masks_t *lm = self->data;
   dt_iop_module_t *module = NULL;
 
+  // deliberately the masks view and not the active one: TREE_MODULE is only
+  // written on rows that belong to a module's mask, and the library is flat and
+  // module-less by construction -- reading its selection here would always
+  // answer NULL and silently demote rule 1 to rule 2
   GtkTreeModel *model = NULL;
   GList *selected = gtk_tree_selection_get_selected_rows
     (gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview)), &model);
@@ -1066,8 +1168,12 @@ static void _tree_group(GtkButton *button, dt_lib_module_t *self)
            g_list_length(darktable.develop->forms));
 
   // we add all selected forms to this group
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
-  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
+  // the list the menu was opened from: a grouping asked for in the library must
+  // not read the masks zone's selection, and the other way round
+  GtkWidget *view = _masks_active_view(lm);
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
+  GtkTreeSelection *selection =
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
 
   int pos = 0;
   GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
@@ -1235,6 +1341,20 @@ static void _set_iter_name(dt_lib_masks_t *lm,
     }
   }
 
+  // a library row -- the only row in either store that is a shape with no
+  // parent group, and the only place a shape exists as itself. what the "used"
+  // badge could never say is whether a module actually renders it: a word, not
+  // a colour and not a glyph, because it has to translate and to follow a theme
+  // change, which the pixbufs rasterised once in gui_init do not.
+  // the walk this costs is paid on library rows only, and dev->forms is the
+  // list a human drew by hand
+  const char *link = "";
+
+  if(!dt_is_valid_maskid(grid)
+     && !(form->type & DT_MASKS_GROUP)
+     && _shape_scope(form->formid, NULL, 0) != DT_MASKS_SCOPE_MODULE)
+    link = _("no module");
+
   const gboolean show = state & DT_MASKS_STATE_SHOW;
 
   GdkPixbuf *icop = NULL;
@@ -1258,6 +1378,7 @@ static void _set_iter_name(dt_lib_masks_t *lm,
                      TREE_TEXT, str,
                      TREE_NUM, num,
                      TREE_BASE, base,
+                     TREE_LINK, link,
                      TREE_IC_OP, icop,
                      TREE_IC_OP_VISIBLE, (icop != NULL) && show,
                      TREE_IC_INVERSE, icinv,
@@ -1286,8 +1407,12 @@ static void _tree_operation(GtkButton *button, gpointer user_data)
   dt_lib_masks_t *lm = self->data;
 
   // now we go through all selected nodes
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
-  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
+  // the list the menu was opened from: an operator change asked for in the
+  // library must not read the masks zone's selection, and the other way round
+  GtkWidget *view = _masks_active_view(lm);
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
+  GtkTreeSelection *selection =
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
   gboolean change = FALSE;
   GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
 
@@ -1363,9 +1488,13 @@ static void _tree_move_shape(dt_lib_module_t *self, const gboolean later)
 {
   dt_lib_masks_t *lm = self->data;
 
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
+  // rank and base only exist in the masks zone -- the library is flat and
+  // carries neither -- but the entry that leads here is only offered under
+  // `from_group`, so the view is read the same way as every other action
+  GtkWidget *view = _masks_active_view(lm);
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
   GtkTreeSelection *selection =
-    gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
   GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
   if(!items) return;
 
@@ -1419,6 +1548,56 @@ static void _tree_apply_later(GtkButton *button, dt_lib_module_t *self)
   _tree_move_shape(self, TRUE);
 }
 
+// dt_masks_form_remove() walks dev->iop and dev->forms, and nothing else
+// (src/develop/masks/masks.c): a shape deleted for good while it is also filed
+// in a group no module renders leaves a dt_masks_point_group_t behind, pointing
+// at an id that no longer resolves. nothing crashes -- _lib_masks_list_recurs
+// skips it through its `if(f)` -- but the group silently loses a member and the
+// xmp keeps the corpse. so a real deletion takes those references out itself.
+// only groups NO module renders are touched: a group a module renders is
+// dt_masks_form_remove()'s business, and pruning it here would change what that
+// module renders. a group no module renders produces no pixel, by definition,
+// so this changes nothing on screen -- and keeps the group coherent for the day
+// it is handed to a module.
+// a group left empty is deliberately kept: dropping it would mean removing a
+// form from dev->forms while walking it, an empty group is a state the manager
+// already displays, and "delete unused shapes" already collects it.
+static void _detach_from_unused_groups(const dt_mask_id_t formid)
+{
+  if(!dt_is_valid_maskid(formid)) return;
+
+  for(const GList *forms = darktable.develop->forms;
+      forms;
+      forms = g_list_next(forms))
+  {
+    dt_masks_form_t *grp = forms->data;
+    if(!(grp->type & DT_MASKS_GROUP)) continue;
+    // recursive: a sub-group nested in a module's mask answers MODULE here and
+    // is left alone, which is exactly what we want
+    if(_shape_scope(grp->formid, NULL, 0) == DT_MASKS_SCOPE_MODULE) continue;
+
+    GList *pts = grp->points;
+    while(pts)
+    {
+      GList *next = g_list_next(pts);
+      dt_masks_point_group_t *pt = pts->data;
+
+      if(pt->formid == formid)
+      {
+        // dropping the base of a group hands the base over, exactly as a move
+        // or a deletion inside a module's mask does
+        if(_group_point_index(grp, formid) == 0)
+          _handover_base_state(grp, _group_point_id(grp, 1), INVALID_MASKID);
+
+        grp->points = g_list_remove_link(grp->points, pts);
+        free(pt);
+        g_list_free_1(pts);
+      }
+      pts = next;
+    }
+  }
+}
+
 static void _tree_delete_shape(GtkButton *button, dt_lib_module_t *self)
 {
   dt_lib_masks_t *lm = self->data;
@@ -1426,8 +1605,12 @@ static void _tree_delete_shape(GtkButton *button, dt_lib_module_t *self)
   dt_masks_clear_form_gui(darktable.develop);
 
   // now we go through all selected nodes
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
-  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
+  // the list the menu was opened from: a deletion asked for in the library must
+  // not read the masks zone's selection, and the other way round
+  GtkWidget *view = _masks_active_view(lm);
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
+  GtkTreeSelection *selection =
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
   dt_iop_module_t *module = NULL;
 
   GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
@@ -1475,6 +1658,13 @@ static void _tree_delete_shape(GtkButton *button, dt_lib_module_t *self)
         _handover_base_state(pgrp, _group_point_id(pgrp, 1), INVALID_MASKID);
       gtk_tree_iter_free(prev_iter);
       gtk_tree_iter_free(next_iter);
+
+      // a row with no group is a real deletion, not a detach -- TREE_GROUPID is
+      // 0 on a root row, and that is the very test the menu used to choose
+      // between "delete everywhere" and "remove from <module>"
+      if(!dt_is_valid_maskid(grid))
+        _detach_from_unused_groups(id);
+
       dt_masks_form_remove(module, dt_masks_get_from_id(darktable.develop, grid),
                            dt_masks_get_from_id(darktable.develop, id));
     }
@@ -1490,8 +1680,12 @@ static void _tree_duplicate_shape(GtkButton *button, dt_lib_module_t *self)
   dt_lib_masks_t *lm = self->data;
 
   // we get the selected node
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
-  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
+  // the list the menu was opened from: a duplication asked for in the library
+  // must not read the masks zone's selection, and the other way round
+  GtkWidget *view = _masks_active_view(lm);
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
+  GtkTreeSelection *selection =
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
   GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
   if(!items) return;
   GtkTreePath *item = (GtkTreePath *)items->data;
@@ -1511,13 +1705,32 @@ static void _tree_duplicate_shape(GtkButton *button, dt_lib_module_t *self)
   g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
 }
 
+// a shape is named in one place -- its library row -- and nowhere else:
+// TREE_EDITABLE is (grp_id == 0), and a root row is a library row now. double
+// clicking still opens the editor; this entry is what makes it findable
+static void _tree_rename(GtkButton *button, dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
+  GtkWidget *view = _masks_active_view(lm);
+  if(view != lm->library || !lm->lib_col || !lm->lib_name_cell) return;
+
+  GList *items = gtk_tree_selection_get_selected_rows
+    (gtk_tree_view_get_selection(GTK_TREE_VIEW(view)), NULL);
+  if(!items) return;
+
+  gtk_tree_view_set_cursor_on_cell(GTK_TREE_VIEW(view), items->data,
+                                   lm->lib_col, lm->lib_name_cell, TRUE);
+  g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
+}
+
 static void _tree_cell_edited(GtkCellRendererText *cell,
                               gchar *path_string,
                               gchar *new_text,
-                              dt_lib_module_t *self)
+                              GtkWidget *view)
 {
-  dt_lib_masks_t *lm = self->data;
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
+  // the renderer belongs to one view; resolving the path against any other
+  // would rename whatever row happens to sit at the same index
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
   GtkTreeIter iter;
   if(!gtk_tree_model_get_iter_from_string(model, &iter, path_string)) return;
 
@@ -1541,13 +1754,36 @@ static void _tree_cell_edited(GtkCellRendererText *cell,
 static void _tree_selection_change(GtkTreeSelection *selection, dt_lib_masks_t *self)
 {
   DT_GUARD_GUI_UPDATE();
+
+  // gtk_tree_selection_get_tree_view() is the getter: no side table needed
+  GtkWidget *view = GTK_WIDGET(gtk_tree_selection_get_tree_view(selection));
+  const int nb = gtk_tree_selection_count_selected_rows(selection);
+
+  // two lists, one canvas: the list that just spoke owns both, the other one
+  // lets go. without this two rows stay highlighted and the last view to emit
+  // wins the canvas. the unselect comes straight back here and the guard above
+  // returns at once, so there is no loop -- and it happens BEFORE form_visible
+  // is rebuilt below, from this view only. a deselection claims nothing
+  if(nb > 0)
+  {
+    self->active_view = view;
+
+    DT_ENTER_GUI_UPDATE();
+    for(int v = 0; v < DT_MASKS_NVIEWS; v++)
+    {
+      GtkWidget *other = _masks_view(self, v);
+      if(other && other != view)
+        gtk_tree_selection_unselect_all
+          (gtk_tree_view_get_selection(GTK_TREE_VIEW(other)));
+    }
+    DT_LEAVE_GUI_UPDATE();
+  }
+
   // we reset all "show mask" icon of iops
   dt_masks_reset_show_masks_icons();
 
-  const int nb = gtk_tree_selection_count_selected_rows(selection);
-
   // else, we create a new form group with the selection and display it
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(self->treeview));
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
   dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
   GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
 
@@ -1659,11 +1895,367 @@ static int _shape_use_count(const dt_mask_id_t formid)
   return nb;
 }
 
-static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, double x, double y, dt_lib_module_t *self)
+// the context menu of a tree row, built at click. it was inline in
+// _tree_button_pressed_cb, which made that function 345 lines of which the
+// gesture handling was ten: the menu is one subject, the hit-testing of a click
+// is another, and the next changes to this panel touch one or the other, never
+// both. `view` is the list the click landed in -- the menu acts on that view's
+// selection and nothing else.
+// `mouse_path` is borrowed: valid for the call, freed by the caller, which is
+// where it was hit-tested and where it outlives this function. it used to be
+// freed here, on the one branch that reselects the row, and leaked on every
+// other click -- and now that the two sides live in different functions, who
+// frees it has to be written down rather than read off the code.
+static void _tree_context_menu(dt_lib_module_t *self,
+                               GtkWidget *view,
+                               GtkTreeSelection *selection,
+                               GtkTreeModel *model,
+                               GtkTreePath *mouse_path,
+                               const gboolean on_row,
+                               dt_iop_module_t *module)
 {
+  dt_lib_masks_t *lm = self->data;
+  GtkTreeIter iter;
+
+  GdkModifierType state;
+  gtk_get_current_event_state(&state);
+  // if we are already inside the selection, no change
+  if(on_row
+     && !gtk_tree_selection_path_is_selected(selection, mouse_path))
+  {
+    if(!dt_modifier_is(state, GDK_CONTROL_MASK))
+      gtk_tree_selection_unselect_all(selection);
+
+    gtk_tree_selection_select_path(selection, mouse_path);
+  }
+
+  // and we display the context-menu
+  GtkMenuShell *menu = GTK_MENU_SHELL(gtk_menu_new());
+  GtkWidget *item;
+
+  // we get all infos from selection
+  const int nb = gtk_tree_selection_count_selected_rows(selection);
+  gboolean from_group = FALSE;
+
+  // read from grp->points, not from the row's position: the base is index 0,
+  // the shape applied last is index n-1
+  gboolean is_base_row = FALSE;
+  gboolean is_last_applied = FALSE;
+  dt_masks_state_t selected_states = DT_MASKS_STATE_NONE;
+
+  // despite its name, grpid receives TREE_FORMID: the id of the selected
+  // row itself. parent_grid is the one holding TREE_GROUPID, i.e. the
+  // group that row belongs to (NO_MASKID for a top-level row)
+  int grpid = NO_MASKID;
+  dt_mask_id_t parent_grid = NO_MASKID;
+  // TREE_MODULE of the *selected* row -- unlike `module` above, which
+  // comes from the row under the pointer and is NULL on a blank click
+  dt_iop_module_t *sel_module = NULL;
+  int depth = 0;
+  dt_masks_form_t *grp = NULL;
+
+  if(nb > 0)
+  {
+    GList *selected = gtk_tree_selection_get_selected_rows(selection, NULL);
+    GtkTreePath *it0 = (GtkTreePath *)selected->data;
+    depth = gtk_tree_path_get_depth(it0);
+    if(nb == 1)
+    {
+      // before freeing the list of selected rows, we check if the
+      // form is a group or not
+      if(gtk_tree_model_get_iter(model, &iter, it0))
+      {
+        _lib_masks_get_values(model, &iter, &sel_module, &parent_grid, &grpid);
+        grp = dt_masks_get_from_id(darktable.develop, grpid);
+      }
+
+      // where the selected row sits in its group's application order. the
+      // base is the one shape that must not be given an operator, and the two
+      // ends of the list are the ones that cannot move any further. computed
+      // for a single selection only. parent_grid holds TREE_GROUPID and grpid
+      // holds TREE_FORMID -- a root row has parent_grid == NO_MASKID, so its
+      // rank is -1 and both flags stay FALSE
+      dt_masks_form_t *parent_grp =
+        dt_masks_get_from_id(darktable.develop, parent_grid);
+      const int rank = _group_point_index(parent_grp, grpid);
+      const int nb_points = (parent_grp && (parent_grp->type & DT_MASKS_GROUP))
+        ? (int)g_list_length(parent_grp->points) : 0;
+
+      is_base_row = (rank == 0);
+      is_last_applied = (rank >= 0) && (rank == nb_points - 1);
+    }
+
+    for(const GList *items_iter = selected;
+        items_iter;
+        items_iter = g_list_next(items_iter))
+    {
+      GtkTreePath *item = (GtkTreePath *)items_iter->data;
+
+      if(gtk_tree_model_get_iter(model, &iter, item))
+      {
+        dt_mask_id_t grid = INVALID_MASKID;
+        dt_mask_id_t id = INVALID_MASKID;
+        _lib_masks_get_values(model, &iter, NULL, &grid, &id);
+
+        dt_masks_form_t *grp2 = dt_masks_get_from_id(darktable.develop, grid);
+        if(grp2 && (grp2->type & DT_MASKS_GROUP))
+        {
+          for(const GList *pts = grp2->points; pts; pts = g_list_next(pts))
+          {
+            dt_masks_point_group_t *pt = pts->data;
+            if(pt->formid == id) selected_states |= pt->state;
+          }
+        }
+      }
+    }
+
+    g_list_free_full(selected, (GDestroyNotify)gtk_tree_path_free);
+  }
+
+  if(depth > 1)
+    from_group = TRUE;
+
+  if(nb == 0 || (grp && grp->type & DT_MASKS_GROUP))
+  {
+    // right-clicking inside a module's group is itself the answer to "which
+    // module?": no target line, we already know. a right-click on empty space
+    // answers nothing, so the target is resolved and then written down,
+    // exactly as the catalogue does it
+    dt_iop_module_t *ctx = _mask_target_ok(sel_module) ? sel_module : NULL;
+    if(!ctx)
+    {
+      ctx = _mask_default_target(self);
+      _new_mask_target_header(menu, ctx);
+    }
+    _new_mask_shape_items(menu, ctx);
+  }
+
+  if(grp && grp->type & DT_MASKS_GROUP)
+  {
+    // existing forms
+    gboolean has_unused_shapes = FALSE;
+    GtkWidget *menu0 = gtk_menu_new();
+
+    for(GList *forms = darktable.develop->forms;
+        forms;
+        forms = g_list_next(forms))
+    {
+      dt_masks_form_t *form = forms->data;
+      if((form->type & (DT_MASKS_CLONE|DT_MASKS_NON_CLONE)) || form->formid == grpid)
+      {
+        continue;
+      }
+      char str[10000] = "";
+      g_strlcat(str, form->name, sizeof(str));
+      int nbuse = 0;
+
+      // we search were this form is used
+      for(const GList *modules = darktable.develop->iop;
+          modules;
+          modules = g_list_next(modules))
+      {
+        dt_iop_module_t *m = modules->data;
+        dt_masks_form_t *grp = dt_masks_get_from_id(m->dev, m->blend_params->mask_id);
+        if(grp && (grp->type & DT_MASKS_GROUP))
+        {
+          for(const GList *pts = grp->points; pts; pts = g_list_next(pts))
+          {
+            dt_masks_point_group_t *pt = pts->data;
+            if(pt->formid == form->formid)
+            {
+              if(m == module)
+              {
+                nbuse = -1;
+                break;
+              }
+              if(nbuse == 0) g_strlcat(str, " (", sizeof(str));
+              g_strlcat(str, " ", sizeof(str));
+              gchar *module_label = dt_history_item_get_name(m);
+              g_strlcat(str, module_label, sizeof(str));
+              g_free(module_label);
+              nbuse++;
+            }
+          }
+        }
+      }
+      if(nbuse != -1)
+      {
+        if(nbuse > 0) g_strlcat(str, " )", sizeof(str));
+
+        // we add the menu entry
+        item = gtk_menu_item_new_with_label(str);
+        g_object_set_data(G_OBJECT(item), "formid", GUINT_TO_POINTER(form->formid));
+        g_object_set_data(G_OBJECT(item), "module", module);
+        g_signal_connect(G_OBJECT(item), "activate", G_CALLBACK(_tree_add_exist), grp);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu0), item);
+        has_unused_shapes = TRUE;
+      }
+    }
+
+    if(has_unused_shapes)
+    {
+      item = gtk_menu_item_new_with_label(_("add existing shape"));
+      gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), menu0);
+      gtk_menu_shell_append(menu, item);
+    }
+  }
+
+  if(!from_group && nb > 0)
+  {
+    dt_masks_form_t *grp = dt_masks_get_from_id(darktable.develop, grpid);
+    if(!(grp && (grp->type & DT_MASKS_GROUP)))
+    {
+      if(nb == 1)
+      {
+        // a root row is a library row: the masks zone only holds groups at
+        // depth 1. renaming is only offered where a shape has a name of its
+        // own, and only there is TREE_EDITABLE true
+        if(view == lm->library)
+        {
+          item = gtk_menu_item_new_with_label(_("rename"));
+          g_signal_connect(item, "activate", G_CALLBACK(_tree_rename), self);
+          gtk_menu_shell_append(menu, item);
+        }
+
+        item = gtk_menu_item_new_with_label(_("duplicate this shape"));
+        g_signal_connect(item, "activate", G_CALLBACK(_tree_duplicate_shape), self);
+        gtk_menu_shell_append(menu, item);
+      }
+      // this does not only remove the row: the shape is dropped from
+      // every module using it. say so, and say how many modules are
+      // concerned -- but only when that number is both defined and
+      // meaningful. it is computed for a single selection only, and a
+      // multiple selection may mix shapes and groups, so every other
+      // case keeps the historical wording rather than claiming a scope
+      // that cannot be backed
+      const int used = (nb == 1) ? _shape_use_count(grpid) : 0;
+
+      if(used > 0)
+      {
+        gchar *label =
+          g_strdup_printf(ngettext("delete everywhere (%d module)",
+                                   "delete everywhere (%d modules)", used), used);
+        item = gtk_menu_item_new_with_label(label);
+        g_free(label);
+      }
+      else
+        item = gtk_menu_item_new_with_label(_("delete this shape"));
+
+      g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
+      gtk_menu_shell_append(menu, item);
+    }
+    else
+    {
+      item = gtk_menu_item_new_with_label(_("delete group (shapes are kept)"));
+      g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
+      gtk_menu_shell_append(menu, item);
+    }
+  }
+  else if(nb > 0 && depth < 3)
+  {
+    // here the shape is only detached from the group of that row: it
+    // stays in the mask manager and in every other module. name the
+    // group we are leaving so the difference with a deletion is
+    // readable. parent_grid and sel_module are only filled for a single
+    // selection, so anything else falls back to the plain wording
+    dt_masks_form_t *parent = dt_masks_get_from_id(darktable.develop, parent_grid);
+    gchar *scope = NULL;
+
+    if(parent)
+    {
+      // a group owned by a module is already named after it
+      // ("group `exposure'"), the plain module name reads better here
+      if(sel_module && parent->formid == sel_module->blend_params->mask_id)
+        scope = dt_history_item_get_name(sel_module);
+      else if(*parent->name)
+        scope = g_strdup(parent->name);
+    }
+
+    if(scope)
+    {
+      gchar *label = g_strdup_printf(_("remove from %s"), scope);
+      item = gtk_menu_item_new_with_label(label);
+      g_free(label);
+      g_free(scope);
+    }
+    else
+      item = gtk_menu_item_new_with_label(_("remove from group"));
+
+    g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
+    gtk_menu_shell_append(menu, item);
+  }
+
+  if(nb > 1 && !from_group)
+  {
+    gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+    item = gtk_menu_item_new_with_label(_("group the forms"));
+    g_signal_connect(item, "activate", G_CALLBACK(_tree_group), self);
+    gtk_menu_shell_append(menu, item);
+  }
+
+  if(from_group && depth < 3)
+  {
+    gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+    _add_tree_operation(menu, _("use inverted shape"),
+                        DT_MASKS_STATE_INVERSE, selected_states, TRUE);
+
+    gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+    _add_tree_operation(menu, _("mode: union"),
+                        DT_MASKS_STATE_UNION, selected_states, !is_base_row);
+    _add_tree_operation(menu, _("mode: intersection"),
+                        DT_MASKS_STATE_INTERSECTION, selected_states, !is_base_row);
+    _add_tree_operation(menu, _("mode: difference"),
+                        DT_MASKS_STATE_DIFFERENCE, selected_states, !is_base_row);
+    _add_tree_operation(menu, _("mode: sum"),
+                        DT_MASKS_STATE_SUM, selected_states, !is_base_row);
+    _add_tree_operation(menu, _("mode: exclusion"),
+                        DT_MASKS_STATE_EXCLUSION, selected_states, !is_base_row);
+
+    gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+    // this is time, not space: the list is the order the shapes are applied
+    // in. offered for a single row only -- see _tree_move_shape
+    item = gtk_menu_item_new_with_label(_("apply earlier"));
+    gtk_widget_set_sensitive(item, nb == 1 && !is_base_row);
+    g_signal_connect(item, "activate", G_CALLBACK(_tree_apply_earlier), self);
+    gtk_menu_shell_append(menu, item);
+
+    item = gtk_menu_item_new_with_label(_("apply later"));
+    gtk_widget_set_sensitive(item, nb == 1 && !is_last_applied);
+    g_signal_connect(item, "activate", G_CALLBACK(_tree_apply_later), self);
+    gtk_menu_shell_append(menu, item);
+  }
+
+  gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+  item = gtk_menu_item_new_with_label(_("delete unused shapes"));
+  g_signal_connect(item, "activate", G_CALLBACK(_tree_cleanup), self);
+  gtk_menu_shell_append(menu, item);
+
+  gtk_widget_show_all(GTK_WIDGET(menu));
+
+  GdkEvent *event = gtk_get_current_event();
+  gtk_menu_popup_at_pointer(GTK_MENU(menu), event);
+  gdk_event_free(event);
+}
+
+// what the click hit, and with which button -- nothing else. the right button
+// hands over to _tree_context_menu() above; everything that used to be built
+// here is there now
+static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
+                                    int n_press,
+                                    double x,
+                                    double y,
+                                    dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
   GtkWidget *treeview = dt_gui_get_widget(gesture);
+  // the menu is built now and its entries read the selection back when they
+  // fire: point them at the list the menu was opened on. a right-click inside
+  // an existing selection never reaches _tree_selection_change, so it is set
+  // here too, and before anything can pop up
+  lm->active_view = treeview;
   // we first need to adjust selection
-  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(treeview));
+  GtkTreeSelection *selection =
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(treeview));
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(treeview));
 
   GtkTreePath *mouse_path = NULL;
@@ -1681,6 +2273,7 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
       _lib_masks_get_values(model, &iter, &module, NULL, NULL);
     }
   }
+
   /* single click with the right mouse button? */
   const guint button = gtk_gesture_single_get_current_button(gesture);
   if(button == GDK_BUTTON_PRIMARY)
@@ -1693,316 +2286,13 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture, int n_press, doub
   }
   else if(button == GDK_BUTTON_SECONDARY)
   {
-    GdkModifierType state;
-    gtk_get_current_event_state(&state);
-    // if we are already inside the selection, no change
-    if(on_row
-       && !gtk_tree_selection_path_is_selected(selection, mouse_path))
-    {
-      if(!dt_modifier_is(state, GDK_CONTROL_MASK))
-        gtk_tree_selection_unselect_all(selection);
-
-      gtk_tree_selection_select_path(selection, mouse_path);
-      gtk_tree_path_free(mouse_path);
-    }
-
-    // and we display the context-menu
-    GtkMenuShell *menu = GTK_MENU_SHELL(gtk_menu_new());
-    GtkWidget *item;
-
-    // we get all infos from selection
-    const int nb = gtk_tree_selection_count_selected_rows(selection);
-    gboolean from_group = FALSE;
-
-    // read from grp->points, not from the row's position: the base is index 0,
-    // the shape applied last is index n-1
-    gboolean is_base_row = FALSE;
-    gboolean is_last_applied = FALSE;
-    dt_masks_state_t selected_states = DT_MASKS_STATE_NONE;
-
-    // despite its name, grpid receives TREE_FORMID: the id of the selected
-    // row itself. parent_grid is the one holding TREE_GROUPID, i.e. the
-    // group that row belongs to (NO_MASKID for a top-level row)
-    int grpid = NO_MASKID;
-    dt_mask_id_t parent_grid = NO_MASKID;
-    // TREE_MODULE of the *selected* row -- unlike `module` above, which
-    // comes from the row under the pointer and is NULL on a blank click
-    dt_iop_module_t *sel_module = NULL;
-    int depth = 0;
-    dt_masks_form_t *grp = NULL;
-
-    if(nb > 0)
-    {
-      GList *selected = gtk_tree_selection_get_selected_rows(selection, NULL);
-      GtkTreePath *it0 = (GtkTreePath *)selected->data;
-      depth = gtk_tree_path_get_depth(it0);
-      if(nb == 1)
-      {
-        // before freeing the list of selected rows, we check if the
-        // form is a group or not
-        if(gtk_tree_model_get_iter(model, &iter, it0))
-        {
-          _lib_masks_get_values(model, &iter, &sel_module, &parent_grid, &grpid);
-          grp = dt_masks_get_from_id(darktable.develop, grpid);
-        }
-
-        // where the selected row sits in its group's application order. the
-        // base is the one shape that must not be given an operator, and the two
-        // ends of the list are the ones that cannot move any further. computed
-        // for a single selection only. parent_grid holds TREE_GROUPID and grpid
-        // holds TREE_FORMID -- a root row has parent_grid == NO_MASKID, so its
-        // rank is -1 and both flags stay FALSE
-        dt_masks_form_t *parent_grp =
-          dt_masks_get_from_id(darktable.develop, parent_grid);
-        const int rank = _group_point_index(parent_grp, grpid);
-        const int nb_points = (parent_grp && (parent_grp->type & DT_MASKS_GROUP))
-          ? (int)g_list_length(parent_grp->points) : 0;
-
-        is_base_row = (rank == 0);
-        is_last_applied = (rank >= 0) && (rank == nb_points - 1);
-      }
-
-      for(const GList *items_iter = selected;
-          items_iter;
-          items_iter = g_list_next(items_iter))
-      {
-        GtkTreePath *item = (GtkTreePath *)items_iter->data;
-
-        if(gtk_tree_model_get_iter(model, &iter, item))
-        {
-          dt_mask_id_t grid = INVALID_MASKID;
-          dt_mask_id_t id = INVALID_MASKID;
-          _lib_masks_get_values(model, &iter, NULL, &grid, &id);
-
-          dt_masks_form_t *grp2 = dt_masks_get_from_id(darktable.develop, grid);
-          if(grp2 && (grp2->type & DT_MASKS_GROUP))
-          {
-            for(const GList *pts = grp2->points; pts; pts = g_list_next(pts))
-            {
-              dt_masks_point_group_t *pt = pts->data;
-              if(pt->formid == id) selected_states |= pt->state;
-            }
-          }
-        }
-      }
-
-      g_list_free_full(selected, (GDestroyNotify)gtk_tree_path_free);
-    }
-
-    if(depth > 1)
-      from_group = TRUE;
-
-    if(nb == 0 || (grp && grp->type & DT_MASKS_GROUP))
-    {
-      // right-clicking inside a module's group is itself the answer to "which
-      // module?": no target line, we already know. a right-click on empty space
-      // answers nothing, so the target is resolved and then written down,
-      // exactly as the catalogue does it
-      dt_iop_module_t *ctx = _mask_target_ok(sel_module) ? sel_module : NULL;
-      if(!ctx)
-      {
-        ctx = _mask_default_target(self);
-        _new_mask_target_header(menu, ctx);
-      }
-      _new_mask_shape_items(menu, ctx);
-    }
-
-    if(grp && grp->type & DT_MASKS_GROUP)
-    {
-      // existing forms
-      gboolean has_unused_shapes = FALSE;
-      GtkWidget *menu0 = gtk_menu_new();
-
-      for(GList *forms = darktable.develop->forms;
-          forms;
-          forms = g_list_next(forms))
-      {
-        dt_masks_form_t *form = forms->data;
-        if((form->type & (DT_MASKS_CLONE|DT_MASKS_NON_CLONE)) || form->formid == grpid)
-        {
-          continue;
-        }
-        char str[10000] = "";
-        g_strlcat(str, form->name, sizeof(str));
-        int nbuse = 0;
-
-        // we search were this form is used
-        for(const GList *modules = darktable.develop->iop;
-            modules;
-            modules = g_list_next(modules))
-        {
-          dt_iop_module_t *m = modules->data;
-          dt_masks_form_t *grp = dt_masks_get_from_id(m->dev, m->blend_params->mask_id);
-          if(grp && (grp->type & DT_MASKS_GROUP))
-          {
-            for(const GList *pts = grp->points; pts; pts = g_list_next(pts))
-            {
-              dt_masks_point_group_t *pt = pts->data;
-              if(pt->formid == form->formid)
-              {
-                if(m == module)
-                {
-                  nbuse = -1;
-                  break;
-                }
-                if(nbuse == 0) g_strlcat(str, " (", sizeof(str));
-                g_strlcat(str, " ", sizeof(str));
-                gchar *module_label = dt_history_item_get_name(m);
-                g_strlcat(str, module_label, sizeof(str));
-                g_free(module_label);
-                nbuse++;
-              }
-            }
-          }
-        }
-        if(nbuse != -1)
-        {
-          if(nbuse > 0) g_strlcat(str, " )", sizeof(str));
-
-          // we add the menu entry
-          item = gtk_menu_item_new_with_label(str);
-          g_object_set_data(G_OBJECT(item), "formid", GUINT_TO_POINTER(form->formid));
-          g_object_set_data(G_OBJECT(item), "module", module);
-          g_signal_connect(G_OBJECT(item), "activate", G_CALLBACK(_tree_add_exist), grp);
-          gtk_menu_shell_append(GTK_MENU_SHELL(menu0), item);
-          has_unused_shapes = TRUE;
-        }
-      }
-
-      if(has_unused_shapes)
-      {
-        item = gtk_menu_item_new_with_label(_("add existing shape"));
-        gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), menu0);
-        gtk_menu_shell_append(menu, item);
-      }
-    }
-
-    if(!from_group && nb > 0)
-    {
-      dt_masks_form_t *grp = dt_masks_get_from_id(darktable.develop, grpid);
-      if(!(grp && (grp->type & DT_MASKS_GROUP)))
-      {
-        if(nb == 1)
-        {
-          item = gtk_menu_item_new_with_label(_("duplicate this shape"));
-          g_signal_connect(item, "activate", G_CALLBACK(_tree_duplicate_shape), self);
-          gtk_menu_shell_append(menu, item);
-        }
-        // this does not only remove the row: the shape is dropped from
-        // every module using it. say so, and say how many modules are
-        // concerned -- but only when that number is both defined and
-        // meaningful. it is computed for a single selection only, and a
-        // multiple selection may mix shapes and groups, so every other
-        // case keeps the historical wording rather than claiming a scope
-        // that cannot be backed
-        const int used = (nb == 1) ? _shape_use_count(grpid) : 0;
-
-        if(used > 0)
-        {
-          gchar *label =
-            g_strdup_printf(ngettext("delete everywhere (%d module)",
-                                     "delete everywhere (%d modules)", used), used);
-          item = gtk_menu_item_new_with_label(label);
-          g_free(label);
-        }
-        else
-          item = gtk_menu_item_new_with_label(_("delete this shape"));
-
-        g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
-        gtk_menu_shell_append(menu, item);
-      }
-      else
-      {
-        item = gtk_menu_item_new_with_label(_("delete group (shapes are kept)"));
-        g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
-        gtk_menu_shell_append(menu, item);
-      }
-    }
-    else if(nb > 0 && depth < 3)
-    {
-      // here the shape is only detached from the group of that row: it
-      // stays in the mask manager and in every other module. name the
-      // group we are leaving so the difference with a deletion is
-      // readable. parent_grid and sel_module are only filled for a single
-      // selection, so anything else falls back to the plain wording
-      dt_masks_form_t *parent = dt_masks_get_from_id(darktable.develop, parent_grid);
-      gchar *scope = NULL;
-
-      if(parent)
-      {
-        // a group owned by a module is already named after it
-        // ("group `exposure'"), the plain module name reads better here
-        if(sel_module && parent->formid == sel_module->blend_params->mask_id)
-          scope = dt_history_item_get_name(sel_module);
-        else if(*parent->name)
-          scope = g_strdup(parent->name);
-      }
-
-      if(scope)
-      {
-        gchar *label = g_strdup_printf(_("remove from %s"), scope);
-        item = gtk_menu_item_new_with_label(label);
-        g_free(label);
-        g_free(scope);
-      }
-      else
-        item = gtk_menu_item_new_with_label(_("remove from group"));
-
-      g_signal_connect(item, "activate", G_CALLBACK(_tree_delete_shape), self);
-      gtk_menu_shell_append(menu, item);
-    }
-
-    if(nb > 1 && !from_group)
-    {
-      gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-      item = gtk_menu_item_new_with_label(_("group the forms"));
-      g_signal_connect(item, "activate", G_CALLBACK(_tree_group), self);
-      gtk_menu_shell_append(menu, item);
-    }
-
-    if(from_group && depth < 3)
-    {
-      gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-      _add_tree_operation(menu, _("use inverted shape"),
-                          DT_MASKS_STATE_INVERSE, selected_states, TRUE);
-
-      gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-      _add_tree_operation(menu, _("mode: union"),
-                          DT_MASKS_STATE_UNION, selected_states, !is_base_row);
-      _add_tree_operation(menu, _("mode: intersection"),
-                          DT_MASKS_STATE_INTERSECTION, selected_states, !is_base_row);
-      _add_tree_operation(menu, _("mode: difference"),
-                          DT_MASKS_STATE_DIFFERENCE, selected_states, !is_base_row);
-      _add_tree_operation(menu, _("mode: sum"),
-                          DT_MASKS_STATE_SUM, selected_states, !is_base_row);
-      _add_tree_operation(menu, _("mode: exclusion"),
-                          DT_MASKS_STATE_EXCLUSION, selected_states, !is_base_row);
-
-      gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-      // this is time, not space: the list is the order the shapes are applied
-      // in. offered for a single row only -- see _tree_move_shape
-      item = gtk_menu_item_new_with_label(_("apply earlier"));
-      gtk_widget_set_sensitive(item, nb == 1 && !is_base_row);
-      g_signal_connect(item, "activate", G_CALLBACK(_tree_apply_earlier), self);
-      gtk_menu_shell_append(menu, item);
-
-      item = gtk_menu_item_new_with_label(_("apply later"));
-      gtk_widget_set_sensitive(item, nb == 1 && !is_last_applied);
-      g_signal_connect(item, "activate", G_CALLBACK(_tree_apply_later), self);
-      gtk_menu_shell_append(menu, item);
-    }
-
-    gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-    item = gtk_menu_item_new_with_label(_("delete unused shapes"));
-    g_signal_connect(item, "activate", G_CALLBACK(_tree_cleanup), self);
-    gtk_menu_shell_append(menu, item);
-
-    gtk_widget_show_all(GTK_WIDGET(menu));
-
-    GdkEvent *event = gtk_get_current_event();
-    gtk_menu_popup_at_pointer(GTK_MENU(menu), event);
-    gdk_event_free(event);
+    _tree_context_menu(self, treeview, selection, model,
+                       mouse_path, on_row, module);
   }
+
+  // ours since gtk_tree_view_get_path_at_pos succeeded, on every button and
+  // whatever the menu did with it -- the menu only borrows it
+  if(mouse_path) gtk_tree_path_free(mouse_path);
 }
 
 static gboolean _tree_restrict_select(GtkTreeSelection *selection,
@@ -2069,10 +2359,16 @@ static gboolean _tree_query_tooltip(GtkWidget *widget,
                                         keyboard_tip, &model, &path, &iter))
     return FALSE;
 
-  gtk_tree_model_get(model, &iter, TREE_IC_USED_VISIBLE, &show, TREE_USED_TEXT, &tmp, -1);
+  gtk_tree_model_get(model, &iter, TREE_USED_TEXT, &tmp, -1);
+  // it used to be tied to the "used" badge being visible, so the one row that
+  // most needs a word -- a shape nothing references -- was the one row that
+  // stayed silent
+  show = tmp && *tmp;
   if(show)
   {
-    gtk_tooltip_set_markup(tooltip, tmp);
+    // plain text, not markup: this string carries group names typed by the
+    // photographer, and a single "&" in one of them blanked the whole tooltip
+    gtk_tooltip_set_text(tooltip, tmp);
     gtk_tree_view_set_tooltip_row(tree_view, tooltip, path);
   }
 
@@ -2122,6 +2418,68 @@ static void _is_form_used(const dt_mask_id_t formid,
   }
 }
 
+// three states -- and three meanings of "used" already live in this file, none
+// of which coincide:
+//   _shape_use_count()      counts MODULES exactly the way dt_masks_form_remove()
+//                           walks them: NOT recursive, and it must stay that way,
+//                           it backs the "delete everywhere (n modules)" label.
+//   _is_form_used()         counts memberships in ANY group of dev->forms,
+//                           stand-alone groups included. it feeds the "used"
+//                           badge and its tooltip, and is left untouched.
+//   _masks_cleanup_unused() keeps whatever is reachable, recursively, from a
+//                           history item's blend_params->mask_id.
+// the split a library row needs is "does a module render this", so MODULE is
+// answered by dt_masks_is_in_module(), which IS recursive: _shape_use_count()
+// misses a shape buried in a sub-group of a module's mask and would call a
+// rendered shape unlinked.
+// the union of the two other states is what "delete unused shapes" is about,
+// which is why the caption under the library says "not linked to a module" and
+// never "unused": a shape sitting in a stand-alone group is not unused, and the
+// cleanup takes it away all the same.
+// `groups`, when given, receives the group names behind a GROUP_ONLY verdict.
+// deliberately not cached, though a rebuild asks this of each shape four times:
+// twice in gui_update's two-pass ordering, once in _lib_masks_list_recurs for
+// the tooltip, once in _set_iter_name for the word on the row. each call walks
+// dev->iop and then, on failure, dev->forms -- a few hundred pointer
+// comparisons over lists a human drew by hand, against a rebuild that only
+// happens when the structure changed. a cache would have to be invalidated
+// wherever a module's mask_id or a group's contents move, which is the kind of
+// bookkeeping that goes stale in silence and shows a wrong word on the row.
+static dt_masks_shape_scope_t _shape_scope(const dt_mask_id_t formid,
+                                           char *groups,
+                                           const size_t groups_length)
+{
+  if(groups && groups_length) groups[0] = '\0';
+  if(!dt_is_valid_maskid(formid)) return DT_MASKS_SCOPE_ORPHAN;
+
+  for(const GList *modules = darktable.develop->iop;
+      modules;
+      modules = g_list_next(modules))
+  {
+    dt_iop_module_t *m = modules->data;
+    if((m->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
+       && !(m->flags() & IOP_FLAGS_NO_MASKS)
+       && dt_masks_is_in_module(formid, m))
+      return DT_MASKS_SCOPE_MODULE;
+  }
+
+  // no module renders it. is it filed anywhere at all? _is_form_used walks every
+  // group of dev->forms, stand-alone ones included -- which is what makes it the
+  // wrong answer to the module question and the right one to this one. it counts
+  // a nested group twice; we only read "> 0", so that long-standing quirk cannot
+  // reach the screen through here
+  char str[1000] = "";
+  int nb = 0;
+  _is_form_used(formid, NULL, str, sizeof(str), &nb);
+
+  if(nb > 0)
+  {
+    if(groups) g_strlcpy(groups, str, groups_length);
+    return DT_MASKS_SCOPE_GROUP_ONLY;
+  }
+  return DT_MASKS_SCOPE_ORPHAN;
+}
+
 static void _lib_masks_list_recurs(GtkTreeStore *treestore,
                                    GtkTreeIter *toplevel,
                                    dt_masks_form_t *form,
@@ -2158,10 +2516,39 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
 
   char str2[1000] = "";
   int nbuse = 0;
+
   if(grp_id == 0)
   {
+    // the "used" badge and its tooltip keep their historical meaning, quirks
+    // included: this shape is filed in at least one group, here are their names
     _is_form_used(form->formid, NULL, str2, sizeof(str2), &nbuse);
     if(nbuse > 0) icuse = lm->ic_used;
+
+    if(!(form->type & DT_MASKS_GROUP))
+    {
+      // a library row. the word itself goes in TREE_LINK, written by
+      // _set_iter_name like every other derived column; what is settled here is
+      // the sentence behind it, which needs the names of the groups holding the
+      // shape and so cannot be had from the scope alone. short on the row,
+      // spelled out under the list and in this tooltip: a library where every
+      // row carries a sentence is a library nobody reads
+      char groups[1000] = "";
+      const dt_masks_shape_scope_t scope =
+        _shape_scope(form->formid, groups, sizeof(groups));
+
+      if(scope != DT_MASKS_SCOPE_MODULE)
+      {
+        if(scope == DT_MASKS_SCOPE_GROUP_ONLY)
+          // "unused" would be a lie in one direction and a trap in the other:
+          // no module renders it, yet the group holding it is real
+          snprintf(str2, sizeof(str2),
+                   _("no module uses this shape\n"
+                     "it is only filed in:\n%s"), groups);
+        else
+          g_strlcpy(str2, _("no module and no group uses this shape"),
+                    sizeof(str2));
+      }
+    }
   }
 
   if(!(form->type & DT_MASKS_GROUP))
@@ -2179,22 +2566,11 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
     }
     else
     {
-      // skip all groups first
-      GtkTreeModel *model = GTK_TREE_MODEL(treestore);
-      int pos = 0;
-      GtkTreeIter iter;
-
-      if(gtk_tree_model_get_iter_first(model, &iter))
-      {
-        do
-        {
-          if(gtk_tree_model_iter_has_child(model, &iter))
-            ++pos;
-        } while(gtk_tree_model_iter_next(model, &iter));
-      }
-
-      // insert the child immediately after the last group
-      gtk_tree_store_insert(treestore, &child, NULL, pos);
+      // the library store holds shapes and nothing else, so there is no run of
+      // groups to step over any more: rows land in the order gui_update feeds
+      // them, the ones a module renders first. the block that counted leading
+      // group rows went out with the groups
+      gtk_tree_store_append(treestore, &child, NULL);
     }
 
     gtk_tree_store_set(treestore, &child,
@@ -2302,14 +2678,17 @@ gboolean _find_mask_iter_by_values(GtkTreeModel *model,
   return FALSE;
 }
 
-GList *_lib_masks_get_selected(dt_lib_module_t *self)
+GList *_lib_masks_get_selected(GtkWidget *view)
 {
   GList *res = NULL;
-  dt_lib_masks_t *lm = self->data;
 
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
+  // a selection belongs to one view: saved from that view, restored into that
+  // view's new store. carrying a row over to the other list would answer a
+  // different question than the one that was asked
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
 
-  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
+  GtkTreeSelection *selection =
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
 
   GList *items = gtk_tree_selection_get_selected_rows(selection, &model);
 
@@ -2335,6 +2714,46 @@ GList *_lib_masks_get_selected(dt_lib_module_t *self)
   g_list_free(items);
 
   return res;
+}
+
+// consumes `selectids` (triples module/groupid/formid, as built above) and
+// re-selects in `model` what it can still find. a row that is gone is simply not
+// restored. returns TRUE if anything was selected, so the caller can make that
+// view the active one
+static gboolean _restore_selection(GtkWidget *view,
+                                   GtkTreeModel *model,
+                                   GList *selectids)
+{
+  gboolean any = FALSE;
+  if(!selectids) return FALSE;
+
+  GtkTreeSelection *selection =
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
+
+  for(GList *ids = selectids; ids; )
+  {
+    dt_iop_module_t *mod = ids->data;
+    ids = g_list_next(ids);
+    // const int gid = GPOINTER_TO_INT(ids->data); // not needed, skip it
+    ids = g_list_next(ids);
+    const int fid = GPOINTER_TO_INT(ids->data);
+    ids = g_list_next(ids);
+
+    GtkTreeIter iter;
+    if(gtk_tree_model_get_iter_first(model, &iter)
+       && _find_mask_iter_by_values(model, &iter, mod, fid, 1))
+    {
+      GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
+      gtk_tree_view_expand_to_path(GTK_TREE_VIEW(view), path);
+      gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(view), path, NULL,
+                                   TRUE, 0.5, 0.5);
+      gtk_tree_path_free(path);
+      gtk_tree_selection_select_iter(selection, &iter);
+      any = TRUE;
+    }
+  }
+  g_list_free(selectids);
+  return any;
 }
 
 // A hash of everything that determines the tree's *structure* (which rows exist
@@ -2368,6 +2787,17 @@ static guint _forms_structure_hash(void)
         _MIX(pt->parentid);
       }
   }
+  // which module wears which mask is part of what the tree shows: the library
+  // is ordered by it and each row states it. it lives in blend_params, not in
+  // dev->forms, so without this the early-out in gui_update would keep serving
+  // a library saying "no module" about a shape a module has just picked up.
+  // the price is a rebuild -- and a scroll reset -- on mask assignment, which
+  // is rare and genuinely structural
+  for(const GList *l = dev->iop; l; l = g_list_next(l))
+  {
+    const dt_iop_module_t *m = l->data;
+    if(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING) _MIX(m->blend_params->mask_id);
+  }
 #undef _MIX
   return h;
 }
@@ -2385,94 +2815,90 @@ void gui_update(dt_lib_module_t *self)
   // resets the panel scroll and makes the view jump under the cursor. Just refresh
   // the existing rows in place (text/icons), leaving scroll and selection untouched.
   const guint newhash = _forms_structure_hash();
-  if(lm->treeview && lm->tree_hash_valid && newhash == lm->tree_hash &&
-     !dt_is_valid_maskid(lm->pending_selectid))
+  if((lm->treeview || lm->library) && lm->tree_hash_valid
+     && newhash == lm->tree_hash
+     && !dt_is_valid_maskid(lm->pending_selectid))
   {
-    GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
-    if(model)
-      gtk_tree_model_foreach(model, _update_foreach, lm);
+    // both models: a parameter edit refreshes whichever rows show it
+    for(int v = 0; v < DT_MASKS_NVIEWS; v++)
+    {
+      GtkWidget *view = _masks_view(lm, v);
+      GtkTreeModel *model =
+        view ? gtk_tree_view_get_model(GTK_TREE_VIEW(view)) : NULL;
+      if(model)
+        gtk_tree_model_foreach(model, _update_foreach, lm);
+    }
     DT_LEAVE_GUI_UPDATE();
     return;
   }
 
   // if a treeview is already present, let's get the currently selected items
   // as we are going to recreate the tree.
-  GList *selectids = NULL;
+  // two views now, so each one answers for itself: testing lm->treeview and
+  // then reading lm->library through it is one field deciding for another
+  GList *selectids[DT_MASKS_NVIEWS] = { NULL, NULL };
 
-  if(lm->treeview)
+  for(int v = 0; v < DT_MASKS_NVIEWS; v++)
   {
-    selectids = _lib_masks_get_selected(self);
+    GtkWidget *view = _masks_view(lm, v);
+    if(view) selectids[v] = _lib_masks_get_selected(view);
   }
 
   _lib_masks_inactivate_icons(self);
 
-  GtkTreeStore *treestore;
-  // we store : text ; *module ; groupid ; formid
-  // NOTE: this list and dt_masks_tree_cols_t are two parallel lists kept in
-  // step by hand; a mismatch is a runtime fault, not a build error
-  treestore = gtk_tree_store_new(TREE_COUNT,
-                                 G_TYPE_STRING, G_TYPE_POINTER,
-                                 G_TYPE_INT, G_TYPE_INT,
-                                 G_TYPE_BOOLEAN, GDK_TYPE_PIXBUF,
-                                 G_TYPE_BOOLEAN, GDK_TYPE_PIXBUF,
-                                 G_TYPE_BOOLEAN, GDK_TYPE_PIXBUF,
-                                 G_TYPE_BOOLEAN, G_TYPE_STRING,
-                                 G_TYPE_STRING, G_TYPE_STRING);
+  // we store : text ; *module ; groupid ; formid -- see _masks_store_new()
+  GtkTreeStore *store[DT_MASKS_NVIEWS];
+  for(int v = 0; v < DT_MASKS_NVIEWS; v++) store[v] = _masks_store_new();
 
-  // we first add all groups
+  // top list: the masks, i.e. the groups, with their shapes nested in the order
+  // they are applied. unchanged -- including the prepend that keeps the
+  // historical stacking of root groups, which _tree_group still agrees with
   for(const GList *forms = darktable.develop->forms;
       forms;
       forms = g_list_next(forms))
   {
     dt_masks_form_t *form = forms->data;
     if(form->type & DT_MASKS_GROUP)
-      _lib_masks_list_recurs(treestore, NULL, form, 0, NULL, 0, 1.0, lm);
+      _lib_masks_list_recurs(store[0], NULL, form, 0, NULL, 0, 1.0, lm);
   }
 
-  // and we add all forms
-  for(const GList *forms = darktable.develop->forms;
-      forms;
-      forms = g_list_next(forms))
+  // bottom list: the library every mask draws from -- each shape exactly once.
+  // two passes, so the ones no module renders end up together at the bottom,
+  // right above the caption that names them. an ordering, deliberately, and not
+  // a header row: a row in this store that is not a shape would be walked by
+  // _remove_foreach, _update_foreach, _lib_masks_selection_change_r and the
+  // depth arithmetic of the context menu, each of which would have to learn to
+  // skip it
+  int unlinked = 0;
+  for(int pass = 0; pass < 2; pass++)
   {
-    dt_masks_form_t *form = forms->data;
-    if(!(form->type & DT_MASKS_GROUP))
-      _lib_masks_list_recurs(treestore, NULL, form, 0, NULL, 0, 1.0, lm);
-  }
-
-  gtk_tree_view_set_model(GTK_TREE_VIEW(lm->treeview), GTK_TREE_MODEL(treestore));
-
-  // select the images as selected in the previous tree
-  if(selectids)
-  {
-    GList *ids = selectids;
-    while(ids)
+    for(const GList *forms = darktable.develop->forms;
+        forms;
+        forms = g_list_next(forms))
     {
-      GtkTreeModel *model = GTK_TREE_MODEL(treestore);
-      dt_iop_module_t *mod = ids->data;
-      ids = g_list_next(ids);
-      // const int gid = GPOINTER_TO_INT(ids->data); // not needed, skip it
-      ids = g_list_next(ids);
-      const int fid = GPOINTER_TO_INT(ids->data);
-      ids = g_list_next(ids);
+      dt_masks_form_t *form = forms->data;
+      if(form->type & DT_MASKS_GROUP) continue;
+      // clones never reach the manager (_lib_masks_list_recurs drops them);
+      // filtered here too so the count below matches the rows on screen
+      if(form->type & (DT_MASKS_CLONE | DT_MASKS_NON_CLONE)) continue;
 
-      GtkTreeIter iter;
-      // get formid in group for the given module
-      const gboolean found = gtk_tree_model_get_iter_first(model, &iter)
-                             && _find_mask_iter_by_values(model, &iter, mod, fid, 1);
+      const gboolean linked =
+        _shape_scope(form->formid, NULL, 0) == DT_MASKS_SCOPE_MODULE;
+      if(linked != (pass == 0)) continue;
+      if(!linked) unlinked++;
 
-      if(found)
-      {
-        GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
-        gtk_tree_view_expand_to_path(GTK_TREE_VIEW(lm->treeview), path);
-        gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(lm->treeview),
-                                     path, NULL, TRUE, 0.5, 0.5);
-        gtk_tree_path_free(path);
-        GtkTreeSelection *selection =
-          gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
-        gtk_tree_selection_select_iter(selection, &iter);
-      }
+      _lib_masks_list_recurs(store[1], NULL, form, 0, NULL, 0, 1.0, lm);
     }
-    g_list_free(selectids);
+  }
+
+  for(int v = 0; v < DT_MASKS_NVIEWS; v++)
+  {
+    GtkWidget *view = _masks_view(lm, v);
+    if(!view) continue;
+    gtk_tree_view_set_model(GTK_TREE_VIEW(view), GTK_TREE_MODEL(store[v]));
+    // select the rows as selected in the previous tree
+    if(_restore_selection(view, GTK_TREE_MODEL(store[v]), selectids[v]))
+      lm->active_view = view;
   }
 
   // apply a selection that was requested before this row existed (e.g. a shape
@@ -2480,15 +2906,29 @@ void gui_update(dt_lib_module_t *self)
   // new shape shows up as selected in the mask manager.
   if(dt_is_valid_maskid(lm->pending_selectid))
   {
-    GtkTreeModel *model = GTK_TREE_MODEL(treestore);
-    GtkTreeIter iter;
-    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
-    if(gtk_tree_model_get_iter_first(model, &iter))
+    // a shape created with a module focused lands in that module's mask; one
+    // created from the manager lands in the library. try the masks first
+    gboolean found = FALSE;
+    GtkWidget *holder = NULL;
+    for(int v = 0; v < DT_MASKS_NVIEWS && !found; v++)
     {
-      gtk_tree_view_expand_all(GTK_TREE_VIEW(lm->treeview));
-      if(_lib_masks_selection_change_r(
-           model, selection, &iter, lm->pending_selmodule, lm->pending_selectid, 1))
+      GtkWidget *view = _masks_view(lm, v);
+      if(!view) continue;
+      GtkTreeModel *model = GTK_TREE_MODEL(store[v]);
+      GtkTreeSelection *selection =
+        gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
+      GtkTreeIter iter;
+      if(!gtk_tree_model_get_iter_first(model, &iter)) continue;
+
+      gtk_tree_view_expand_all(GTK_TREE_VIEW(view));
+      found = _lib_masks_selection_change_r(model, selection, &iter,
+                                            lm->pending_selmodule,
+                                            lm->pending_selectid, 1);
+      if(found)
       {
+        holder = view;
+        lm->active_view = view;
+
         // make the just-created shape the active one so the properties reflect
         // it, rather than the previously selected shape: mask_form_selected_id
         // is otherwise only set once a shape is clicked on the canvas.
@@ -2499,19 +2939,46 @@ void gui_update(dt_lib_module_t *self)
         if(rows)
         {
           // a genuinely new shape: reveal its row
-          gtk_tree_view_scroll_to_cell(
-            GTK_TREE_VIEW(lm->treeview), rows->data, NULL, TRUE, 0.5, 0.5);
+          gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(view), rows->data,
+                                       NULL, TRUE, 0.5, 0.5);
           g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
         }
       }
-      else
-        gtk_tree_view_collapse_all(GTK_TREE_VIEW(lm->treeview));
+    }
+
+    // one list highlighted, never two: the restore above may have put a row
+    // back in the list the pending id does not live in. that list is then left
+    // showing nothing, so it also goes back to being folded -- searching it
+    // expanded it whole, and an empty tree splayed open is not a state the user
+    // asked for. the list that holds the pending id keeps whatever the search
+    // opened, since that is what reveals the row.
+    for(int v = 0; v < DT_MASKS_NVIEWS; v++)
+    {
+      GtkWidget *view = _masks_view(lm, v);
+      if(!view || view == holder) continue;
+      GtkTreeSelection *selection =
+        gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
+      if(holder) gtk_tree_selection_unselect_all(selection);
+      if(gtk_tree_selection_count_selected_rows(selection) == 0)
+        gtk_tree_view_collapse_all(GTK_TREE_VIEW(view));
     }
     lm->pending_selectid = NO_MASKID;
     lm->pending_selmodule = NULL;
   }
 
-  g_object_unref(treestore);
+  // the caption sits directly under the run it describes and says what is true
+  // of that run, not what the cleanup promises to do about it
+  if(unlinked > 0)
+  {
+    gchar *t = g_strdup_printf(ngettext("%d shape not linked to a module",
+                                        "%d shapes not linked to a module",
+                                        unlinked), unlinked);
+    gtk_label_set_text(GTK_LABEL(lm->lib_unlinked), t);
+    g_free(t);
+  }
+  gtk_widget_set_visible(lm->lib_unlinked, unlinked > 0);
+
+  for(int v = 0; v < DT_MASKS_NVIEWS; v++) g_object_unref(store[v]);
 
   // remember the structure we just built so a later parameter-only update can be
   // served in place (see the early-out at the top of this function).
@@ -2520,7 +2987,11 @@ void gui_update(dt_lib_module_t *self)
 
   DT_LEAVE_GUI_UPDATE();
 
-  dt_gui_widget_reallocate_now(lm->treeview);
+  for(int v = 0; v < DT_MASKS_NVIEWS; v++)
+  {
+    GtkWidget *view = _masks_view(lm, v);
+    if(view) dt_gui_widget_reallocate_now(view);
+  }
 }
 
 static void _lib_masks_recreate_list(dt_lib_module_t *self)
@@ -2579,8 +3050,17 @@ static void _lib_masks_update_list(dt_lib_module_t *self)
 {
   dt_lib_masks_t *lm = self->data;
   // for each node , we refresh the string
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
-  gtk_tree_model_foreach(model, _update_foreach, lm);
+  // both models, always: a shape shown in one list and stale in the other is
+  // the same shape saying two things at once
+  for(int v = 0; v < DT_MASKS_NVIEWS; v++)
+  {
+    GtkWidget *view = _masks_view(lm, v);
+    GtkTreeModel *model =
+      view ? gtk_tree_view_get_model(GTK_TREE_VIEW(view)) : NULL;
+    if(!model) continue;
+
+    gtk_tree_model_foreach(model, _update_foreach, lm);
+  }
 }
 
 static gboolean _remove_foreach(GtkTreeModel *model,
@@ -2611,28 +3091,38 @@ static void _lib_masks_remove_item(dt_lib_module_t *self,
 {
   dt_lib_masks_t *lm = self->data;
   // for each node , we refresh the string
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
-  GList *rl = NULL;
-  g_object_set_data(G_OBJECT(model), "formid", GUINT_TO_POINTER(formid));
-  g_object_set_data(G_OBJECT(model), "groupid", GUINT_TO_POINTER(parentid));
-  gtk_tree_model_foreach(model, _remove_foreach, &rl);
-
-  for(const GList *rlt = rl; rlt; rlt = g_list_next(rlt))
+  // both models, always. a shape removed from one and left in the other is a
+  // row pointing at a freed form -- and develop/masks/path.c calls
+  // dt_dev_masks_list_remove() directly, from the canvas
+  for(int v = 0; v < DT_MASKS_NVIEWS; v++)
   {
-    GtkTreeRowReference *rowref = (GtkTreeRowReference *)rlt->data;
-    GtkTreePath *path = gtk_tree_row_reference_get_path(rowref);
-    gtk_tree_row_reference_free(rowref);
-    if(path)
+    GtkWidget *view = _masks_view(lm, v);
+    GtkTreeModel *model =
+      view ? gtk_tree_view_get_model(GTK_TREE_VIEW(view)) : NULL;
+    if(!model) continue;
+
+    GList *rl = NULL;
+    g_object_set_data(G_OBJECT(model), "formid", GUINT_TO_POINTER(formid));
+    g_object_set_data(G_OBJECT(model), "groupid", GUINT_TO_POINTER(parentid));
+    gtk_tree_model_foreach(model, _remove_foreach, &rl);
+
+    for(const GList *rlt = rl; rlt; rlt = g_list_next(rlt))
     {
-      GtkTreeIter iter;
-      if(gtk_tree_model_get_iter(model, &iter, path))
+      GtkTreeRowReference *rowref = (GtkTreeRowReference *)rlt->data;
+      GtkTreePath *path = gtk_tree_row_reference_get_path(rowref);
+      gtk_tree_row_reference_free(rowref);
+      if(path)
       {
-        gtk_tree_store_remove(GTK_TREE_STORE(model), &iter);
+        GtkTreeIter iter;
+        if(gtk_tree_model_get_iter(model, &iter, path))
+        {
+          gtk_tree_store_remove(GTK_TREE_STORE(model), &iter);
+        }
+        gtk_tree_path_free(path);
       }
-      gtk_tree_path_free(path);
     }
+    g_list_free(rl);
   }
-  g_list_free(rl);
 }
 
 static gboolean _lib_masks_selection_change_r(GtkTreeModel *model,
@@ -2681,27 +3171,31 @@ static void _lib_masks_selection_change(dt_lib_module_t *self,
                                         const dt_mask_id_t selectid)
 {
   dt_lib_masks_t *lm = self->data;
-  if(!lm->treeview) return;
-
-  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(lm->treeview));
-  if(!model) return;
+  if(!lm->treeview || !lm->library) return;
 
   DT_ENTER_GUI_UPDATE();
 
-  // we first unselect all
-  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(lm->treeview));
-  gtk_tree_selection_unselect_all(selection);
+  // clear both, then answer in the masks first: a request carrying a module
+  // means a row inside that module's mask, and the library row for the same
+  // shape would be a different answer to the same question
+  for(int v = 0; v < DT_MASKS_NVIEWS; v++)
+    gtk_tree_selection_unselect_all
+      (gtk_tree_view_get_selection(GTK_TREE_VIEW(_masks_view(lm, v))));
 
-  GtkTreeIter iter;
-  gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
-
-  // we go through all nodes
   gboolean found = FALSE;
-  if(valid)
+  for(int v = 0; v < DT_MASKS_NVIEWS && !found; v++)
   {
-    gtk_tree_view_expand_all(GTK_TREE_VIEW(lm->treeview));
+    GtkWidget *view = _masks_view(lm, v);
+    GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
+    GtkTreeIter iter;
+    if(!model || !gtk_tree_model_get_iter_first(model, &iter)) continue;
+
+    GtkTreeSelection *selection =
+      gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
+    gtk_tree_view_expand_all(GTK_TREE_VIEW(view));
     found = _lib_masks_selection_change_r(model, selection, &iter, module, selectid, 1);
-    if(!found) gtk_tree_view_collapse_all(GTK_TREE_VIEW(lm->treeview));
+    if(found) lm->active_view = view;
+    else gtk_tree_view_collapse_all(GTK_TREE_VIEW(view));
   }
 
   // a shape just created is not yet in the (still to be rebuilt) tree, so the
@@ -2745,6 +3239,117 @@ static GdkPixbuf *_get_pixbuf_from_cairo(DTGTKCairoPaintIconFunc paint,
   dt_draw_cairo_to_gdk_pixbuf(data, width, height);
   return gdk_pixbuf_new_from_data(data, GDK_COLORSPACE_RGB, TRUE, 8, width, height,
                                   cairo_image_surface_get_stride(cst), NULL, NULL);
+}
+
+// both lists are the same widget fed different rows. keeping them built by one
+// function is the whole point: the moment they diverge, every fix has to be
+// written twice and one of the two will be forgotten.
+// NOTE the renderer stack below is the one place renderers are packed.
+static void _build_masks_view(dt_lib_module_t *self,
+                              GtkWidget *view,
+                              const gboolean library)
+{
+  dt_lib_masks_t *d = self->data;
+
+  GtkTreeViewColumn *col = gtk_tree_view_column_new();
+  gtk_tree_view_column_set_title(col, "shapes");
+  gtk_tree_view_append_column(GTK_TREE_VIEW(view), col);
+  GtkCellRenderer *renderer;
+
+  if(!library)
+  {
+    // the application rank, first thing on the row: read the column top-down and
+    // you read the order the shapes are applied in. right-aligned and two
+    // characters wide so a group reaching ten shapes does not shift every name
+    // sideways. small and insensitive: the theme greys it for us -- dark theme
+    // and light theme alike -- and no colour is hardcoded.
+    // a constant empty gutter reads as a margin; a column that moves reads as a
+    // bug -- which is why the library, where no row is ever ranked, carries none
+    renderer = gtk_cell_renderer_text_new();
+    g_object_set(renderer,
+                 "xalign", 1.0,
+                 "xpad", (guint)DT_PIXEL_APPLY_DPI(2),
+                 "width-chars", 2,
+                 "scale", PANGO_SCALE_SMALL,
+                 "sensitive", FALSE,
+                 NULL);
+    gtk_tree_view_column_pack_start(col, renderer, FALSE);
+    gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_NUM);
+
+    renderer = gtk_cell_renderer_pixbuf_new();
+    gtk_tree_view_column_pack_start(col, renderer, FALSE);
+    gtk_tree_view_column_set_attributes(col, renderer, "pixbuf", TREE_IC_OP, NULL);
+    gtk_tree_view_column_add_attribute(col, renderer, "visible", TREE_IC_OP_VISIBLE);
+
+    // "base" sits where the operator glyph would be, on the one row that has no
+    // operator and cannot be given one. a word rather than a glyph: it has to
+    // translate, and it has to follow a theme change -- which the icons,
+    // rasterised once above, do not
+    renderer = gtk_cell_renderer_text_new();
+    g_object_set(renderer,
+                 "xalign", 0.0,
+                 "xpad", (guint)DT_PIXEL_APPLY_DPI(1),
+                 "scale", PANGO_SCALE_SMALL,
+                 "sensitive", FALSE,
+                 NULL);
+    gtk_tree_view_column_pack_start(col, renderer, FALSE);
+    gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_BASE);
+
+    renderer = gtk_cell_renderer_pixbuf_new();
+    gtk_tree_view_column_pack_start(col, renderer, FALSE);
+    gtk_tree_view_column_set_attributes(col, renderer, "pixbuf", TREE_IC_INVERSE, NULL);
+    gtk_tree_view_column_add_attribute(col, renderer, "visible", TREE_IC_INVERSE_VISIBLE);
+  }
+
+  renderer = gtk_cell_renderer_text_new();
+  g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, NULL);
+  gtk_tree_view_column_pack_start(col, renderer, TRUE);
+  gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_TEXT);
+  gtk_tree_view_column_add_attribute(col, renderer, "editable", TREE_EDITABLE);
+  g_signal_connect(renderer, "edited", G_CALLBACK(_tree_cell_edited), view);
+  dt_gui_commit_on_focus_loss(renderer, NULL);
+  if(library)
+  {
+    d->lib_col = col;
+    d->lib_name_cell = renderer;
+  }
+
+  // packed from the right edge inwards: the badge first, so it keeps the very
+  // place it has today
+  renderer = gtk_cell_renderer_pixbuf_new();
+  gtk_tree_view_column_pack_end(col, renderer, FALSE);
+  gtk_tree_view_column_set_attributes(col, renderer, "pixbuf", TREE_IC_USED, NULL);
+  gtk_tree_view_column_add_attribute(col, renderer, "visible", TREE_IC_USED_VISIBLE);
+
+  if(library)
+  {
+    // and just left of it, what the badge cannot say: no module renders this
+    // shape. same treatment as the rank column -- small, insensitive, greyed by
+    // the theme, no colour in the C. no ellipsizing: the name cell expands and
+    // gives way, a truncated statement would read as a different statement
+    renderer = gtk_cell_renderer_text_new();
+    g_object_set(renderer,
+                 "xalign", 1.0,
+                 "xpad", (guint)DT_PIXEL_APPLY_DPI(2),
+                 "scale", PANGO_SCALE_SMALL,
+                 "sensitive", FALSE,
+                 NULL);
+    gtk_tree_view_column_pack_end(col, renderer, FALSE);
+    gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_LINK);
+
+    // the library is flat by construction: no expander gutter to indent it
+    gtk_tree_view_set_show_expanders(GTK_TREE_VIEW(view), FALSE);
+  }
+
+  GtkTreeSelection *selection =
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
+  gtk_tree_selection_set_mode(selection, GTK_SELECTION_MULTIPLE);
+  gtk_tree_selection_set_select_function(selection, _tree_restrict_select, d, NULL);
+  gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(view), FALSE);
+  gtk_widget_set_has_tooltip(view, TRUE);
+  g_signal_connect(view, "query-tooltip", G_CALLBACK(_tree_query_tooltip), NULL);
+  g_signal_connect(selection, "changed", G_CALLBACK(_tree_selection_change), d);
+  dt_gui_connect_click_all(view, _tree_button_pressed_cb, NULL, self);
 }
 
 void gui_init(dt_lib_module_t *self)
@@ -2826,70 +3431,16 @@ void gui_init(dt_lib_module_t *self)
 #endif
 
   d->treeview = gtk_tree_view_new();
-  GtkTreeViewColumn *col = gtk_tree_view_column_new();
-  gtk_tree_view_column_set_title(col, "shapes");
-  gtk_tree_view_append_column(GTK_TREE_VIEW(d->treeview), col);
+  _build_masks_view(self, d->treeview, FALSE);
 
-  // the application rank, first thing on the row: read the column top-down and
-  // you read the order the shapes are applied in. right-aligned and two
-  // characters wide so a group reaching ten shapes does not shift every name
-  // sideways. small and insensitive: the theme greys it for us -- dark theme
-  // and light theme alike -- and no colour is hardcoded.
-  // a constant empty gutter reads as a margin; a column that moves reads as a bug
-  GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
-  g_object_set(renderer,
-               "xalign", 1.0,
-               "xpad", (guint)DT_PIXEL_APPLY_DPI(2),
-               "width-chars", 2,
-               "scale", PANGO_SCALE_SMALL,
-               "sensitive", FALSE,
-               NULL);
-  gtk_tree_view_column_pack_start(col, renderer, FALSE);
-  gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_NUM);
-
-  renderer = gtk_cell_renderer_pixbuf_new();
-  gtk_tree_view_column_pack_start(col, renderer, FALSE);
-  gtk_tree_view_column_set_attributes(col, renderer, "pixbuf", TREE_IC_OP, NULL);
-  gtk_tree_view_column_add_attribute(col, renderer, "visible", TREE_IC_OP_VISIBLE);
-
-  // "base" sits where the operator glyph would be, on the one row that has no
-  // operator and cannot be given one. a word rather than a glyph: it has to
-  // translate, and it has to follow a theme change -- which the icons,
-  // rasterised once above, do not
-  renderer = gtk_cell_renderer_text_new();
-  g_object_set(renderer,
-               "xalign", 0.0,
-               "xpad", (guint)DT_PIXEL_APPLY_DPI(1),
-               "scale", PANGO_SCALE_SMALL,
-               "sensitive", FALSE,
-               NULL);
-  gtk_tree_view_column_pack_start(col, renderer, FALSE);
-  gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_BASE);
-
-  renderer = gtk_cell_renderer_pixbuf_new();
-  gtk_tree_view_column_pack_start(col, renderer, FALSE);
-  gtk_tree_view_column_set_attributes(col, renderer, "pixbuf", TREE_IC_INVERSE, NULL);
-  gtk_tree_view_column_add_attribute(col, renderer, "visible", TREE_IC_INVERSE_VISIBLE);
-  renderer = gtk_cell_renderer_text_new();
-  g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, NULL);
-  gtk_tree_view_column_pack_start(col, renderer, TRUE);
-  gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_TEXT);
-  gtk_tree_view_column_add_attribute(col, renderer, "editable", TREE_EDITABLE);
-  g_signal_connect(renderer, "edited", G_CALLBACK(_tree_cell_edited), self);
-  dt_gui_commit_on_focus_loss(renderer, NULL);
-  renderer = gtk_cell_renderer_pixbuf_new();
-  gtk_tree_view_column_pack_end(col, renderer, FALSE);
-  gtk_tree_view_column_set_attributes(col, renderer, "pixbuf", TREE_IC_USED, NULL);
-  gtk_tree_view_column_add_attribute(col, renderer, "visible", TREE_IC_USED_VISIBLE);
-
-  GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(d->treeview));
-  gtk_tree_selection_set_mode(selection, GTK_SELECTION_MULTIPLE);
-  gtk_tree_selection_set_select_function(selection, _tree_restrict_select, d, NULL);
-  gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(d->treeview), FALSE);
-  gtk_widget_set_has_tooltip(d->treeview, TRUE);
-  g_signal_connect(d->treeview, "query-tooltip", G_CALLBACK(_tree_query_tooltip), NULL);
-  g_signal_connect(selection, "changed", G_CALLBACK(_tree_selection_change), d);
-  dt_gui_connect_click_all(d->treeview, _tree_button_pressed_cb, NULL, self);
+  d->library = gtk_tree_view_new();
+  // the ground is what separates the two zones, and the name is the whole of it:
+  // the shade is derived from the theme's own background in
+  // data/themes/darktable.css, next to the delete-dialog precedent, so light and
+  // dark both follow and no colour is written here
+  gtk_widget_set_name(d->library, "masks-library");
+  _build_masks_view(self, d->library, TRUE);
+  d->active_view = d->treeview;
 
   // the row used to open on a decorative "created shapes" label; it becomes the
   // explicit entry point instead. same row, same height, one more thing that
@@ -2910,9 +3461,41 @@ void gui_init(dt_lib_module_t *self)
   dt_gui_box_add(shape_buttons, d->bt_object);
 #endif
 
+  d->lib_unlinked = dt_ui_label_new("");
+  // dt_ui_label_new sets ellipsize END, and gtk_label_ensure_layout picks
+  // ellipsize over wrap: the caption would be cut instead of wrapped, and it is
+  // the one place "not linked to a module" is spelled out. turn ellipsize off
+  // so the wrap below is the one that applies -- the left panel is narrow and
+  // this sentence has to survive it whole
+  gtk_label_set_ellipsize(GTK_LABEL(d->lib_unlinked), PANGO_ELLIPSIZE_NONE);
+  gtk_label_set_line_wrap(GTK_LABEL(d->lib_unlinked), TRUE);
+  // the one place the cleanup's own definition is stated, and the only place a
+  // promise about it is hedged: it keeps whatever a history step still refers
+  // to, which this classification does not measure
+  gtk_widget_set_tooltip_text
+    (d->lib_unlinked,
+     _("no module uses them\n"
+       "\"delete unused shapes\" removes those no history step refers to either"));
+
+  // the masks on top, the shapes they are drawn from below. a row in the top
+  // list belongs to a mask -- deleting it detaches it. a row in the library IS
+  // the shape. that is the whole point of the split.
+  // both lists stay in place even when empty: a right-click on blank space is
+  // how "add brush/circle/..." and "delete unused shapes" are reached, and that
+  // path must not disappear with the last row
   self->widget = dt_gui_vbox
     (shape_buttons,
-     dt_ui_resize_wrap(d->treeview, 200, "plugins/darkroom/masks/heightview"));
+     dt_ui_resize_wrap(d->treeview, 200, "plugins/darkroom/masks/heightview"),
+     dt_ui_section_label_new(C_("section", "shape library")),
+     dt_ui_resize_wrap(d->library, 120, "plugins/darkroom/masks/heightlibrary"),
+     d->lib_unlinked);
+
+  // gui_update decides whether the caption is up. show_all first, then
+  // no_show_all and an explicit hide, or a later panel show_all brings it back
+  // -- same pattern as the shrink/grow slider further down
+  gtk_widget_show_all(d->lib_unlinked);
+  gtk_widget_set_no_show_all(d->lib_unlinked, TRUE);
+  gtk_widget_hide(d->lib_unlinked);
 
   dt_gui_new_collapsible_section
     (&d->cs,
