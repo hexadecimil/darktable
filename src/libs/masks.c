@@ -473,6 +473,12 @@ typedef enum dt_masks_tree_cols_t
   // and the only one a mask row can state without lying
   TREE_IC_TYPE,
   TREE_IC_TYPE_VISIBLE,
+  // the opacity this shape has IN THIS MASK, as "85%", and "" at 100%: the
+  // column states what is not the default and stays quiet about what is.
+  // opacity belongs to the membership and not to the shape -- the same
+  // gradient is 85% in one mask and 100% in the next -- so it is written on
+  // group members and nowhere else. derived, written by _set_iter_name only
+  TREE_OPACITY,
   TREE_COUNT
 } dt_masks_tree_cols_t;
 
@@ -507,6 +513,7 @@ static GtkTreeStore *_masks_store_new(void)
       [TREE_LINK] = G_TYPE_STRING,
       [TREE_IC_TYPE] = GDK_TYPE_PIXBUF,
       [TREE_IC_TYPE_VISIBLE] = G_TYPE_BOOLEAN,
+      [TREE_OPACITY] = G_TYPE_STRING,
     };
 
   return gtk_tree_store_newv(TREE_COUNT, types);
@@ -1821,20 +1828,21 @@ static void _set_iter_name(dt_lib_masks_t *lm,
 {
   if(!form) return;
 
-  // TREE_TEXT must stay exactly form->name on an editable row:
+  // TREE_TEXT is exactly form->name, on every row and with nothing appended:
   // _tree_cell_edited copies the displayed string straight back into
-  // form->name. TREE_EDITABLE is (grp_id == 0), and a root row is always built
-  // with opacity 1.0f, so no "%" suffix can reach it either. the rank and the
-  // base marker live in columns of their own and never in TREE_TEXT
+  // form->name, so whatever else is shown here is what a rename would write
+  // into the name. that used to hold by coincidence only -- the "%" suffix was
+  // built right here, and TREE_EDITABLE being (grp_id == 0) simply never
+  // coincided with a row carrying one. the rank, the base marker, the kind and
+  // now the opacity live in columns of their own
   char str[256] = "";
   g_strlcat(str, form->name, sizeof(str));
 
+  // 100% is the default and gets no text: a column that states the ordinary
+  // case on every row states nothing at all
+  char opac[8] = "";
   if(opacity != 1.0f)
-  {
-    char str2[256] = "";
-    g_strlcpy(str2, str, sizeof(str2));
-    snprintf(str, sizeof(str), "%s %d%%", str2, (int)(opacity * 100));
-  }
+    snprintf(opac, sizeof(opac), "%d%%", (int)(opacity * 100));
 
   // the shapes of a mask are stacked: the first lays the base, the next ones
   // combine onto it. number them so a module's mask reads like a recipe --
@@ -1919,6 +1927,7 @@ static void _set_iter_name(dt_lib_masks_t *lm,
 
   gtk_tree_store_set(GTK_TREE_STORE(model), iter,
                      TREE_TEXT, str,
+                     TREE_OPACITY, opac,
                      TREE_NUM, num,
                      TREE_BASE, base,
                      TREE_LINK, link,
@@ -4138,15 +4147,41 @@ static void _build_masks_view(dt_lib_module_t *self,
     d->lib_name_cell = renderer;
   }
 
-  // packed from the right edge inwards: the badge first, so it keeps the very
-  // place it has today
-  renderer = gtk_cell_renderer_pixbuf_new();
-  gtk_tree_view_column_pack_end(col, renderer, FALSE);
-  gtk_tree_view_column_set_attributes(col, renderer, "pixbuf", TREE_IC_USED, NULL);
-  gtk_tree_view_column_add_attribute(col, renderer, "visible", TREE_IC_USED_VISIBLE);
+  if(!library)
+  {
+    // the opacity of this shape in this mask, at the right edge of the row.
+    // a fixed four-character gutter: "100%" is the widest string it could hold
+    // and it never holds one, but a cell whose width follows its content moves
+    // every name on every row the moment one shape leaves 100%. small and
+    // insensitive, like the rank on the other side -- the theme greys it, dark
+    // and light alike, and no colour is written here
+    renderer = gtk_cell_renderer_text_new();
+    g_object_set(renderer,
+                 "xalign", 1.0,
+                 "xpad", (guint)DT_PIXEL_APPLY_DPI(2),
+                 "width-chars", 4,
+                 "scale", PANGO_SCALE_SMALL,
+                 "sensitive", FALSE,
+                 NULL);
+    gtk_tree_view_column_pack_end(col, renderer, FALSE);
+    gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_OPACITY);
+  }
 
   if(library)
   {
+    // packed from the right edge inwards: the badge first, so it keeps the
+    // very place it has today.
+    // the library and nowhere else: on a mask row the badge answered "is this
+    // filed in a group", which a mask row answers by existing. here the
+    // question is real -- one row per shape, and the badge is the whole of
+    // what says the shape is in use at all
+    renderer = gtk_cell_renderer_pixbuf_new();
+    gtk_tree_view_column_pack_end(col, renderer, FALSE);
+    gtk_tree_view_column_set_attributes(col, renderer,
+                                        "pixbuf", TREE_IC_USED, NULL);
+    gtk_tree_view_column_add_attribute(col, renderer,
+                                       "visible", TREE_IC_USED_VISIBLE);
+
     // and just left of it, what the badge cannot say: no module renders this
     // shape. same treatment as the rank column -- small, insensitive, greyed by
     // the theme, no colour in the C. no ellipsizing: the name cell expands and
