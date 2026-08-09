@@ -112,11 +112,6 @@ static int _op_index(const dt_masks_state_t state)
 
 typedef struct dt_lib_masks_t
 {
-  /* vbox with managed history items */
-  GtkWidget *bt_circle, *bt_path, *bt_gradient, *bt_ellipse, *bt_brush;
-#ifdef HAVE_AI
-  GtkWidget *bt_object;
-#endif
   // the manager shows two lists now. `treeview` holds the masks: the groups,
   // with their members in the order they are applied. `library` holds the
   // shapes, each exactly once, as itself -- where a shape is named, duplicated
@@ -145,6 +140,16 @@ typedef struct dt_lib_masks_t
   // caption under the library, shown only when at least one shape is not
   // linked to a module: it names exactly the set the cleanup is about
   GtkWidget *lib_unlinked;
+  // what the empty state swaps out. the two boxes and not the two views:
+  // dt_ui_resize_wrap hands back the event box wrapping the scrolled window,
+  // and hiding a view alone would leave that window's min_content_height
+  // holding the space open under the message
+  GtkWidget *masks_box, *lib_box;
+  GtkWidget *lib_label;    // the "shape library" heading, above its list
+  // the empty-state sentences, shown only while both lists are empty. two
+  // widgets and not one box because M1 reads sentence, button, sentence and
+  // the button between them is the one at the top of the panel
+  GtkWidget *empty_title, *empty_hint;
   dt_gui_collapsible_section_t cs;
   GtkWidget *property[DT_MASKS_PROPERTY_LAST];
   GtkWidget *pressure, *smoothing;
@@ -202,6 +207,35 @@ static GtkWidget *_masks_view(dt_lib_masks_t *lm, const int v)
 static GtkWidget *_masks_active_view(dt_lib_masks_t *lm)
 {
   return lm->active_view ? lm->active_view : lm->treeview;
+}
+
+// M1: an image that carries no mask at all gets a sentence instead of two
+// empty lists. read back from the models rather than from dev->forms so it
+// agrees with the rows on screen -- _lib_masks_list_recurs drops clone and
+// retouch shapes, and those must not keep the panel looking occupied
+static void _empty_state_update(dt_lib_masks_t *lm)
+{
+  // cs.expander is the last widget gui_init builds: no expander, no panel yet
+  if(!lm->cs.expander) return;
+
+  gboolean empty = TRUE;
+  for(int v = 0; v < DT_MASKS_NVIEWS; v++)
+  {
+    GtkWidget *view = _masks_view(lm, v);
+    GtkTreeModel *model =
+      view ? gtk_tree_view_get_model(GTK_TREE_VIEW(view)) : NULL;
+    if(model && gtk_tree_model_iter_n_children(model, NULL) > 0) empty = FALSE;
+  }
+
+  gtk_widget_set_visible(lm->empty_title, empty);
+  gtk_widget_set_visible(lm->empty_hint, empty);
+  gtk_widget_set_visible(lm->masks_box, !empty);
+  gtk_widget_set_visible(lm->lib_label, !empty);
+  gtk_widget_set_visible(lm->lib_box, !empty);
+  // "properties" goes too. it is the only other thing packed into the panel,
+  // M1 is a screen with one action on it, and with nothing to select the
+  // section can say nothing but "no shapes selected"
+  gtk_widget_set_visible(lm->cs.expander, !empty);
 }
 
 const char *name(dt_lib_module_t *self)
@@ -801,21 +835,6 @@ static void _lib_masks_get_values(GtkTreeModel *model,
   if(formid ) gtk_tree_model_get(model, iter, TREE_FORMID, formid, -1);
 }
 
-static void _lib_masks_inactivate_icons(dt_lib_module_t *self)
-{
-  dt_lib_masks_t *lm = self->data;
-
-  // we set the add shape icons inactive
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(lm->bt_circle), FALSE);
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(lm->bt_ellipse), FALSE);
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(lm->bt_path), FALSE);
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(lm->bt_gradient), FALSE);
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(lm->bt_brush), FALSE);
-#ifdef HAVE_AI
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(lm->bt_object), FALSE);
-#endif
-}
-
 /* -------------------------------------------------------------------------
    "new mask": one entry point that names the module the shape is for.
 
@@ -1055,9 +1074,9 @@ static void _creation_bar_cancel(GtkButton *button, dt_lib_masks_t *d)
   dt_control_queue_redraw_center();
 }
 
-// the one creation path of this panel. the icon row, the catalogue and the
-// tree context menu all land here, so none of them can produce a shape with no
-// module behind it and all of them refuse with the same words.
+// the one creation path of this panel. the catalogue, the tree context menu
+// and the shape shortcuts all land here, so none of them can produce a shape
+// with no module behind it and all of them refuse with the same words.
 static gboolean _start_creation(dt_lib_module_t *self,
                                 dt_iop_module_t *module,
                                 const dt_masks_type_t type,
@@ -1069,7 +1088,6 @@ static gboolean _start_creation(dt_lib_module_t *self,
   if(type == DT_MASKS_OBJECT && !dt_masks_object_available())
   {
     dt_control_log(_("AI model is not available. Check preferences > AI"));
-    _lib_masks_inactivate_icons(self);
     return FALSE;
   }
 #endif
@@ -1082,7 +1100,6 @@ static gboolean _start_creation(dt_lib_module_t *self,
     // manager, in no pipe, and stays there until "delete unused shapes" is
     // found. do not create it
     dt_control_log(_("no module can take a drawn mask"));
-    _lib_masks_inactivate_icons(self);
     return FALSE;
   }
 
@@ -1120,7 +1137,6 @@ static gboolean _start_creation(dt_lib_module_t *self,
   d->arm_module = module;
   _creation_bar_update(d);
 
-  _lib_masks_inactivate_icons(self);
   dt_control_queue_redraw_center();
   return TRUE;
 }
@@ -1139,49 +1155,64 @@ static void _tree_add_shape(GtkWidget *widget, gpointer shape)
   _start_creation(self, module, GPOINTER_TO_INT(shape), FALSE);
 }
 
-static void _bt_add_shape_cb(GtkGestureSingle *gesture, int n_press, double x, double y, gpointer shape)
-{
-  if(dt_gui_current_button(gesture) != GDK_BUTTON_PRIMARY) return;
-
-  // proxy.masks.module was dereferenced here without a guard; a gesture can
-  // fire while the panel is being torn down
-  dt_lib_module_t *self = darktable.develop->proxy.masks.module;
-  if(!self) return;
-
-  // the icons stay the fast path for someone who already knows where the shape
-  // goes -- and they keep their shortcuts, which live at the action path
-  // "shapes/add *" and would be silently invalidated if the row were replaced.
-  // what changes is that they resolve their target exactly as the catalogue
-  // does, so the two entry points can never disagree, and that they say so when
-  // there is nowhere to put the shape instead of quietly making an orphan
-  _start_creation(self, _mask_default_target(self), GPOINTER_TO_INT(shape),
-                  dt_modifier_is(dt_gui_current_state(gesture), GDK_CONTROL_MASK));
-}
-
-// the shape types, in the order of the icon row so the two entry points read
-// the same way. the labels are the ones already used by the context menu and by
-// the icon tooltips -- no new string for translators. DT_MASKS_OBJECT is the
-// one type that can be unavailable at runtime, and the icon row has always had
-// it while the context menu never did: the catalogue settles it
+// the shape types, in one table. `label` is what a menu shows -- the strings
+// the context menu already used, no new one for translators. `action` is the
+// id the shortcut path is built from and it is frozen: those paths outlived
+// the icon row that used to carry them, and "add object" is what that row
+// registered, tooltip and menu saying "add AI object" or not. DT_MASKS_OBJECT
+// is the one type that can be unavailable at runtime, and the icon row has
+// always had it while the context menu never did: the catalogue settles it
 static const struct
 {
   dt_masks_type_t type;
-  const char *label;
+  const char *label;   // the menu entry
+  const char *action;  // the action id -- never rename, never retranslate
 } _new_mask_shapes[] =
 {
-  { DT_MASKS_BRUSH,    N_("add brush")     },
-  { DT_MASKS_CIRCLE,   N_("add circle")    },
-  { DT_MASKS_ELLIPSE,  N_("add ellipse")   },
-  { DT_MASKS_PATH,     N_("add path")      },
-  { DT_MASKS_GRADIENT, N_("add gradient")  },
+  { DT_MASKS_BRUSH,    N_("add brush"),     N_("add brush")    },
+  { DT_MASKS_CIRCLE,   N_("add circle"),    N_("add circle")   },
+  { DT_MASKS_ELLIPSE,  N_("add ellipse"),   N_("add ellipse")  },
+  { DT_MASKS_PATH,     N_("add path"),      N_("add path")     },
+  { DT_MASKS_GRADIENT, N_("add gradient"),  N_("add gradient") },
 #ifdef HAVE_AI
-  { DT_MASKS_OBJECT,   N_("add AI object") },
+  { DT_MASKS_OBJECT,   N_("add AI object"), N_("add object")   },
 #endif
 };
 
-// one row per shape type, wired to the callback the icon row and the context
-// menu already use. the module travels on the item, so the same function fills
-// the top level of the catalogue, every per-module submenu, and the context menu
+// the shortcut path, and the only reason the six action ids survive the icon
+// row. a shortcut is persisted by path in shortcutsrc; a path no longer
+// registered is dropped when the file is read and gone from the file when it
+// is written back, with nothing on screen to say so. registered as commands
+// and not on a widget: a catalogue entry is a menu item built at click and
+// destroyed at "deactivate", so the weak pointer dt_action_define keeps would
+// be NULL and the shortcut would answer "not active" instead of drawing.
+//
+// what a command does not carry is elements and effects. the toggle these used
+// to be had a ctrl fallback, so ctrl + the bound key drew shape after shape;
+// that variant is gone here. an explicitly bound key is not: it keeps its path
+// and draws one shape, and an effect left in the file is read and ignored.
+// continuous creation is still on ctrl-click of "add multiple ..." in every
+// module's blending panel
+static void _add_shape_action(dt_action_t *action)
+{
+  dt_lib_module_t *self = darktable.develop->proxy.masks.module;
+  if(!self) return;
+
+  for(int i = 0; i < (int)G_N_ELEMENTS(_new_mask_shapes); i++)
+  {
+    if(!g_strcmp0(action->id, _new_mask_shapes[i].action))
+    {
+      _start_creation(self, _mask_default_target(self),
+                      _new_mask_shapes[i].type, FALSE);
+      return;
+    }
+  }
+}
+
+// one row per shape type, wired to the callback the context menu and the shape
+// shortcuts already use. the module travels on the item, so the same function
+// fills the top level of the catalogue, every per-module submenu, and the
+// context menu
 static void _new_mask_shape_items(GtkMenuShell *menu, dt_iop_module_t *target)
 {
   for(int i = 0; i < (int)G_N_ELEMENTS(_new_mask_shapes); i++)
@@ -3270,8 +3301,6 @@ void gui_update(dt_lib_module_t *self)
     if(view) selectids[v] = _lib_masks_get_selected(view);
   }
 
-  _lib_masks_inactivate_icons(self);
-
   // we store : text ; *module ; groupid ; formid -- see _masks_store_new()
   GtkTreeStore *store[DT_MASKS_NVIEWS];
   for(int v = 0; v < DT_MASKS_NVIEWS; v++) store[v] = _masks_store_new();
@@ -3403,6 +3432,11 @@ void gui_update(dt_lib_module_t *self)
     g_free(t);
   }
   gtk_widget_set_visible(lm->lib_unlinked, unlinked > 0);
+
+  // last, so it reads the models the loop above installed. the early-out at the
+  // top of this function cannot skip a change of state: _forms_structure_hash
+  // mixes every form's id, so gaining or losing the last one always misses it
+  _empty_state_update(lm);
 
   for(int v = 0; v < DT_MASKS_NVIEWS; v++) g_object_unref(store[v]);
 
@@ -3549,6 +3583,12 @@ static void _lib_masks_remove_item(dt_lib_module_t *self,
     }
     g_list_free(rl);
   }
+
+  // this is the one path that empties the lists without going through
+  // gui_update. its only caller adds a history item right after, which does
+  // reach gui_update -- but relying on that would leave the panel showing two
+  // empty lists the day someone calls the proxy on its own
+  _empty_state_update(lm);
 }
 
 static gboolean _lib_masks_selection_change_r(GtkTreeModel *model,
@@ -3842,62 +3882,16 @@ void gui_init(dt_lib_module_t *self)
     d->ic_op[i] = _get_pixbuf_from_cairo(_masks_operators[i].paint,
                                          bs2 * 2, bs2);
 
-  // initialise widgets
-  d->bt_gradient = dtgtk_togglebutton_new(dtgtk_cairo_paint_masks_gradient, 0, NULL);
-  dt_action_define(DT_ACTION(self), N_("shapes"), N_("add gradient"),
-                   d->bt_gradient, &dt_action_def_toggle);
-  g_object_set_data(G_OBJECT(d->bt_gradient), DT_ACTION_GESTURE_KEY,
-                    dt_gui_connect_click(d->bt_gradient, _bt_add_shape_cb, NULL,
-                                         GINT_TO_POINTER(DT_MASKS_GRADIENT)));
-  gtk_widget_set_tooltip_text(d->bt_gradient, _("add gradient"));
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->bt_gradient), FALSE);
-
-  d->bt_path = dtgtk_togglebutton_new(dtgtk_cairo_paint_masks_path, 0, NULL);
-  dt_action_define(DT_ACTION(self), N_("shapes"), N_("add path"),
-                   d->bt_path, &dt_action_def_toggle);
-  g_object_set_data(G_OBJECT(d->bt_path), DT_ACTION_GESTURE_KEY,
-                    dt_gui_connect_click(d->bt_path, _bt_add_shape_cb, NULL,
-                                         GINT_TO_POINTER(DT_MASKS_PATH)));
-  gtk_widget_set_tooltip_text(d->bt_path, _("add path"));
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->bt_path), FALSE);
-
-  d->bt_ellipse = dtgtk_togglebutton_new(dtgtk_cairo_paint_masks_ellipse, 0, NULL);
-  dt_action_define(DT_ACTION(self), N_("shapes"), N_("add ellipse"),
-                   d->bt_ellipse, &dt_action_def_toggle);
-  g_object_set_data(G_OBJECT(d->bt_ellipse), DT_ACTION_GESTURE_KEY,
-                    dt_gui_connect_click(d->bt_ellipse, _bt_add_shape_cb, NULL,
-                                         GINT_TO_POINTER(DT_MASKS_ELLIPSE)));
-  gtk_widget_set_tooltip_text(d->bt_ellipse, _("add ellipse"));
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->bt_ellipse), FALSE);
-
-  d->bt_circle = dtgtk_togglebutton_new(dtgtk_cairo_paint_masks_circle, 0, NULL);
-  dt_action_define(DT_ACTION(self), N_("shapes"), N_("add circle"),
-                   d->bt_circle, &dt_action_def_toggle);
-  g_object_set_data(G_OBJECT(d->bt_circle), DT_ACTION_GESTURE_KEY,
-                    dt_gui_connect_click(d->bt_circle, _bt_add_shape_cb, NULL,
-                                         GINT_TO_POINTER(DT_MASKS_CIRCLE)));
-  gtk_widget_set_tooltip_text(d->bt_circle, _("add circle"));
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->bt_circle), FALSE);
-
-  d->bt_brush = dtgtk_togglebutton_new(dtgtk_cairo_paint_masks_brush, 0, NULL);
-  dt_action_define(DT_ACTION(self), N_("shapes"), N_("add brush"),
-                   d->bt_brush, &dt_action_def_toggle);
-  g_object_set_data(G_OBJECT(d->bt_brush), DT_ACTION_GESTURE_KEY,
-                    dt_gui_connect_click(d->bt_brush, _bt_add_shape_cb, NULL,
-                                         GINT_TO_POINTER(DT_MASKS_BRUSH)));
-  gtk_widget_set_tooltip_text(d->bt_brush, _("add brush"));
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->bt_brush), FALSE);
-
-#ifdef HAVE_AI
-  d->bt_object = dtgtk_togglebutton_new(dtgtk_cairo_paint_masks_object, 0, NULL);
-  dt_action_define(DT_ACTION(self), N_("shapes"), N_("add object"),
-                   d->bt_object, &dt_action_def_toggle);
-  g_object_set_data(G_OBJECT(d->bt_object), DT_ACTION_GESTURE_KEY,
-                    dt_gui_connect_click(d->bt_object, _bt_add_shape_cb, NULL,
-                                         GINT_TO_POINTER(DT_MASKS_OBJECT)));
-  gtk_widget_set_tooltip_text(d->bt_object, _("add AI object"));
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->bt_object), FALSE);
-#endif
+  // the six shape toggles that used to open this panel are gone: every
+  // module's own blending panel already carries the same six (blend_gui.c),
+  // and the catalogue below reaches the same creation with the target written
+  // down first. what does not go is their action paths -- re-registered here
+  // as commands, same ids, so a key bound to "shapes/add circle" still draws
+  // one -- see _add_shape_action for what a command carries and what it drops
+  dt_action_t *shapes = dt_action_section(DT_ACTION(self), N_("shapes"));
+  for(int i = 0; i < (int)G_N_ELEMENTS(_new_mask_shapes); i++)
+    dt_action_register(shapes, _new_mask_shapes[i].action,
+                       _add_shape_action, 0, 0);
 
   d->treeview = gtk_tree_view_new();
   _build_masks_view(self, d->treeview, FALSE);
@@ -3911,24 +3905,32 @@ void gui_init(dt_lib_module_t *self)
   _build_masks_view(self, d->library, TRUE);
   d->active_view = d->treeview;
 
-  // the row used to open on a decorative "created shapes" label; it becomes the
-  // explicit entry point instead. same row, same height, one more thing that
-  // can be clicked -- and the label was redundant with the tree right below it,
-  // which is what shows the shapes that exist. the icons stay to its right:
-  // they carry the "shapes/add *" action paths and user shortcuts are persisted
-  // by path, so removing them would silently invalidate existing bindings.
-  // dt_action_button_new already sets hexpand, dt_gui_expand was redundant
+  // the row used to open on a decorative "created shapes" label and six shape
+  // toggles; it is one full-width command now. the label was redundant with the
+  // tree right below it, and the toggles were a second copy of the row every
+  // blending panel has -- with no module named, which is where an orphan shape
+  // came from on this side. dt_action_button_new already sets hexpand
   GtkWidget *bt_new = dt_action_button_new
     (self, N_("new mask"), _new_mask_clicked, self,
      _("pick a shape and the module it belongs to\n"
        "right-click to cancel while drawing"), 0, 0);
 
-  GtkWidget *shape_buttons = dt_gui_hbox
-    (bt_new,
-     d->bt_brush, d->bt_circle, d->bt_ellipse, d->bt_path, d->bt_gradient);
-#ifdef HAVE_AI
-  dt_gui_box_add(shape_buttons, d->bt_object);
-#endif
+  // M1: an image carrying no mask says so, and says what a mask is for, rather
+  // than showing two empty lists. the sentences go either side of the button
+  // above -- that is M1's reading order, and no second button is needed for it.
+  // a twin would need one anyway: dt_action_button_new registers the action ON
+  // the button, so it would claim the same path "lib/masks/new mask"
+  d->empty_title = gtk_label_new(_("no masks on this image"));
+  d->empty_hint = gtk_label_new(_("a mask limits an adjustment to an area"));
+  gtk_label_set_line_wrap(GTK_LABEL(d->empty_title), TRUE);
+  gtk_label_set_line_wrap(GTK_LABEL(d->empty_hint), TRUE);
+  gtk_label_set_justify(GTK_LABEL(d->empty_title), GTK_JUSTIFY_CENTER);
+  gtk_label_set_justify(GTK_LABEL(d->empty_hint), GTK_JUSTIFY_CENTER);
+  dt_gui_add_class(d->empty_hint, "dt_dimmed");
+  gtk_widget_set_margin_top(d->empty_title, DT_PIXEL_APPLY_DPI(12));
+  gtk_widget_set_margin_bottom(d->empty_title, DT_PIXEL_APPLY_DPI(6));
+  gtk_widget_set_margin_top(d->empty_hint, DT_PIXEL_APPLY_DPI(6));
+  gtk_widget_set_margin_bottom(d->empty_hint, DT_PIXEL_APPLY_DPI(12));
 
   d->lib_unlinked = dt_ui_label_new("");
   // dt_ui_label_new sets ellipsize END, and gtk_label_ensure_layout picks
@@ -3962,14 +3964,33 @@ void gui_init(dt_lib_module_t *self)
   // the masks on top, the shapes they are drawn from below. a row in the top
   // list belongs to a mask -- deleting it detaches it. a row in the library IS
   // the shape. that is the whole point of the split.
-  // both lists stay in place even when empty: a right-click on blank space is
-  // how "add brush/circle/..." and "delete unused shapes" are reached, and that
-  // path must not disappear with the last row
+  //
+  // both lists go away together, and only when both are empty. the right-click
+  // on blank space they used to protect offers, in that state and only that
+  // state, the shape entries of the button above -- a strict subset of its menu
+  // -- plus "delete unused shapes", which can then only reach what neither list
+  // was showing: retouch and spot-removal shapes are held by a module and kept,
+  // what is left is what an undone history step still refers to. below the last
+  // row of a non-empty list that menu is untouched
+  d->masks_box = dt_ui_resize_wrap(d->treeview, 200,
+                                   "plugins/darkroom/masks/heightview");
+  // xalign 0: dt_ui_section_label_new centres its text, and centred over a
+  // full-width rule is how darktable draws a separator -- which is why this one
+  // read as a footer under the list above instead of a heading for the list
+  // below. the class stays, so colour, weight and rule still come from the
+  // theme. same fix on "properties", built by the same helper
+  d->lib_label = dt_ui_section_label_new(C_("section", "shape library"));
+  gtk_label_set_xalign(GTK_LABEL(d->lib_label), 0.0f);
+  d->lib_box = dt_ui_resize_wrap(d->library, 120,
+                                 "plugins/darkroom/masks/heightlibrary");
+
   self->widget = dt_gui_vbox
-    (shape_buttons,
-     dt_ui_resize_wrap(d->treeview, 200, "plugins/darkroom/masks/heightview"),
-     dt_ui_section_label_new(C_("section", "shape library")),
-     dt_ui_resize_wrap(d->library, 120, "plugins/darkroom/masks/heightlibrary"),
+    (d->empty_title,
+     bt_new,
+     d->empty_hint,
+     d->masks_box,
+     d->lib_label,
+     d->lib_box,
      d->lib_unlinked,
      d->creation_bar);
 
@@ -3987,16 +4008,40 @@ void gui_init(dt_lib_module_t *self)
   gtk_widget_set_no_show_all(d->creation_bar, TRUE);
   gtk_widget_hide(d->creation_bar);
 
+  // the message and the two lists are the two sides of one switch, so both
+  // sides take the same treatment: raise the children once, then no_show_all,
+  // or the panel-wide gtk_widget_show_all() of libs/lib.c decides this instead
+  // of gui_update. the two sentences are leaves, nothing under them to raise
+  gtk_widget_set_no_show_all(d->empty_title, TRUE);
+  gtk_widget_set_no_show_all(d->empty_hint, TRUE);
+
+  gtk_widget_show_all(d->masks_box);
+  gtk_widget_show_all(d->lib_label);
+  gtk_widget_show_all(d->lib_box);
+  gtk_widget_set_no_show_all(d->masks_box, TRUE);
+  gtk_widget_set_no_show_all(d->lib_label, TRUE);
+  gtk_widget_set_no_show_all(d->lib_box, TRUE);
+
   dt_gui_new_collapsible_section
     (&d->cs,
      "plugins/darkroom/masks/expand_properties",
      _("properties"),
      GTK_BOX(self->widget),
      DT_ACTION(self));
+  // the helper builds its header with dt_ui_section_label_new too: left-align
+  // it as well, or the panel contradicts itself two lines apart
+  gtk_label_set_xalign(GTK_LABEL(d->cs.label), 0.0f);
   d->none_label = dt_ui_label_new(_("no shapes selected"));
   dt_gui_box_add(d->cs.container, d->none_label);
   gtk_widget_show_all(GTK_WIDGET(d->cs.container));
   gtk_widget_set_no_show_all(GTK_WIDGET(d->cs.container), TRUE);
+  // the section is packed into self->widget by the helper, so it is on screen
+  // in the empty state too unless gui_update is allowed to take it away. same
+  // pattern: show_all raises the header and its arrow exactly as the panel's
+  // own show_all would have, the container above keeps its own no_show_all,
+  // and from here on the empty state decides
+  gtk_widget_show_all(d->cs.expander);
+  gtk_widget_set_no_show_all(d->cs.expander, TRUE);
 
   for(int i = 0; i < DT_MASKS_PROPERTY_LAST; i++)
   {
