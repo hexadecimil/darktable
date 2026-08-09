@@ -68,13 +68,22 @@ static void _paint_cell_render(GtkCellRenderer *r,
                                const GdkRectangle *cell_area,
                                GtkCellRendererState flags)
 {
-  (void)bg_area; (void)flags;
+  (void)bg_area;
   GtkDarktablePaintCell *self = DTGTK_PAINT_CELL(r);
   if(!self->paint) return;
 
+  // the state of the CELL, not of the widget. a widget is never selected, so
+  // reading its state alone drew every icon of a list in the plain foreground
+  // colour -- including the one on the selected row, next to a label that had
+  // just switched -- and gave the prelight of the whole view to every icon in
+  // it at once. gtk_cell_renderer_get_state() is the one call that folds the
+  // widget's state, this renderer's own "sensitive" property and the per-cell
+  // flags into one, and it is what every stock renderer of GTK uses
   GdkRGBA fg;
   GtkStyleContext *ctx = gtk_widget_get_style_context(widget);
-  gtk_style_context_get_color(ctx, gtk_widget_get_state_flags(widget), &fg);
+  gtk_style_context_get_color(ctx,
+                              gtk_cell_renderer_get_state(r, widget, flags),
+                              &fg);
 
   const int mx = cell_area->width  / 5;
   const int my = cell_area->height / 5;
