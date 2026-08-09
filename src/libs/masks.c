@@ -2541,6 +2541,23 @@ static int _shape_use_count(const dt_mask_id_t formid)
   return nb;
 }
 
+// where the selected row sits in a tree view's bin window, for a menu that has
+// no pointer to hang from. x and width come back as 0 -- no column asked for
+// -- which anchors on the left edge of the row, and a row that is scrolled out
+// of view or not realised gives a zero height, which is the caller's cue to
+// fall back
+static gboolean _selected_row_rect(GtkWidget *view, GdkRectangle *rect)
+{
+  GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
+  GList *rows = gtk_tree_selection_get_selected_rows(sel, NULL);
+  if(!rows) return FALSE;
+
+  gtk_tree_view_get_cell_area(GTK_TREE_VIEW(view), rows->data, NULL, rect);
+  g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+
+  return rect->height > 0;
+}
+
 // the context menu of a tree row, built at click. it was inline in
 // _tree_button_pressed_cb, which made that function 345 lines of which the
 // gesture handling was ten: the menu is one subject, the hit-testing of a click
@@ -2552,12 +2569,16 @@ static int _shape_use_count(const dt_mask_id_t formid)
 // freed here, on the one branch that reselects the row, and leaked on every
 // other click -- and now that the two sides live in different functions, who
 // frees it has to be written down rather than read off the code.
+//
+// `at_row` says the menu was asked for without a pointer -- see the tail of
+// this function, where it decides where the menu comes up
 static void _tree_context_menu(dt_lib_module_t *self,
                                GtkWidget *view,
                                GtkTreeSelection *selection,
                                GtkTreeModel *model,
                                GtkTreePath *mouse_path,
                                const gboolean on_row,
+                               const gboolean at_row,
                                dt_iop_module_t *module)
 {
   dt_lib_masks_t *lm = self->data;
@@ -2874,7 +2895,22 @@ static void _tree_context_menu(dt_lib_module_t *self,
   gtk_widget_show_all(GTK_WIDGET(menu));
 
   GdkEvent *event = gtk_get_current_event();
-  gtk_menu_popup_at_pointer(GTK_MENU(menu), event);
+
+  // a key press carries no pointer. gtk_menu_popup_at_pointer() would then
+  // hand GTK an event with no coordinates and the menu would come up at the
+  // corner of the list, or wherever the mouse was last left -- over the canvas
+  // as easily as not. anchor it under the row it is about instead, which is
+  // where the right button would have opened it anyway
+  GdkRectangle rect;
+  if(at_row && _selected_row_rect(view, &rect))
+    gtk_menu_popup_at_rect(GTK_MENU(menu),
+                           gtk_tree_view_get_bin_window(GTK_TREE_VIEW(view)),
+                           &rect,
+                           GDK_GRAVITY_SOUTH_WEST, GDK_GRAVITY_NORTH_WEST,
+                           event);
+  else
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), event);
+
   gdk_event_free(event);
 }
 
@@ -3194,12 +3230,61 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
   else if(button == GDK_BUTTON_SECONDARY)
   {
     _tree_context_menu(self, treeview, selection, model,
-                       mouse_path, on_row, module);
+                       mouse_path, on_row, FALSE, module);
   }
 
   // ours since gtk_tree_view_get_path_at_pos succeeded, on every button and
   // whatever the menu did with it -- the menu only borrows it
   if(mouse_path) gtk_tree_path_free(mouse_path);
+}
+
+// the Menu key and shift+F10, on the row that is selected. GTK raises
+// "popup-menu" on a tree view for both, and the whole of this panel's per-row
+// vocabulary -- rename, duplicate, delete, the five operators, apply
+// earlier/later -- lived behind the right button alone until now. that is what
+// replaces the per-row "..." of M2: a column of ellipsis buttons would have
+// cost ~20 px on every row to double a gesture that already exists, where the
+// right-click is the convention of every other list panel of darktable without
+// one exception. it just had to be reachable from the keyboard.
+//
+// gui/gtk.h enforces the return type with a _Static_assert: this signal wants
+// a gboolean, TRUE meaning handled. libs/collect.c is the precedent for the
+// wiring; it is not one for the position, and that is the `at_row` argument
+// below -- collect.c hands a key event to gtk_menu_popup_at_pointer() and the
+// menu lands wherever the mouse was left, which for a gesture whose whole
+// purpose is to work without one is the one thing to get right
+static gboolean _tree_popup_menu_cb(GtkWidget *view, dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
+  // the menu is built now and its entries read the selection back when they
+  // fire: point them at this list, exactly as the right button does before
+  // anything can pop up
+  lm->active_view = view;
+
+  GtkTreeSelection *selection =
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
+
+  // the module of the row the menu is about. the right button reads it off the
+  // row under the pointer; there is no pointer here, so the selection is the
+  // row. "add existing shape" is the only entry that uses it, and only for a
+  // single selection -- which is also the only case where it means anything
+  dt_iop_module_t *module = NULL;
+  GList *sel = gtk_tree_selection_get_selected_rows(selection, NULL);
+
+  if(sel && !g_list_next(sel))
+  {
+    GtkTreeIter iter;
+    if(gtk_tree_model_get_iter(model, &iter, sel->data))
+      _lib_masks_get_values(model, &iter, &module, NULL, NULL);
+  }
+  g_list_free_full(sel, (GDestroyNotify)gtk_tree_path_free);
+
+  // no row under a pointer, so no path to hand over and nothing to reselect:
+  // the menu reads the selection back itself, which is the whole reason it can
+  // be opened from the keyboard at all
+  _tree_context_menu(self, view, selection, model, NULL, FALSE, TRUE, module);
+  return TRUE;
 }
 
 static gboolean _tree_restrict_select(GtkTreeSelection *selection,
@@ -4468,6 +4553,9 @@ static void _build_masks_view(dt_lib_module_t *self,
   if(!library)
     dt_gui_connect_motion(view, _tree_motion_cb, NULL, _tree_leave_cb, self);
   dt_gui_connect_click_all(view, _tree_button_pressed_cb, NULL, self);
+  // both lists: the same menu, the same entries, and no reason for one of them
+  // to answer the keyboard and the other not
+  g_signal_connect(view, "popup-menu", G_CALLBACK(_tree_popup_menu_cb), self);
 }
 
 void gui_init(dt_lib_module_t *self)
