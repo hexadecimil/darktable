@@ -260,7 +260,7 @@ typedef struct dt_lib_masks_t
   guint resize_timer;       // debounce source id (0 = none)
   gboolean resize_updating; // guard: programmatic slider change, don't commit
 
-  GdkPixbuf *ic_inverse, *ic_used;
+  GdkPixbuf *ic_inverse;
   // the operator glyphs, indexed by _masks_operators: same table, same order,
   // so a sixth operator is one line there and nothing at all here
   GdkPixbuf *ic_op[G_N_ELEMENTS(_masks_operators)];
@@ -501,8 +501,6 @@ typedef enum dt_masks_tree_cols_t
   TREE_IC_OP_VISIBLE,
   TREE_IC_INVERSE,
   TREE_IC_INVERSE_VISIBLE,
-  TREE_IC_USED,
-  TREE_IC_USED_VISIBLE,
   TREE_USED_TEXT,
   // rank of the shape in the application order of its module's mask, ""
   // where that order carries no meaning. derived, never persisted, and
@@ -577,8 +575,6 @@ static GtkTreeStore *_masks_store_new(void)
       [TREE_IC_OP_VISIBLE] = G_TYPE_BOOLEAN,
       [TREE_IC_INVERSE] = GDK_TYPE_PIXBUF,
       [TREE_IC_INVERSE_VISIBLE] = G_TYPE_BOOLEAN,
-      [TREE_IC_USED] = GDK_TYPE_PIXBUF,
-      [TREE_IC_USED_VISIBLE] = G_TYPE_BOOLEAN,
       [TREE_USED_TEXT] = G_TYPE_STRING,
       [TREE_NUM] = G_TYPE_STRING,
       [TREE_LINK] = G_TYPE_STRING,
@@ -1398,10 +1394,22 @@ static void _arm_bar_update(dt_lib_masks_t *d)
     // <the mask>:" and then three ways for the next shape to enter it.
     // unquoted, where M2 draws quotes: every mask a module owns is already
     // named `group `exposure'' by _set_group_name_from_module(), so a second
-    // pair would nest on every row that was never renamed by hand
-    gchar *text = g_strdup_printf(C_("mask", "in %s:"), grp->name);
+    // pair would nest on every row that was never renamed by hand.
+    // and on a mask still carrying that default name, the module's name
+    // alone. the label is capped at ten characters, so "in group `expos..."
+    // named nothing at all -- while the ten characters "in exposure:" needs
+    // name the very same mask. the same predicate the row itself uses to
+    // decide whether to repeat the module after the name
+    gchar *name = dt_masks_group_name_is_default(grp, target)
+      ? dt_history_item_get_name(target)
+      : g_strdup(grp->name);
+    gchar *text = g_strdup_printf(C_("mask", "in %s:"), name);
     gtk_label_set_text(GTK_LABEL(d->arm_label), text);
+    // a mask whose name is long is ellipsized all the same; the tooltip hands
+    // it back whole, exactly as the target line above does with its own
+    gtk_widget_set_tooltip_text(d->arm_label, text);
     g_free(text);
+    g_free(name);
   }
 
   d->arm_updating = TRUE;
@@ -1411,6 +1419,29 @@ static void _arm_bar_update(dt_lib_masks_t *d)
   d->arm_updating = FALSE;
 
   gtk_widget_set_visible(d->arm_bar, armable);
+}
+
+// the glyph on one of the three operator buttons of that bar, drawn and not
+// rasterised. a GtkImage built from d->ic_op[] would be frozen in the colour
+// gui_init found -- DT_GUI_COLOR_BUTTON_FG, 55 % of the foreground -- so the
+// button would go on saying nothing while the word beside it lit, and a theme
+// change would move one and not the other. this is dtgtk/button.c's own three
+// lines: the widget's style context, the widget's state, the paint function.
+// the drawing area inherits the CSS `color` of the button it sits in, so
+// :checked reaches it exactly as it reaches the label
+static gboolean _arm_glyph_draw(GtkWidget *area,
+                                cairo_t *cr,
+                                gpointer op_index)
+{
+  GdkRGBA fg;
+  gtk_style_context_get_color(gtk_widget_get_style_context(area),
+                              gtk_widget_get_state_flags(area), &fg);
+  GtkAllocation alloc;
+  gtk_widget_get_allocation(area, &alloc);
+  gdk_cairo_set_source_rgba(cr, &fg);
+  _masks_operators[GPOINTER_TO_INT(op_index)].paint
+    (cr, 0, 0, alloc.width, alloc.height, 0, NULL);
+  return TRUE;
 }
 
 // one of the three, or the same one again to put it down. M2 draws a cross on
@@ -2061,18 +2092,23 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   }
 
   // a library row -- the only row in either store that is a shape with no
-  // parent group, and the only place a shape exists as itself. what the "used"
-  // badge could never say is whether a module actually renders it: a word, not
-  // a colour and not a glyph, because it has to translate and to follow a theme
-  // change, which the pixbufs rasterised once in gui_init do not.
-  // the walk this costs is paid on library rows only, and dev->forms is the
-  // list a human drew by hand
+  // parent group, and the only place a shape exists as itself. two words where
+  // the "used" badge was one mark: that badge was dtgtk_cairo_paint_masks_used,
+  // a ring with a stem down from the top of it, a few rows under
+  // dtgtk_cairo_paint_switch, which is a ring with a stem down from the top of
+  // it. words also split the two negative states the badge folded together and
+  // leave the ordinary one -- a module renders this shape -- silent, as it
+  // should be. "unused" is exact on this row and still forbidden on the caption
+  // under the list, which covers both states at once (see _shape_scope).
+  // the walk this costs is paid on library rows only, over a list a human drew
   const char *link = "";
 
-  if(!dt_is_valid_maskid(grid)
-     && !(form->type & DT_MASKS_GROUP)
-     && _shape_scope(form->formid, NULL, 0) != DT_MASKS_SCOPE_MODULE)
-    link = _("no module");
+  if(!dt_is_valid_maskid(grid) && !(form->type & DT_MASKS_GROUP))
+  {
+    const dt_masks_shape_scope_t scope = _shape_scope(form->formid, NULL, 0);
+    if(scope == DT_MASKS_SCOPE_GROUP_ONLY) link = _("no module");
+    else if(scope == DT_MASKS_SCOPE_ORPHAN) link = _("unused");
+  }
 
   // M2: "what is this group for?" answered on the row that raises the
   // question. the mask rows only -- which is a root row carrying a module:
@@ -3713,7 +3749,9 @@ static void _is_form_used(const dt_mask_id_t formid,
 // the union of the two other states is what "delete unused shapes" is about,
 // which is why the caption under the library says "not linked to a module" and
 // never "unused": a shape sitting in a stand-alone group is not unused, and the
-// cleanup takes it away all the same.
+// cleanup takes it away all the same. a ROW may say "unused", and only an
+// ORPHAN one does -- that row is in no group and in no module, which is the
+// whole of the word.
 // `groups`, when given, receives the group names behind a GROUP_ONLY verdict.
 // deliberately not cached, though a rebuild asks this of each shape four times:
 // twice in gui_update's two-pass ordering, once in _lib_masks_list_recurs for
@@ -3776,17 +3814,17 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
   // row from the very same state -- this block computed some of them only to
   // be overwritten a few lines later. one writer for what a row displays, so
   // "refresh in place" and "full rebuild" cannot disagree
-  GdkPixbuf *icuse = NULL;
-
   char str2[1000] = "";
+  // an out parameter _is_form_used() writes and nothing here reads any more:
+  // the badge it used to raise is gone, and TREE_LINK now says more than a
+  // count could. the tooltip below is the whole of what survives
   int nbuse = 0;
 
   if(grp_id == 0)
   {
-    // the "used" badge and its tooltip keep their historical meaning, quirks
-    // included: this shape is filed in at least one group, here are their names
+    // the tooltip keeps its historical meaning, quirks included: this shape is
+    // filed in at least one group, here are their names
     _is_form_used(form->formid, NULL, str2, sizeof(str2), &nbuse);
-    if(nbuse > 0) icuse = lm->ic_used;
 
     if(!(form->type & DT_MASKS_GROUP))
     {
@@ -3843,8 +3881,6 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
                        TREE_GROUPID, grp_id,
                        TREE_FORMID, form->formid,
                        TREE_EDITABLE, (grp_id == 0),
-                       TREE_IC_USED, icuse,
-                       TREE_IC_USED_VISIBLE, (nbuse > 0),
                        TREE_USED_TEXT, str2,
                        -1);
     _set_iter_name(lm, form, gstate, opacity, GTK_TREE_MODEL(treestore), &child);
@@ -3885,8 +3921,6 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
                        TREE_GROUPID, grp_id,
                        TREE_FORMID, form->formid,
                        TREE_EDITABLE, (grp_id == 0),
-                       TREE_IC_USED, icuse,
-                       TREE_IC_USED_VISIBLE, (nbuse > 0),
                        TREE_USED_TEXT, str2,
                        -1);
     _set_iter_name(lm, form, gstate, opacity, GTK_TREE_MODEL(treestore), &child);
@@ -4809,21 +4843,10 @@ static void _build_masks_view(dt_lib_module_t *self,
 
   if(library)
   {
-    // packed from the right edge inwards: the badge first, so it keeps the
-    // very place it has today.
-    // the library and nowhere else: on a mask row the badge answered "is this
-    // filed in a group", which a mask row answers by existing. here the
-    // question is real -- one row per shape, and the badge is the whole of
-    // what says the shape is in use at all
-    renderer = gtk_cell_renderer_pixbuf_new();
-    gtk_tree_view_column_pack_end(col, renderer, FALSE);
-    gtk_tree_view_column_set_attributes(col, renderer,
-                                        "pixbuf", TREE_IC_USED, NULL);
-    gtk_tree_view_column_add_attribute(col, renderer,
-                                       "visible", TREE_IC_USED_VISIBLE);
-
-    // and just left of it, what the badge cannot say: no module renders this
-    // shape. same treatment as the rank column -- small, insensitive, greyed by
+    // what the badge could never say, and now the only thing said here: this
+    // shape reaches no module, and whether it at least sits in a group. blank
+    // on the shapes a module renders, which is the ordinary case and needs no
+    // word. same treatment as the rank column -- small, insensitive, greyed by
     // the theme, no colour in the C. no ellipsizing: the name cell expands and
     // gives way, a truncated statement would read as a different statement
     renderer = gtk_cell_renderer_text_new();
@@ -4870,7 +4893,6 @@ void gui_init(dt_lib_module_t *self)
   // cell renderer of the treeview
   const int bs2 = DT_PIXEL_APPLY_DPI(13);
   d->ic_inverse = _get_pixbuf_from_cairo(dtgtk_cairo_paint_masks_inverse, bs2, bs2);
-  d->ic_used = _get_pixbuf_from_cairo(dtgtk_cairo_paint_masks_used, bs2, bs2);
   // the operator glyphs, from the one table that also builds the menu entries
   // and decides which one a row shows. wider than they are high because they
   // are two overlapping circles: dtgtk_cairo_paint_masks_union() and its four
@@ -4981,13 +5003,19 @@ void gui_init(dt_lib_module_t *self)
   g_signal_connect(G_OBJECT(d->bt_target), "clicked",
                    G_CALLBACK(_target_menu_clicked), self);
   d->target_row = dt_gui_hbox(dt_gui_expand(d->target_label), d->bt_target);
+  // M2 puts 5 to 6 px between the objects of a row; dt_gui_hbox() opens at 0
+  // and only the 0.07em margin of a button separated anything. two points on
+  // top of that margin lands on M2 without touching the theme
+  gtk_box_set_spacing(GTK_BOX(d->target_row), DT_PIXEL_APPLY_DPI(2));
 
   // R2: the six shapes, one click each. six buttons ask for about 148 px of
   // their own (1.15em min-width + 0.07em margin + 1px padding + 1px border,
-  // six times over), 170 px inside the panel's 0.65em side padding -- against
-  // 310 px for the same six with the module name on the same line, twice the
-  // 150 px min_panel_width. hence two rows
+  // six times over) plus the five 2 px gaps below, 180 px inside the panel's
+  // 0.65em side padding -- against 320 px for the same six with the module
+  // name on the same line, twice the 150 px min_panel_width. hence two rows
   d->shape_row = dt_gui_hbox();
+  // the same gap the row above takes, for the same reason
+  gtk_box_set_spacing(GTK_BOX(d->shape_row), DT_PIXEL_APPLY_DPI(2));
   for(int i = 0; i < (int)G_N_ELEMENTS(_new_mask_shapes); i++)
     dt_gui_box_add(d->shape_row, dt_gui_expand(d->bt_shape[i]));
 
@@ -5037,25 +5065,56 @@ void gui_init(dt_lib_module_t *self)
                    G_CALLBACK(_creation_bar_cancel), d);
   // the operator bar, above the creation bar and below both lists: one says
   // how the next shape combines, the other where it goes.
-  // words and not glyphs, which is the one thing this row is for. the glyph is
-  // already on the shape's own line once it is drawn, and there it sits beside
-  // a rank and a name that explain it; here it would be three unlabelled
-  // symbols asking to be learned before anything has been drawn at all. M2
-  // spells them out, and the width is affordable: three labelled buttons ask
-  // for about as much as the six shape buttons of the row above, so the panel
-  // gains no new floor
+  // the glyph AND the word, which is what M2 draws -- the earlier reading of
+  // that sketch, "words against three unlabelled symbols", was a choice
+  // between two things it never offered. the glyph is the drawing the shape's
+  // own row will show once it is in, so the button and its result are one
+  // drawing; the word says what a glyph cannot before anything has been drawn.
+  // and the row is measurable now: minimum 172 px against 214 before, under
+  // the 228 px the six shape buttons of the row above already ask for, so it
+  // can no longer be the row GTK cuts off at the right edge
   d->arm_label = dt_ui_label_new("");
-  d->arm_bar = dt_gui_hbox(dt_gui_expand(d->arm_label));
+  // NOT expanding any more. shoulder to shoulder with three hexpanding
+  // buttons it claimed a quarter of the bar to state a name the row above
+  // already carries. capped, so the sentence is what gives way first and never
+  // a button; dimmed, which is the level M2 gives it.
+  // the cap alone would not hold -- max-width-chars bounds the natural width
+  // and never the minimum -- so the ellipsize dt_ui_label_new() already sets
+  // is what makes the bar narrower than its sentence. said here because the
+  // two only work as a pair
+  gtk_label_set_max_width_chars(GTK_LABEL(d->arm_label), 10);
+  gtk_label_set_ellipsize(GTK_LABEL(d->arm_label), PANGO_ELLIPSIZE_END);
+  dt_gui_add_class(d->arm_label, "dt_dimmed");
+  d->arm_bar = dt_gui_hbox(d->arm_label);
+  gtk_box_set_spacing(GTK_BOX(d->arm_bar), DT_PIXEL_APPLY_DPI(2));
 
   for(int i = 0; i < (int)G_N_ELEMENTS(_arm_operators); i++)
   {
     const int op = _op_index(_arm_operators[i].state);
-    GtkWidget *w =
-      gtk_toggle_button_new_with_label(_(_arm_operators[i].label));
+    GtkWidget *w = gtk_toggle_button_new();
+    GtkWidget *word = gtk_label_new(_(_arm_operators[i].label));
+    // ellipsized, so the minimum of the button is the glyph and a letter and
+    // the bar can always be narrower than the panel; named, so the theme sets
+    // it one step under the body text as M2 does, and no size is written here
+    gtk_label_set_ellipsize(GTK_LABEL(word), PANGO_ELLIPSIZE_END);
+    gtk_widget_set_name(word, "masks-arm-word");
+    // the same two sizes the row's own operator pixbuf is rasterised at, so
+    // the button and the row it will produce show one glyph at one size
+    GtkWidget *glyph = gtk_drawing_area_new();
+    gtk_widget_set_size_request(glyph, opw, bs2);
+    gtk_widget_set_valign(glyph, GTK_ALIGN_CENTER);
+    g_signal_connect(G_OBJECT(glyph), "draw", G_CALLBACK(_arm_glyph_draw),
+                     GINT_TO_POINTER(op));
+    GtkWidget *content = dt_gui_hbox(glyph, word);
+    gtk_box_set_spacing(GTK_BOX(content), DT_PIXEL_APPLY_DPI(2));
+    gtk_container_add(GTK_CONTAINER(w), content);
     // the operator's own name, from the msgid the row's context menu already
     // uses: the word on the button and the word in that menu are two names for
-    // one thing, and this is where they are put side by side
-    gchar *tip = g_strdup_printf(_("%s\nthe next shape combines this way"),
+    // one thing, and this is where they are put side by side. the third line
+    // is M2's cross on the lit button, said rather than drawn -- a toggle that
+    // disarms on a second click is that cross with one target fewer
+    gchar *tip = g_strdup_printf(_("%s\nthe next shape combines this way\n"
+                                   "click it again to stop"),
                                  _(_masks_operators[op].name));
     gtk_widget_set_tooltip_text(w, tip);
     g_free(tip);
@@ -5066,6 +5125,7 @@ void gui_init(dt_lib_module_t *self)
   }
 
   d->creation_bar = dt_gui_hbox(dt_gui_expand(d->creation_label), cancel);
+  gtk_box_set_spacing(GTK_BOX(d->creation_bar), DT_PIXEL_APPLY_DPI(2));
 
   // the masks on top, the shapes they are drawn from below. a row in the top
   // list belongs to a mask -- deleting it detaches it. a row in the library IS
@@ -5078,7 +5138,14 @@ void gui_init(dt_lib_module_t *self)
   // was showing: retouch and spot-removal shapes are held by a module and kept,
   // what is left is what an undone history step still refers to. below the last
   // row of a non-empty list that menu is untouched
-  d->masks_box = dt_ui_resize_wrap(d->treeview, 200,
+  // the second argument is a FLOOR and not a starting height: dt_ui_resize_wrap
+  // stashes it as the scrolled window's negative min-content-height, and
+  // _resize_wrap_draw() raises the content height to it before it clamps.
+  // 200 and 120 meant a panel holding one mask and one shape -- about 75 px of
+  // rows -- reserved 320 px and drew 245 of them empty. four rows here, two
+  // below: enough for the box to read as a list rather than as a slot, and the
+  // box still grows with its content up to the two conf values (300 / 150)
+  d->masks_box = dt_ui_resize_wrap(d->treeview, 96,
                                    "plugins/darkroom/masks/heightview");
   // xalign 0: dt_ui_section_label_new centres its text, and centred over a
   // full-width rule is how darktable draws a separator -- which is why this one
@@ -5087,7 +5154,7 @@ void gui_init(dt_lib_module_t *self)
   // theme. same fix on "properties", built by the same helper
   d->lib_label = dt_ui_section_label_new(C_("section", "shape library"));
   gtk_label_set_xalign(GTK_LABEL(d->lib_label), 0.0f);
-  d->lib_box = dt_ui_resize_wrap(d->library, 120,
+  d->lib_box = dt_ui_resize_wrap(d->library, 48,
                                  "plugins/darkroom/masks/heightlibrary");
 
   self->widget = dt_gui_vbox
