@@ -252,6 +252,13 @@ typedef struct dt_lib_masks_t
   // caption under the library, shown only when at least one shape is not
   // linked to a module: it names exactly the set the cleanup is about
   GtkWidget *lib_unlinked;
+  // the shape library's heading row: the section label, and the one button
+  // that empties what the caption under the list describes. a heading and not
+  // the creation row -- F3-4 asks for that distance, and it is all this panel
+  // has. `unlinked` is what gui_update just counted, read back by the
+  // confirmation so the dialog and the caption state one number
+  GtkWidget *lib_row, *bt_cleanup;
+  int unlinked;
   // what the empty state swaps out. the two boxes and not the two views:
   // dt_ui_resize_wrap hands back the event box wrapping the scrolled window,
   // and hiding a view alone would leave that window's min_content_height
@@ -400,7 +407,7 @@ static void _empty_state_update(dt_lib_masks_t *lm)
   gtk_widget_set_visible(lm->target_row, !empty);
   gtk_widget_set_visible(lm->shape_row, !empty);
   gtk_widget_set_visible(lm->masks_box, !empty);
-  gtk_widget_set_visible(lm->lib_label, !empty);
+  gtk_widget_set_visible(lm->lib_row, !empty);
   gtk_widget_set_visible(lm->lib_box, !empty);
   // "properties" goes too. it is the only other thing packed into the panel,
   // M1 is a screen with one action on it, and with nothing to select the
@@ -1146,6 +1153,12 @@ static void _update_all_properties(dt_lib_masks_t *self)
   if(self->bt_hide)
     gtk_widget_set_sensitive(self->bt_hide,
                              (form && form->points != NULL) || drawing);
+
+  // ... and the cleanup, which destroys a shape being drawn:
+  // dt_masks_cleanup_unused() opens on dt_masks_change_form_gui(NULL). the
+  // same answer, read the other way round
+  if(self->bt_cleanup)
+    gtk_widget_set_sensitive(self->bt_cleanup, !drawing);
 }
 
 static void _lib_masks_get_values(GtkTreeModel *model,
@@ -2244,6 +2257,52 @@ static void _handover_base_state(dt_masks_form_t *grp,
   }
 }
 
+// which kind an icon should show for a row, -1 for none.
+//
+// a shape answers for itself. a group answers when no member disagrees -- a
+// mask made of three circles IS a circle mask, and "no member disagrees" is
+// the one count at which the icon cannot start lying. read recursively, so a
+// module's mask holding one AI object resolves through that object's group
+// down to its paths, which is the row M2 draws. read from grp->points and not
+// from the row's children: on a first pass the row is being built and has none.
+// the old rule was "exactly one member", which left a group of two -- an AI
+// object and its hole -- with no icon at all.
+//
+// an AI object first, and by its DEFAULT NAME, which is the only mark it has.
+// develop/masks/object.c destroys the object shape at finalisation and files
+// plain paths, so nothing in the data says where they came from; the name is
+// the mark object.c itself reads back to number the next one, so the panel and
+// the producer are right together or wrong together. renamed by hand, or
+// written in a locale other than the one running, the group falls back to the
+// kind of its members -- a path, which is what it is, and not a lie. saying it
+// durably needs DT_MASKS_OBJECT on the group's type, i.e. a new bit in
+// main.masks_history: deliberately not done here.
+// the depth cap is insurance, not a case: nothing builds a cycle, and this now
+// runs on every row of every refresh
+static int _row_type_index(const dt_masks_form_t *form, const int depth)
+{
+  if(!form || depth > 4) return -1;
+  if(!(form->type & DT_MASKS_GROUP)) return _type_index(form->type);
+
+#ifdef HAVE_AI
+  const char *ai = _("ai object group");
+  if(!strncmp(form->name, ai, strlen(ai)))
+    return _type_index(DT_MASKS_OBJECT);
+#endif
+
+  int ty = -1;
+  for(const GList *l = form->points; l; l = g_list_next(l))
+  {
+    const dt_masks_point_group_t *pt = l->data;
+    const int t = _row_type_index
+      (dt_masks_get_from_id(darktable.develop, pt->formid), depth + 1);
+    if(t < 0 || (ty >= 0 && t != ty)) return -1;
+    ty = t;
+  }
+
+  return ty;
+}
+
 static void _set_iter_name(dt_lib_masks_t *lm,
                            dt_masks_form_t *form,
                            const int state,
@@ -2432,20 +2491,9 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   if(state & DT_MASKS_STATE_INVERSE)
     icinv = lm->ic_inverse;
 
-  // M2.2: every shape says what it is. a group has no kind of its own -- but a
-  // group holding exactly one shape has that shape's, and a mask made of a
-  // single gradient IS a gradient. one is the only count at which the icon
-  // cannot come to mean something else the moment a second shape is added.
-  // read from grp->points and not from the row's children: on a first pass the
-  // row is being built and has none yet
-  const dt_masks_form_t *tform = form;
-
-  if(form->type & DT_MASKS_GROUP)
-    tform = (g_list_length(form->points) == 1)
-      ? dt_masks_get_from_id(darktable.develop, _group_point_id(form, 0))
-      : NULL;
-
-  const int ty = tform ? _type_index(tform->type) : -1;
+  // M2.2: every shape says what it is, and a group says it when its content
+  // agrees on one answer -- the whole of the rule is _row_type_index() above
+  const int ty = _row_type_index(form, 0);
   GdkPixbuf *ictype = (ty >= 0) ? lm->ic_type[ty] : NULL;
 
   gtk_tree_store_set(GTK_TREE_STORE(model), iter,
@@ -2470,8 +2518,29 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   g_free(target);
 }
 
+// the one destructive action of this panel that names no target: it removes
+// every shape no module and no history step refers to. asked for first,
+// because afterwards there is nothing left on screen to point at -- and
+// because dt_masks_cleanup_unused() opens on dt_masks_change_form_gui(NULL),
+// which drops a shape being drawn. the button is insensitive while one is,
+// see _update_all_properties; this is the second lock
 static void _tree_cleanup(GtkButton *button, dt_lib_module_t *self)
 {
+  const dt_lib_masks_t *d = self->data;
+
+  // the count says what the caption above the button says -- how many shapes
+  // the library shows as linked to nothing -- and the sentence then says which
+  // of them go, because the two are not the same set: a shape an undone
+  // history step still refers to is counted here and kept by the cleanup
+  const gboolean go = dt_gui_show_yes_no_dialog
+    (_("delete unused shapes"), "",
+     ngettext("%d shape in the library is linked to no module.\n"
+              "the ones no history step refers to either are removed.",
+              "%d shapes in the library are linked to no module.\n"
+              "the ones no history step refers to either are removed.",
+              d->unlinked), d->unlinked);
+  if(!go) return;
+
   dt_masks_cleanup_unused(darktable.develop);
   _lib_masks_recreate_list(self);
 }
@@ -3196,25 +3265,6 @@ static void _tree_context_menu(dt_lib_module_t *self,
   if(depth > 1)
     from_group = TRUE;
 
-  if(nb == 0 || (grp && grp->type & DT_MASKS_GROUP))
-  {
-    // right-clicking inside a module's group is itself the answer to "which
-    // module?": no target line, we already know. a right-click on empty space
-    // answers nothing, so the target is resolved and then written down,
-    // exactly as the catalogue does it
-    dt_iop_module_t *ctx = _mask_target_ok(sel_module) ? sel_module : NULL;
-    if(ctx)
-      _new_mask_shape_items(menu, ctx);
-    else if((ctx = _mask_default_target(self)))
-    {
-      // same two lines as the button, in the same order. no target at all
-      // leaves the shapes out, which is harmless here and would not be in the
-      // button: this menu has items of its own below
-      _new_mask_target_header(menu, ctx);
-      _new_mask_shape_items(menu, ctx);
-    }
-  }
-
   if(grp && grp->type & DT_MASKS_GROUP)
   {
     // existing forms
@@ -3415,11 +3465,6 @@ static void _tree_context_menu(dt_lib_module_t *self,
     g_signal_connect(item, "activate", G_CALLBACK(_tree_apply_later), self);
     gtk_menu_shell_append(menu, item);
   }
-
-  gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
-  item = gtk_menu_item_new_with_label(_("delete unused shapes"));
-  g_signal_connect(item, "activate", G_CALLBACK(_tree_cleanup), self);
-  gtk_menu_shell_append(menu, item);
 
   gtk_widget_show_all(GTK_WIDGET(menu));
 
@@ -3785,8 +3830,16 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
   }
   else if(button == GDK_BUTTON_SECONDARY)
   {
-    _tree_context_menu(self, treeview, selection, model,
-                       mouse_path, on_row, FALSE, module);
+    // the menu of a ROW, and only that: it is what M2 defines the right button
+    // as, and since the six shapes and the target line became a row of their
+    // own there is nothing left for a blank click to offer that is not already
+    // 20 px above it. the row under the pointer and not the selection either
+    // -- _tree_context_menu() selects what was pointed at before it counts, so
+    // on_row is enough for the menu to have a subject, and a menu built on a
+    // row 200 px away from the click answers a question nobody asked
+    if(on_row)
+      _tree_context_menu(self, treeview, selection, model,
+                         mouse_path, on_row, FALSE, module);
   }
 
   // ours since gtk_tree_view_get_path_at_pos succeeded, on every button and
@@ -3820,6 +3873,10 @@ static gboolean _tree_popup_menu_cb(GtkWidget *view, dt_lib_module_t *self)
   GtkTreeSelection *selection =
     gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
+
+  // nothing selected is nothing to open a menu about, this gesture being the
+  // row's. FALSE, so GTK does what it does when a panel has no such menu
+  if(gtk_tree_selection_count_selected_rows(selection) == 0) return FALSE;
 
   // the module of the row the menu is about. the right button reads it off the
   // row under the pointer; there is no pointer here, so the selection is the
@@ -4675,6 +4732,7 @@ void gui_update(dt_lib_module_t *self)
     gtk_label_set_text(GTK_LABEL(lm->lib_unlinked), t);
     g_free(t);
   }
+  lm->unlinked = unlinked;
   gtk_widget_set_visible(lm->lib_unlinked, unlinked > 0);
 
   // last, so it reads the models the loop above installed. the early-out at the
@@ -5581,13 +5639,15 @@ void gui_init(dt_lib_module_t *self)
   // list belongs to a mask -- deleting it detaches it. a row in the library IS
   // the shape. that is the whole point of the split.
   //
-  // both lists go away together, and only when both are empty. the right-click
-  // on blank space they used to protect offers, in that state and only that
-  // state, the shape entries of the button above -- a strict subset of its menu
-  // -- plus "delete unused shapes", which can then only reach what neither list
-  // was showing: retouch and spot-removal shapes are held by a module and kept,
-  // what is left is what an undone history step still refers to. below the last
-  // row of a non-empty list that menu is untouched
+  // both lists go away together, and only when both are empty -- and the
+  // library's heading goes with them, the cleanup button on it included. that
+  // costs nothing it could reach: the library lists every shape dev->forms
+  // holds bar the ones retouch and spot removal own, so an empty library is a
+  // library with nothing unlinked in it, and what the cleanup would still find
+  // beyond that -- a shape only an undone history step refers to -- was never
+  // reachable in that state either, both trees being hidden and the blank
+  // click that used to open the menu with them.
+  //
   // the second argument is a FLOOR and not a starting height: dt_ui_resize_wrap
   // stashes it as the scrolled window's negative min-content-height, and
   // _resize_wrap_draw() raises the content height to it before it clamps.
@@ -5604,6 +5664,20 @@ void gui_init(dt_lib_module_t *self)
   // theme. same fix on "properties", built by the same helper
   d->lib_label = dt_ui_section_label_new(C_("section", "shape library"));
   gtk_label_set_xalign(GTK_LABEL(d->lib_label), 0.0f);
+  d->bt_cleanup = dtgtk_button_new(dtgtk_cairo_paint_remove, 0, NULL);
+  gtk_widget_set_tooltip_text
+    (d->bt_cleanup,
+     _("delete the shapes no module and no history step uses"));
+  dt_action_define(DT_ACTION(self), N_("shapes"), N_("delete unused shapes"),
+                   d->bt_cleanup, &dt_action_def_button);
+  g_signal_connect(G_OBJECT(d->bt_cleanup), "clicked",
+                   G_CALLBACK(_tree_cleanup), self);
+  // on the heading of the list it empties, and as far from the six creation
+  // buttons as this panel goes. it was in a menu that only opened where there
+  // was blank space left to click -- so it went out of reach on a full list
+  // and out of existence in the empty state
+  d->lib_row = dt_gui_hbox(dt_gui_expand(d->lib_label), d->bt_cleanup);
+  gtk_box_set_spacing(GTK_BOX(d->lib_row), DT_PIXEL_APPLY_DPI(2));
   d->lib_box = dt_ui_resize_wrap(d->library, 48,
                                  "plugins/darkroom/masks/heightlibrary");
 
@@ -5614,7 +5688,7 @@ void gui_init(dt_lib_module_t *self)
      d->target_row,
      d->shape_row,
      d->masks_box,
-     d->lib_label,
+     d->lib_row,
      d->lib_box,
      d->lib_unlinked,
      d->arm_bar,
@@ -5651,10 +5725,12 @@ void gui_init(dt_lib_module_t *self)
   gtk_widget_set_no_show_all(d->empty_hint, TRUE);
 
   gtk_widget_show_all(d->masks_box);
-  gtk_widget_show_all(d->lib_label);
+  // the row and not the label alone: show_all has to reach the cleanup button
+  // packed beside it, and it is the row the empty state now hides
+  gtk_widget_show_all(d->lib_row);
   gtk_widget_show_all(d->lib_box);
   gtk_widget_set_no_show_all(d->masks_box, TRUE);
-  gtk_widget_set_no_show_all(d->lib_label, TRUE);
+  gtk_widget_set_no_show_all(d->lib_row, TRUE);
   gtk_widget_set_no_show_all(d->lib_box, TRUE);
 
   // the top row and the named button are the two sides of the same switch, so
