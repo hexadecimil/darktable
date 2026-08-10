@@ -2091,23 +2091,45 @@ static void _set_iter_name(dt_lib_masks_t *lm,
     if(rank >= 0 && module) snprintf(num, sizeof(num), "%d", rank + 1);
   }
 
-  // a library row -- the only row in either store that is a shape with no
-  // parent group, and the only place a shape exists as itself. two words where
-  // the "used" badge was one mark: that badge was dtgtk_cairo_paint_masks_used,
-  // a ring with a stem down from the top of it, a few rows under
-  // dtgtk_cairo_paint_switch, which is a ring with a stem down from the top of
-  // it. words also split the two negative states the badge folded together and
-  // leave the ordinary one -- a module renders this shape -- silent, as it
-  // should be. "unused" is exact on this row and still forbidden on the caption
-  // under the list, which covers both states at once (see _shape_scope).
+  // a row hanging from no group. two kinds reach this column and they are told
+  // apart below, because what they have to say is not the same thing.
+  //
+  // a library row first -- the only row in either store that is a shape with
+  // no parent group, and the only place a shape exists as itself. two words
+  // where the "used" badge was one mark: that badge was
+  // dtgtk_cairo_paint_masks_used, a ring with a stem down from the top of it,
+  // a few rows under dtgtk_cairo_paint_switch, which is a ring with a stem
+  // down from the top of it. words also split the two negative states the
+  // badge folded together and leave the ordinary one -- a module renders this
+  // shape -- silent, as it should be. "unused" is exact on this row and still
+  // forbidden on the caption under the list, which covers both states at once
+  // (see _shape_scope).
   // the walk this costs is paid on library rows only, over a list a human drew
   const char *link = "";
 
-  if(!dt_is_valid_maskid(grid) && !(form->type & DT_MASKS_GROUP))
+  if(!dt_is_valid_maskid(grid))
   {
-    const dt_masks_shape_scope_t scope = _shape_scope(form->formid, NULL, 0);
-    if(scope == DT_MASKS_SCOPE_GROUP_ONLY) link = _("no module");
-    else if(scope == DT_MASKS_SCOPE_ORPHAN) link = _("unused");
+    if(form->type & DT_MASKS_GROUP)
+    {
+      // ... and a group at the root of the masks list that no module wears.
+      // deliberately NOT the library's "no module", which says "some group
+      // still holds this shape, but nothing renders it": read on this row it
+      // would announce a mask whose module the panel had failed to name. this
+      // row is not a mask at all, it is a group that belongs to nothing --
+      // "group the forms" makes one on purpose, a module taken out of the pipe
+      // leaves one behind -- and the file already has the word for that state,
+      // in the TREE_MODULE_OFF rule below.
+      // TREE_MODULE and not `live`: an empty pointer is gui_update saying no
+      // module holds this group, a stale one is the pipe having moved under
+      // the store, and the second must not be reported as the first
+      if(!module) link = _("unattached");
+    }
+    else
+    {
+      const dt_masks_shape_scope_t scope = _shape_scope(form->formid, NULL, 0);
+      if(scope == DT_MASKS_SCOPE_GROUP_ONLY) link = _("no module");
+      else if(scope == DT_MASKS_SCOPE_ORPHAN) link = _("unused");
+    }
   }
 
   // M2: "what is this group for?" answered on the row that raises the
@@ -3071,7 +3093,18 @@ static void _tree_context_menu(dt_lib_module_t *self,
     gtk_menu_shell_append(menu, item);
   }
 
-  if(nb > 1 && !from_group)
+  // grouping is something one does to SHAPES, so it is offered where the
+  // shapes are. a root row of the masks list is a mask: grouping two of them
+  // built a group of masks that no module wears, and both masks then appeared
+  // twice, once at the root as their module's and once inside it.
+  // where the result lands, since it is not under the rows it was made from:
+  // _tree_group() registers the new group in dev->forms with no module and no
+  // parent, so it appears at the root of the MASKS list, marked "unattached".
+  // that is the one object the model has no level for -- it is not a shape,
+  // and it is not the mask of a module -- and this entry is its deliberate
+  // producer. it stays here rather than in the masks list because what it
+  // takes has to be shapes; what it makes has nowhere better to be shown
+  if(nb > 1 && !from_group && view == lm->library)
   {
     gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
     item = gtk_menu_item_new_with_label(_("group the forms"));
@@ -3796,6 +3829,40 @@ static dt_masks_shape_scope_t _shape_scope(const dt_mask_id_t formid,
   return DT_MASKS_SCOPE_ORPHAN;
 }
 
+// the module whose mask THIS group IS -- the one pointing straight at it, and
+// never one that merely holds it somewhere below. that distinction is the
+// whole of what tells a mask from a group filed inside one, and it is why
+// _shape_scope() cannot answer here: dt_masks_is_in_module() is recursive on
+// purpose and calls both of them MODULE
+static dt_iop_module_t *_mask_group_owner(const dt_mask_id_t formid)
+{
+  if(!dt_is_valid_maskid(formid)) return NULL;
+
+  for(const GList *iops = darktable.develop->iop;
+      iops;
+      iops = g_list_next(iops))
+  {
+    dt_iop_module_t *iop = iops->data;
+    if((iop->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
+       && !(iop->flags() & IOP_FLAGS_NO_MASKS)
+       && iop->blend_params->mask_id == formid)
+      return iop;
+  }
+  return NULL;
+}
+
+// ... and whether some other group holds it. _is_form_used() walks every group
+// of dev->forms, stand-alone ones included, which is exactly this question.
+// only "> 0" is read here, so its long-standing habit of counting a nested
+// group twice cannot reach the screen through this call
+static gboolean _group_is_filed(const dt_mask_id_t formid)
+{
+  char str[1000] = "";
+  int nb = 0;
+  _is_form_used(formid, NULL, str, sizeof(str), &nb);
+  return nb > 0;
+}
+
 static void _lib_masks_list_recurs(GtkTreeStore *treestore,
                                    GtkTreeIter *toplevel,
                                    dt_masks_form_t *form,
@@ -3887,21 +3954,11 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
   }
   else
   {
-    // we first check if it's a "module" group or not
+    // we first check if it's a "module" group or not. the same walk gui_update
+    // runs to decide whether this group is a root row at all, so what a row
+    // states about its module and whether the row exists are one decision
     if(grp_id == 0 && !module)
-    {
-      for(const GList *iops = darktable.develop->iop; iops; iops = g_list_next(iops))
-      {
-        dt_iop_module_t *iop = iops->data;
-        if((iop->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
-           && !(iop->flags() & IOP_FLAGS_NO_MASKS)
-           && iop->blend_params->mask_id == form->formid)
-        {
-          module = iop;
-          break;
-        }
-      }
-    }
+      module = _mask_group_owner(form->formid);
 
     // we add the group node to the tree
     GtkTreeIter child;
@@ -3912,8 +3969,8 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
     else
       // at the root there is no application order to show. keep the historical
       // stacking so root rows -- and _tree_group, which builds a new group in
-      // the visual order of the selection and is only offered for root rows --
-      // are untouched
+      // the visual order of the selection and is offered on the root rows of
+      // the library -- are untouched
       gtk_tree_store_prepend(treestore, &child, NULL);
     gtk_tree_store_set(treestore, &child,
                        TREE_TEXT, str,
@@ -4146,8 +4203,23 @@ void gui_update(dt_lib_module_t *self)
       forms = g_list_next(forms))
   {
     dt_masks_form_t *form = forms->data;
-    if(form->type & DT_MASKS_GROUP)
-      _lib_masks_list_recurs(store[0], NULL, form, 0, NULL, 0, 1.0, lm);
+    if(!(form->type & DT_MASKS_GROUP)) continue;
+
+    // a root row of this list is a MASK: the group a module points at, or a
+    // group nothing else holds. a group filed inside another one is shown
+    // where it is filed and only there.
+    // dev->forms is a flat sack of ids and membership lives in the groups'
+    // points, so being registered there and being a member are not exclusive:
+    // an AI object registers its own group AND hands it to the module's mask,
+    // which put the same composite on two rows -- one nested and complete, one
+    // at the root among the masks with no module, no switch, no target, no
+    // rank and no kind, and a "delete group (shapes are kept)" that emptied
+    // the mask above it. what is skipped here is a duplicate, never the only
+    // row a form has
+    if(!_mask_group_owner(form->formid) && _group_is_filed(form->formid))
+      continue;
+
+    _lib_masks_list_recurs(store[0], NULL, form, 0, NULL, 0, 1.0, lm);
   }
 
   // bottom list: the library every mask draws from -- each shape exactly once.
@@ -4841,27 +4913,30 @@ static void _build_masks_view(dt_lib_module_t *self,
                                             _show_cell_data, NULL, NULL);
   }
 
-  if(library)
-  {
-    // what the badge could never say, and now the only thing said here: this
-    // shape reaches no module, and whether it at least sits in a group. blank
-    // on the shapes a module renders, which is the ordinary case and needs no
-    // word. same treatment as the rank column -- small, insensitive, greyed by
-    // the theme, no colour in the C. no ellipsizing: the name cell expands and
-    // gives way, a truncated statement would read as a different statement
-    renderer = gtk_cell_renderer_text_new();
-    g_object_set(renderer,
-                 "xalign", 1.0,
-                 "xpad", (guint)DT_PIXEL_APPLY_DPI(2),
-                 "scale", PANGO_SCALE_SMALL,
-                 "sensitive", FALSE,
-                 NULL);
-    gtk_tree_view_column_pack_end(col, renderer, FALSE);
-    gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_LINK);
+  // a row that reaches no module says so in words, on BOTH lists and for a
+  // different row of each: in the library, what the badge could never say --
+  // this shape reaches no module, and whether it at least sits in a group; in
+  // the masks list, the one root row that is not a module's mask. blank on
+  // every other row, the shapes a module renders included, which is the
+  // ordinary case and needs no word. same treatment as the rank column --
+  // small, insensitive, greyed by the theme, no colour in the C. no
+  // ellipsizing: the name cell expands and gives way, a truncated statement
+  // would read as a different statement. written in _set_iter_name like every
+  // other derived column, and packed at the end after the opacity and the
+  // target, which are both empty on that root row
+  renderer = gtk_cell_renderer_text_new();
+  g_object_set(renderer,
+               "xalign", 1.0,
+               "xpad", (guint)DT_PIXEL_APPLY_DPI(2),
+               "scale", PANGO_SCALE_SMALL,
+               "sensitive", FALSE,
+               NULL);
+  gtk_tree_view_column_pack_end(col, renderer, FALSE);
+  gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_LINK);
 
-    // the library is flat by construction: no expander gutter to indent it
+  // the library is flat by construction: no expander gutter to indent it
+  if(library)
     gtk_tree_view_set_show_expanders(GTK_TREE_VIEW(view), FALSE);
-  }
 
   GtkTreeSelection *selection =
     gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
