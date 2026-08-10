@@ -505,11 +505,9 @@ typedef enum dt_masks_tree_cols_t
   TREE_IC_USED_VISIBLE,
   TREE_USED_TEXT,
   // rank of the shape in the application order of its module's mask, ""
-  // where that order carries no meaning. TREE_BASE holds _("base") on the
-  // shape that lays the buffer down, "" everywhere else. both are derived,
-  // never persisted, and written by _set_iter_name only
+  // where that order carries no meaning. derived, never persisted, and
+  // written by _set_iter_name only
   TREE_NUM,
-  TREE_BASE,
   // library rows only: one word when no module renders the shape, "" on every
   // other row. derived like the two above, and written in the same single
   // place, _set_iter_name -- which does walk dev->iop for it, but only on the
@@ -583,7 +581,6 @@ static GtkTreeStore *_masks_store_new(void)
       [TREE_IC_USED_VISIBLE] = G_TYPE_BOOLEAN,
       [TREE_USED_TEXT] = G_TYPE_STRING,
       [TREE_NUM] = G_TYPE_STRING,
-      [TREE_BASE] = G_TYPE_STRING,
       [TREE_LINK] = G_TYPE_STRING,
       [TREE_IC_TYPE] = GDK_TYPE_PIXBUF,
       [TREE_IC_TYPE_VISIBLE] = G_TYPE_BOOLEAN,
@@ -2012,8 +2009,8 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   // form->name, so whatever else is shown here is what a rename would write
   // into the name. that used to hold by coincidence only -- the "%" suffix was
   // built right here, and TREE_EDITABLE being (grp_id == 0) simply never
-  // coincided with a row carrying one. the rank, the base marker, the kind and
-  // now the opacity live in columns of their own
+  // coincided with a row carrying one. the rank, the kind and the opacity
+  // live in columns of their own
   char str[256] = "";
   g_strlcat(str, form->name, sizeof(str));
 
@@ -2027,10 +2024,12 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   // combine onto it. number them so a module's mask reads like a recipe --
   // only there: at the root, and inside a stand-alone group no module uses,
   // the order means nothing on screen and gets no number.
-  // the base MARKER is not tied to that: group.c forbids an operator on index
-  // 0 of *every* group and the context menu greys the five "mode:" entries
-  // accordingly, so the marker has to appear wherever that rule bites --
-  // otherwise the menu is disabled without saying why.
+  // the base is not tied to that: group.c forbids an operator on index 0 of
+  // *every* group and the context menu greys the five "mode:" entries
+  // accordingly, so the tooltip that says why has to answer wherever that
+  // rule bites -- otherwise the menu is disabled without saying anything.
+  // that tooltip is _tree_query_tooltip()'s DT_MASKS_OP_HIT_BASE case, which
+  // reads the rank back out of the group and needs no column of its own.
   // TREE_MODULE and TREE_GROUPID are already set on the row by the time we are
   // called, so we read them back instead of growing the signature
   dt_iop_module_t *module = NULL;
@@ -2048,20 +2047,17 @@ static void _set_iter_name(dt_lib_masks_t *lm,
 
   int rank = -1;
   char num[8] = "";
-  const char *base = "";
 
   if(dt_is_valid_maskid(grid))
   {
     rank =
       _group_point_index(dt_masks_get_from_id(darktable.develop, grid), id);
 
-    if(rank >= 0)
-    {
-      if(module) snprintf(num, sizeof(num), "%d", rank + 1);
-      // the base carries no operator and cannot be given one; say so rather
-      // than leave an unexplained empty operator slot and a greyed menu
-      if(rank == 0) base = _("base");
-    }
+    // the base carries no operator and cannot be given one. nothing is
+    // written in its slot for it: the strip is still its zone, the hand
+    // cursor still stays away from it, and the tooltip _tree_query_tooltip()
+    // already puts there says why the five "mode:" entries are greyed
+    if(rank >= 0 && module) snprintf(num, sizeof(num), "%d", rank + 1);
   }
 
   // a library row -- the only row in either store that is a shape with no
@@ -2086,7 +2082,14 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   // the next shape goes, and they have to read as the same statement
   gchar *target = NULL;
 
-  if(live && !dt_is_valid_maskid(grid))
+  // ... and not on a mask that has never been renamed. the name a module
+  // writes into its own mask already IS the module's name -- `group
+  // `exposure'' -- so the row stated it twice and cut the name short to fit
+  // the repeat. asked of develop/masks.c, which composes that name, rather
+  // than matched here against a copy of its format. rename the mask and the
+  // arrow comes back, which is precisely the row M2 draws: "sky -> exposure"
+  if(live && !dt_is_valid_maskid(grid)
+     && !dt_masks_group_name_is_default(form, live))
   {
     gchar *mname = dt_history_item_get_name(live);
     target = g_strdup_printf("→ %s", mname);
@@ -2171,7 +2174,6 @@ static void _set_iter_name(dt_lib_masks_t *lm,
                      TREE_TEXT, str,
                      TREE_OPACITY, opac,
                      TREE_NUM, num,
-                     TREE_BASE, base,
                      TREE_LINK, link,
                      TREE_IC_OP, icop,
                      TREE_IC_OP_VISIBLE, (icop != NULL),
@@ -3182,9 +3184,9 @@ static dt_masks_op_hit_t _op_cell_at_bin(dt_lib_masks_t *lm,
       _lib_masks_get_values(model, &iter, NULL, &grid, &id);
 
       // read from grp->points, never from the row's position: the same walk,
-      // the same function, as the rank and the "base" marker on screen. a row
-      // whose group no longer holds its shape yields NULL and the click stays
-      // a plain selection
+      // and the same function, as the rank on screen. a row whose group no
+      // longer holds its shape yields NULL and the click stays a plain
+      // selection
       int rank = -1;
       const dt_masks_point_group_t *pt =
         _group_point_get(dt_masks_get_from_id(darktable.develop, grid),
@@ -4519,24 +4521,25 @@ static void _build_masks_view(dt_lib_module_t *self,
     // the operator" when GTK reports THIS column under the pointer -- no pixel
     // arithmetic, nothing to keep in step with a renderer's padding. the same
     // test gui/preferences_ai.c runs on its info column.
-    // rank, operator, "base": everything that says where the shape sits in the
+    // rank and operator: everything that says where the shape sits in the
     // application order, in one strip that does not move with depth
     d->op_col = gtk_tree_view_column_new();
     gtk_tree_view_column_set_title(d->op_col, "operator");
     gtk_tree_view_append_column(GTK_TREE_VIEW(view), d->op_col);
 
-    // the application rank, first thing on the row: read the column top-down and
-    // you read the order the shapes are applied in. right-aligned and two
-    // characters wide so a group reaching ten shapes does not shift every name
-    // sideways. small and insensitive: the theme greys it for us -- dark theme
-    // and light theme alike -- and no colour is hardcoded.
-    // a constant empty gutter reads as a margin; a column that moves reads as a
-    // bug -- which is why the library, where no row is ever ranked, carries none
+    // the application rank, first thing on the row: read the column top-down
+    // and you read the order the shapes are applied in. right-aligned, small
+    // and insensitive: the theme greys it for us -- dark theme and light theme
+    // alike -- and no colour is hardcoded.
+    // no reserved width any more. two characters were held so a group reaching
+    // ten shapes would not shift the names sideways; the bill was 18 px of
+    // gutter on every row of every list against the 9 px a digit takes, and M2
+    // gives the rank 10. a mask that reaches ten shapes widens the strip once,
+    // by one digit, like every other content-driven cell in this view
     renderer = gtk_cell_renderer_text_new();
     g_object_set(renderer,
                  "xalign", 1.0,
-                 "xpad", (guint)DT_PIXEL_APPLY_DPI(2),
-                 "width-chars", 2,
+                 "xpad", (guint)DT_PIXEL_APPLY_DPI(1),
                  "scale", PANGO_SCALE_SMALL,
                  "sensitive", FALSE,
                  NULL);
@@ -4553,23 +4556,14 @@ static void _build_masks_view(dt_lib_module_t *self,
     gtk_tree_view_column_add_attribute(d->op_col, renderer,
                                        "visible", TREE_IC_OP_VISIBLE);
 
-    // "base" sits where the operator glyph would be, on the one row that has no
-    // operator and cannot be given one. a word rather than a glyph: it has to
-    // translate, and it has to follow a theme change -- which the icons,
-    // rasterised once in gui_init, do not.
-    // it is in this column and not next to the name on purpose: the strip has
-    // to read vertically. a click on the word is therefore a click "on the
-    // operator", which is why the base is a case _op_cell_at_bin() answers for
-    // rather than a case it ignores
-    renderer = gtk_cell_renderer_text_new();
-    g_object_set(renderer,
-                 "xalign", 0.0,
-                 "xpad", (guint)DT_PIXEL_APPLY_DPI(1),
-                 "scale", PANGO_SCALE_SMALL,
-                 "sensitive", FALSE,
-                 NULL);
-    gtk_tree_view_column_pack_start(d->op_col, renderer, FALSE);
-    gtk_tree_view_column_add_attribute(d->op_col, renderer, "text", TREE_BASE);
+    // no cell for the base marker. M2 draws it as a chip INSIDE the operator
+    // slot -- the two are mutually exclusive, rank 0 never has an operator --
+    // and a GtkCellAreaBox cannot share one slot between two renderers: it
+    // reserves the maximum of each cell over every row of the view, so a
+    // second cell cost 30 px on every row of both lists to speak on one row
+    // per mask. the strip is still the base's own zone: _op_cell_at_bin()
+    // answers DT_MASKS_OP_HIT_BASE over it, and the tooltip there says in a
+    // sentence what a four-letter word only hinted at
   }
 
   GtkTreeViewColumn *col = gtk_tree_view_column_new();
@@ -4621,7 +4615,12 @@ static void _build_masks_view(dt_lib_module_t *self,
                                      "sensitive", TREE_MODULE_ON);
 
   renderer = gtk_cell_renderer_text_new();
-  g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, NULL);
+  // by the END and not by the middle: what a name loses at the end is a
+  // suffix, what it loses in the middle is the word itself. `group
+  // `exposure'' ellipsized in the middle came out "gro...n'", which names
+  // nothing at all -- M2 draws no cut name, and END is the closest thing to
+  // that when one has to be cut
+  g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
   gtk_tree_view_column_pack_start(col, renderer, TRUE);
   gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_TEXT);
   gtk_tree_view_column_add_attribute(col, renderer, "editable", TREE_EDITABLE);
@@ -4645,16 +4644,17 @@ static void _build_masks_view(dt_lib_module_t *self,
   if(!library)
   {
     // the opacity of this shape in this mask, at the right edge of the row.
-    // a fixed four-character gutter: "100%" is the widest string it could hold
-    // and it never holds one, but a cell whose width follows its content moves
-    // every name on every row the moment one shape leaves 100%. small and
-    // insensitive, like the rank on the other side -- the theme greys it, dark
-    // and light alike, and no colour is written here
+    // small and insensitive, like the rank on the other side -- the theme
+    // greys it, dark and light alike, and no colour is written here.
+    // no reserved gutter any more: four characters were held for "100%", the
+    // one string this cell is written never to show, and the 32 px it cost
+    // were paid on every row of every panel whose shapes are all at 100 % --
+    // which is most panels. the names move by that much the first time a
+    // shape leaves 100 %, once, and stop moving after that
     renderer = gtk_cell_renderer_text_new();
     g_object_set(renderer,
                  "xalign", 1.0,
                  "xpad", (guint)DT_PIXEL_APPLY_DPI(2),
-                 "width-chars", 4,
                  "scale", PANGO_SCALE_SMALL,
                  "sensitive", FALSE,
                  NULL);
@@ -4813,15 +4813,22 @@ void gui_init(dt_lib_module_t *self)
   d->ic_inverse = _get_pixbuf_from_cairo(dtgtk_cairo_paint_masks_inverse, bs2, bs2);
   d->ic_used = _get_pixbuf_from_cairo(dtgtk_cairo_paint_masks_used, bs2, bs2);
   // the operator glyphs, from the one table that also builds the menu entries
-  // and decides which one a row shows. twice as wide as they are high, as they
-  // have always been
+  // and decides which one a row shows. wider than they are high because they
+  // are two overlapping circles: dtgtk_cairo_paint_masks_union() and its four
+  // siblings draw 3.4 radii across and 2 down, the radius capped under both
+  // w / 3.4 and h / 2. those two caps meet at w = 1.7 * h, so that is the
+  // narrowest pixbuf still giving the glyph its full height. twice the height
+  // was past that point and paid for it in transparency -- two and a half
+  // points down each side of every shape row, in the one strip with nothing
+  // to spare
+  const int opw = (bs2 * 17) / 10;
   for(int i = 0; i < (int)G_N_ELEMENTS(_masks_operators); i++)
     d->ic_op[i] = _get_pixbuf_from_cairo(_masks_operators[i].paint,
-                                         bs2 * 2, bs2);
+                                         opw, bs2);
 
   // the kind glyphs, from the table that also draws the six buttons above the
   // list: a row and the button that made it show the same drawing. square,
-  // like the inverse and "used" badges -- only the operators are twice as wide
+  // like the inverse marker -- the operators are the only wide ones
   for(int i = 0; i < (int)G_N_ELEMENTS(_new_mask_shapes); i++)
     d->ic_type[i] = _get_pixbuf_from_cairo(_new_mask_shapes[i].paint,
                                            bs2, bs2);
