@@ -4153,21 +4153,26 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
         // tooltip ever said on that row. it follows a sentence now, so it
         // needs one of its own rather than standing there as a bare name
         snprintf(str2, sizeof(str2), _("filed in:\n%s"), groups);
-
-      // what a click here DOES, on every library row and above whatever else
-      // the row has to say. nothing in the panel states it and the row itself
-      // cannot: selecting a shape puts it on the photograph -- _tree_selection
-      // _change() hands it to dev->form_visible and the canvas takes its
-      // handles from there, which is the whole point of a shape belonging to
-      // the image. a row that only ever answered with a rename box read as a
-      // row that could do nothing else
-      gchar *state = g_strdup(str2);
-      snprintf(str2, sizeof(str2), "%s%s%s",
-               _("click to edit this shape on the photograph"),
-               *state ? "\n\n" : "", state);
-      g_free(state);
     }
   }
+
+  // what a click DOES, on every row of both lists and above whatever else the
+  // row has to say. a mask row hands its WHOLE content over:
+  // _tree_selection_change() flattens the group through
+  // dt_masks_group_ungroup(), so every shape under it -- the two paths of an
+  // AI object included -- is drawn at once, and the one under the pointer is
+  // the one being edited (develop/masks/group.c reassigns group_edited on
+  // every move, so no click is needed to change shape). a shape row hands over
+  // that shape alone. said here because nothing else in the panel says it, and
+  // a row that only ever answered with a rename box read as a row that could
+  // do nothing else
+  gchar *state = g_strdup(str2);
+  snprintf(str2, sizeof(str2), "%s%s%s",
+           (form->type & DT_MASKS_GROUP)
+             ? _("click to edit these shapes on the photograph")
+             : _("click to edit this shape on the photograph"),
+           *state ? "\n\n" : "", state);
+  g_free(state);
 
   if(!(form->type & DT_MASKS_GROUP))
   {
