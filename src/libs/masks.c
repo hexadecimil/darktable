@@ -198,6 +198,12 @@ static int _type_index(const dt_masks_type_t type)
   return -1;
 }
 
+// 0 = the masks, 1 = the shape library. declared here and not beside
+// _masks_view() below because the panel keeps one field per list of a few
+// things now, and an array indexed by this is what keeps "do it to both" a
+// one-line loop
+#define DT_MASKS_NVIEWS 2
+
 typedef struct dt_lib_masks_t
 {
   // the manager shows two lists now. `treeview` holds the masks: the groups,
@@ -211,10 +217,20 @@ typedef struct dt_lib_masks_t
   // menu is built now and its entries read the selection back when they fire,
   // so which list they act on has to be decided when the menu opens, once
   GtkWidget *active_view;
-  // the library's column and name cell, so "rename" can open the in-place
-  // editor on the row the photographer pointed at
-  GtkTreeViewColumn *lib_col;
-  GtkCellRenderer *lib_name_cell;
+  // the name column of each list and the cell inside it, indexed exactly like
+  // _masks_view(). two uses, and both lists need them: renaming opens the
+  // in-place editor on the row the photographer pointed at, and the double
+  // click that starts it has to know it landed on the name and not on one of
+  // the cells a single click already acts on
+  GtkTreeViewColumn *name_col[DT_MASKS_NVIEWS];
+  GtkCellRenderer *name_cell[DT_MASKS_NVIEWS];
+  // did the editor actually open? a one-shot handshake between
+  // _tree_start_rename() and "editing-started", read on the line after the
+  // call that should have opened it and never anywhere else. the cell is
+  // editable only while a rename lasts, and a cell left armed by an editor
+  // that never opened is a cell the next plain click would edit -- the very
+  // behaviour the arming exists to remove
+  gboolean rename_started;
   // the masks zone's operator column, and the whole of the click target: a
   // click is "on the operator" when GTK hands back THIS column, never when a
   // pixel offset falls inside a range. one field for both lists, and it only
@@ -324,13 +340,22 @@ static void _arm_bar_update(dt_lib_masks_t *d);
 static void _target_row_update(dt_lib_masks_t *d);
 static void _creation_end_continuous(void);
 
-#define DT_MASKS_NVIEWS 2
-
-// 0 = the masks, 1 = the shape library. an index rather than two named fields
-// so that "do it to both" stays a one-line loop everywhere below
+// the list an index names -- see DT_MASKS_NVIEWS above for which is which.
+// an index rather than two named fields, so that "do it to both" stays a
+// one-line loop everywhere below
 static GtkWidget *_masks_view(dt_lib_masks_t *lm, const int v)
 {
   return v == 0 ? lm->treeview : lm->library;
+}
+
+// ... and the way back, for the handlers a view hands itself to: -1 when the
+// widget is neither list, which is what keeps an array lookup off a bad index
+static int _masks_view_index(dt_lib_masks_t *lm, GtkWidget *view)
+{
+  if(!view) return -1;
+  for(int v = 0; v < DT_MASKS_NVIEWS; v++)
+    if(_masks_view(lm, v) == view) return v;
+  return -1;
 }
 
 // the view an action applies to. pinned by every right-click before the menu
@@ -2588,22 +2613,77 @@ static void _tree_duplicate_shape(GtkButton *button, dt_lib_module_t *self)
   g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
 }
 
-// a shape is named in one place -- its library row -- and nowhere else:
-// TREE_EDITABLE is (grp_id == 0), and a root row is a library row now. double
-// clicking still opens the editor; this entry is what makes it findable
+// the editor opened. nothing else to do with the news: the receipt is read on
+// the next line of _tree_start_rename() and by no one else
+static void _tree_editing_started(GtkCellRenderer *cell,
+                                  GtkCellEditable *editable,
+                                  gchar *path,
+                                  dt_lib_masks_t *lm)
+{
+  lm->rename_started = TRUE;
+}
+
+// a row owns its name when it hangs from no group: a shape in the library, and
+// a mask at the root of the masks list -- which is what TREE_EDITABLE says, on
+// both stores. a shape nested in a mask is the same form under a second row
+// and is renamed in the library, in one place.
+// the cell is armed here and disarmed the moment the edit ends, so nothing
+// else can start one -- see the note in _build_masks_view. that is what
+// libs/map_locations.c does with its own name cell, at each of its three entry
+// points, and for the same reason
+static void _tree_start_rename(dt_lib_module_t *self,
+                               GtkWidget *view,
+                               GtkTreePath *path)
+{
+  dt_lib_masks_t *lm = self->data;
+  const int v = _masks_view_index(lm, view);
+  if(v < 0 || !path || !lm->name_col[v] || !lm->name_cell[v]) return;
+
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
+  GtkTreeIter iter;
+  if(!model || !gtk_tree_model_get_iter(model, &iter, path)) return;
+
+  gboolean editable = FALSE;
+  gtk_tree_model_get(model, &iter, TREE_EDITABLE, &editable, -1);
+  if(!editable) return;
+
+  lm->rename_started = FALSE;
+  g_object_set(lm->name_cell[v], "editable", TRUE, NULL);
+  gtk_tree_view_set_cursor_on_cell(GTK_TREE_VIEW(view), path,
+                                   lm->name_col[v], lm->name_cell[v], TRUE);
+
+  // that call returns void and starts the editor from inside itself, so
+  // "editing-started" has already been through by the time we get here and the
+  // answer is in. it can decline -- the view has to be realized and the column
+  // has to take the focus -- and an arming nothing ever ends is the one state
+  // this whole mechanism cannot afford: neither "edited" nor "editing-canceled"
+  // would come, and the cell would stay editable for good
+  if(!lm->rename_started)
+    g_object_set(lm->name_cell[v], "editable", FALSE, NULL);
+}
+
+// the menu entry and the keyboard both land here: the row is the selected one,
+// there being no pointer to read in the second case
 static void _tree_rename(GtkButton *button, dt_lib_module_t *self)
 {
   dt_lib_masks_t *lm = self->data;
   GtkWidget *view = _masks_active_view(lm);
-  if(view != lm->library || !lm->lib_col || !lm->lib_name_cell) return;
 
   GList *items = gtk_tree_selection_get_selected_rows
     (gtk_tree_view_get_selection(GTK_TREE_VIEW(view)), NULL);
   if(!items) return;
 
-  gtk_tree_view_set_cursor_on_cell(GTK_TREE_VIEW(view), items->data,
-                                   lm->lib_col, lm->lib_name_cell, TRUE);
+  _tree_start_rename(self, view, items->data);
   g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
+}
+
+// escape, and nothing else: GtkCellRendererText emits "edited" on a commit
+// only. a focus loss is not a third case -- dt_gui_commit_on_focus_loss() ends
+// it through "editing-done", which comes out here as an ordinary "edited"
+static void _tree_editing_canceled(GtkCellRenderer *cell,
+                                   gpointer user_data)
+{
+  g_object_set(cell, "editable", FALSE, NULL);
 }
 
 static void _tree_cell_edited(GtkCellRendererText *cell,
@@ -2611,6 +2691,10 @@ static void _tree_cell_edited(GtkCellRendererText *cell,
                               gchar *new_text,
                               GtkWidget *view)
 {
+  // the arming ends with the edit, before anything below can return early:
+  // the cell has to be inert again by the time the next click reaches it
+  g_object_set(cell, "editable", FALSE, NULL);
+
   // the renderer belongs to one view; resolving the path against any other
   // would rename whatever row happens to sit at the same index
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
@@ -3010,21 +3094,25 @@ static void _tree_context_menu(dt_lib_module_t *self,
 
   if(!from_group && nb > 0)
   {
+    // the row hangs from no group, which is the whole of the rule: it owns its
+    // name, TREE_EDITABLE is true on it, and the double click renames it.
+    // said once here for both lists, and no longer inside the branch below
+    // that only shapes reach: a root row of the library is a shape, a root row
+    // of the masks list is a mask, and both are named by hand. renaming a mask
+    // is not a detail -- it is what puts "sky -> exposure" on the row instead
+    // of the module's own name twice over
+    if(nb == 1)
+    {
+      item = gtk_menu_item_new_with_label(_("rename"));
+      g_signal_connect(item, "activate", G_CALLBACK(_tree_rename), self);
+      gtk_menu_shell_append(menu, item);
+    }
+
     dt_masks_form_t *grp = dt_masks_get_from_id(darktable.develop, grpid);
     if(!(grp && (grp->type & DT_MASKS_GROUP)))
     {
       if(nb == 1)
       {
-        // a root row is a library row: the masks zone only holds groups at
-        // depth 1. renaming is only offered where a shape has a name of its
-        // own, and only there is TREE_EDITABLE true
-        if(view == lm->library)
-        {
-          item = gtk_menu_item_new_with_label(_("rename"));
-          g_signal_connect(item, "activate", G_CALLBACK(_tree_rename), self);
-          gtk_menu_shell_append(menu, item);
-        }
-
         item = gtk_menu_item_new_with_label(_("duplicate this shape"));
         g_signal_connect(item, "activate", G_CALLBACK(_tree_duplicate_shape), self);
         gtk_menu_shell_append(menu, item);
@@ -3560,6 +3648,39 @@ static gboolean _tree_popup_menu_cb(GtkWidget *view, dt_lib_module_t *self)
   // be opened from the keyboard at all
   _tree_context_menu(self, view, selection, model, NULL, FALSE, TRUE, module);
   return TRUE;
+}
+
+// M3: double click to rename, and a single click that does nothing but select.
+// GtkTreeView emits "row-activated" on the second press of a double click --
+// and only now that no cell of this column is editable at rest, since the
+// editing branch of its gesture returns before the signal is reached.
+// the gesture is free: the widget attaches no default handler to that signal,
+// which is why gui/preferences.c expands and collapses its own rows from its
+// own "row-activated" callback rather than letting the view do it, and nothing
+// else in this file listens for it. a group is still folded and unfolded by
+// its triangle, the way it always was, and by nothing else.
+// the COLUMN is checked and not just the row: the switch and the show-mask
+// cell are single-click targets, and two quick clicks on a switch are two
+// switches -- the comparison gesture M2 asks the power column for. opening an
+// editor on top of it would fight the very thing it is there for. the operator
+// glyph is the same story one column over. what the check does NOT separate is
+// the cells packed inside the name column itself -- the kind icon, the
+// opacity, the target, the word for a row that reaches no module -- so a
+// double click anywhere along that column renames. none of them answers a
+// click of its own, so there is nothing there to fight
+static void _tree_row_activated_cb(GtkTreeView *view,
+                                   GtkTreePath *path,
+                                   GtkTreeViewColumn *column,
+                                   dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
+  GtkWidget *widget = GTK_WIDGET(view);
+  const int v = _masks_view_index(lm, widget);
+  if(v < 0 || column != lm->name_col[v]) return;
+
+  // the same pinning every other entry point does before acting on a list
+  lm->active_view = widget;
+  _tree_start_rename(self, widget, path);
 }
 
 static gboolean _tree_restrict_select(GtkTreeSelection *selection,
@@ -4762,7 +4883,19 @@ static void _build_masks_view(dt_lib_module_t *self,
   g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
   gtk_tree_view_column_pack_start(col, renderer, TRUE);
   gtk_tree_view_column_add_attribute(col, renderer, "text", TREE_TEXT);
-  gtk_tree_view_column_add_attribute(col, renderer, "editable", TREE_EDITABLE);
+  // "editable" is deliberately NOT bound to TREE_EDITABLE. a cell editable at
+  // rest is a cell GTK starts editing on a plain click:
+  // gtk_tree_view_multipress_gesture_pressed() decides whether to edit BEFORE
+  // it looks at the click count, on one test -- is the clicked row already the
+  // anchor -- and a selection made in code sets that anchor
+  // (_gtk_tree_selection_internal_select_node). so the first click on a row
+  // _restore_selection() had just put back opened the editor, ten seconds
+  // after the selection or ten minutes, and the second press of a real double
+  // click was swallowed by the same branch: "row-activated" never fired on a
+  // row that had a name. the cell is armed for the length of one rename
+  // instead, by _tree_start_rename(), exactly as libs/map_locations.c arms its
+  // own. TREE_EDITABLE stays the policy -- which rows own their name -- and is
+  // read by that function and by the context menu
   // struck through, never greyed: an insensitive cell is not editable, and
   // greying the name is the one change that would make a mask unrenamable.
   // both properties bound, not just the first: "strikethrough" is ignored
@@ -4773,12 +4906,21 @@ static void _build_masks_view(dt_lib_module_t *self,
   gtk_tree_view_column_add_attribute(col, renderer,
                                      "strikethrough-set", TREE_MODULE_OFF);
   g_signal_connect(renderer, "edited", G_CALLBACK(_tree_cell_edited), view);
+  // the other way an edit ends. without it an escaped rename would leave the
+  // cell armed, and the next plain click on that row would open the editor --
+  // the very behaviour the unbinding above exists to remove
+  g_signal_connect(renderer, "editing-canceled",
+                   G_CALLBACK(_tree_editing_canceled), NULL);
+  // ... and the receipt that the editor opened at all, which is what tells an
+  // arming that will end from one that never would
+  g_signal_connect(renderer, "editing-started",
+                   G_CALLBACK(_tree_editing_started), d);
   dt_gui_commit_on_focus_loss(renderer, NULL);
-  if(library)
-  {
-    d->lib_col = col;
-    d->lib_name_cell = renderer;
-  }
+  // both lists: a mask at the root of the top list owns its name as much as a
+  // shape in the library does -- renaming it is what puts "sky -> exposure" on
+  // the row, see the TREE_TARGET note in _set_iter_name
+  d->name_col[library ? 1 : 0] = col;
+  d->name_cell[library ? 1 : 0] = renderer;
 
   if(!library)
   {
@@ -4953,6 +5095,10 @@ static void _build_masks_view(dt_lib_module_t *self,
   if(!library)
     dt_gui_connect_motion(view, _tree_motion_cb, NULL, _tree_leave_cb, self);
   dt_gui_connect_click_all(view, _tree_button_pressed_cb, NULL, self);
+  // the double click, on both lists. it is emitted by the tree view's own
+  // gesture, which our handler above never claims -- see the note there
+  g_signal_connect(view, "row-activated",
+                   G_CALLBACK(_tree_row_activated_cb), self);
   // both lists: the same menu, the same entries, and no reason for one of them
   // to answer the keyboard and the other not
   g_signal_connect(view, "popup-menu", G_CALLBACK(_tree_popup_menu_cb), self);
