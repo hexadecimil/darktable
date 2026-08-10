@@ -231,6 +231,17 @@ Why that? Just because it's a developer choice and most classes use underscore i
 @define-color colorlabel_yellow rgb(255,180,0);
 @define-color colorlabel_purple rgb(230,0,230);
 
+/* mask manager: a row cell that is on -- the module's switch, and the cell
+   that puts that module's mask on the photograph. a cell renderer has no CSS
+   node, so this can never be a :checked rule; the panel resolves the name
+   with gtk_style_context_lookup_color(), the way dt_gui_apply_theme()
+   resolves everything darktable draws in cairo. named here and not written
+   into the C so a theme can take it back in one line: the mask itself is
+   drawn in yellow over the photograph, and these two cells are the only
+   colour in the panel. a theme that wants it strictly grey redefines this to
+   @field_active_fg. */
+@define-color masks_row_on_fg @colorlabel_yellow;
+
 /* Reset GTK defaults - Otherwise dt inherits Adwaita default theme dark */
 *
 {

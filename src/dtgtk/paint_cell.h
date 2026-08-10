@@ -33,6 +33,11 @@ struct _GtkDarktablePaintCell
   DTGTKCairoPaintIconFunc paint;
   gint paint_flags;
   void *paint_data;
+  // the colour this cell takes on a row that says it is on. a cell renderer
+  // has no CSS node of its own -- no :checked rule of the theme can match one
+  // -- so the lit colour is handed over by name instead of being asked for
+  const char *active_color;
+  gboolean active;
 };
 
 /** Cell renderer that draws a dtgtk cairo paint function directly
@@ -46,6 +51,22 @@ struct _GtkDarktablePaintCell
 GtkCellRenderer *dtgtk_paint_cell_new(DTGTKCairoPaintIconFunc paint,
                                       gint paint_flags,
                                       void *paint_data);
+
+/** The colour this cell draws in on a row that says it is on. Resolved with
+ *  gtk_style_context_lookup_color(), the way dt_gui_apply_theme() resolves
+ *  every colour darktable draws in cairo, so the value belongs to the theme
+ *  and never to the caller. The name is kept by reference, not copied.
+ *  A cell nobody calls this on renders exactly as it did before it existed. */
+void dtgtk_paint_cell_set_active_color(GtkDarktablePaintCell *cell,
+                                       const char *css_color);
+
+/** Whether the row this cell is about to be drawn for is on. Set it from a
+ *  GtkTreeCellDataFunc: GtkCellLayout applies the model attributes first and
+ *  the data function second, so "visible" and "sensitive" keep working next
+ *  to it -- the pairing libs/map_locations.c already uses to bind "text" and
+ *  still adjust the same renderer per row. */
+void dtgtk_paint_cell_set_active(GtkDarktablePaintCell *cell,
+                                 const gboolean active);
 
 G_END_DECLS
 
