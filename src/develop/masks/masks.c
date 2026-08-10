@@ -308,12 +308,32 @@ static void _check_id(dt_masks_form_t *form)
   }
 }
 
+// the one place the name of a module's mask is composed. read back by
+// dt_masks_group_name_is_default() below, so a panel that has to know whether
+// a photographer renamed a mask compares against this very string rather than
+// against a second copy of the format that would drift away from it
+static void _group_name_for_module(const dt_iop_module_t *module,
+                                   char *name,
+                                   const size_t name_size)
+{
+  gchar *module_label = dt_history_item_get_name(module);
+  snprintf(name, name_size, _("group `%s'"), module_label);
+  g_free(module_label);
+}
+
 static void _set_group_name_from_module(const dt_iop_module_t *module,
                                         dt_masks_form_t *grp)
 {
-  gchar *module_label = dt_history_item_get_name(module);
-  snprintf(grp->name, sizeof(grp->name), _("group `%s'"), module_label);
-  g_free(module_label);
+  _group_name_for_module(module, grp->name, sizeof(grp->name));
+}
+
+gboolean dt_masks_group_name_is_default(const dt_masks_form_t *grp,
+                                        const dt_iop_module_t *module)
+{
+  if(!grp || !module) return FALSE;
+  char name[sizeof(grp->name)];
+  _group_name_for_module(module, name, sizeof(name));
+  return !strcmp(grp->name, name);
 }
 
 static dt_masks_form_t *_group_create(dt_develop_t *dev,

@@ -585,6 +585,12 @@ dt_masks_form_t *dt_masks_get_from_id_ext(GList *forms, dt_mask_id_t id);
 dt_masks_form_t *dt_masks_get_from_id(const dt_develop_t *dev, dt_mask_id_t id);
 /** check if a form is used by a given module (directly or as a child of its group) */
 gboolean dt_masks_is_in_module(dt_mask_id_t maskid, const struct dt_iop_module_t *module);
+
+/** whether this group still carries the name darktable wrote into it when the
+ *  module took it, rather than one a photographer typed. the mask manager asks
+ *  before repeating on a row the module name that name already contains */
+gboolean dt_masks_group_name_is_default(const dt_masks_form_t *grp,
+                                        const struct dt_iop_module_t *module);
 /** register forms into the mask manager */
 void dt_masks_register_forms(dt_develop_t *dev,
                              GList *forms);
