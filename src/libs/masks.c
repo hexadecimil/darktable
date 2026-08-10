@@ -312,12 +312,15 @@ typedef struct dt_lib_masks_t
   // sensitivity is the only thing about it that moves afterwards
   GtkWidget *bt_hide;
 
-  // the creation bar: one row, under both lists, saying where the next drawn
-  // shape is about to go and letting it be called off. arm_module is this
-  // panel's claim on the creation in flight, not a second source of truth for
-  // it: a shape button in a module's own blending panel arms the very same
-  // canvas and reaches the very same proxy, and only this tells the two apart
-  GtkWidget *creation_bar, *creation_label;
+  // the hint row: one row, under both lists, saying what the panel is waiting
+  // for -- where the next drawn shape is about to go, or that an operator is
+  // armed and a shape has still to be picked -- and letting either be called
+  // off. arm_module is this panel's claim on the creation in flight, not a
+  // second source of truth for it: a shape button in a module's own blending
+  // panel arms the very same canvas and reaches the very same proxy, and only
+  // this tells the two apart. bt_creation_cancel is the cross, which stands
+  // down for the one state of the row that states a fact instead of waiting
+  GtkWidget *creation_bar, *creation_label, *bt_creation_cancel;
   struct dt_iop_module_t *arm_module;
 
   // the operator bar: M2's contextual row, under both lists and above the
@@ -1116,7 +1119,9 @@ static void _update_all_properties(dt_lib_masks_t *self)
   // shrink/grow applies only to a single path shape
   _resize_update(self);
 
-  // ... and the row that says where the next drawn shape is going
+  // ... and the hint row, which says where the next drawn shape is going.
+  // first of the three: it is what settles whether a creation this panel armed
+  // is still in flight, and the two below read that answer
   _creation_bar_update(self);
 
   // ... and the line above the shape buttons, which says the same thing
@@ -1125,7 +1130,9 @@ static void _update_all_properties(dt_lib_masks_t *self)
 
   // ... and the row that says how the next shape will combine once it lands.
   // after _target_row_update on purpose: it reads the very target that call
-  // has just written down
+  // has just written down. last, and it raises or drops the hint row above as
+  // its closing act -- that row also stands for an armed operator, and whether
+  // one is still armed is settled inside this call
   _arm_bar_update(self);
 
   // ... and the header eye, which can only take away what is there. the empty
@@ -1365,11 +1372,16 @@ static void _creation_end_continuous(void)
   fg->creation_continuous_module = NULL;
 }
 
-// the one place the bar is decided, reached from _update_all_properties(), so
-// from all four refresh paths of this panel. what is armed is read back from
-// form_gui rather than mirrored here: the bar then promises exactly what the
-// next click on the image will do, and the shape code stays free to end a
-// creation without telling us -- which is what it does.
+// the hint row, first half: the one place a creation in flight is decided,
+// reached from _update_all_properties(), so from all four refresh paths of
+// this panel. what is armed is read back from form_gui rather than mirrored
+// here: the row then promises exactly what the next click on the image will
+// do, and the shape code stays free to end a creation without telling us --
+// which is what it does.
+//
+// the row itself is raised or dropped by _arm_bar_update(), which runs after
+// this and knows the other half -- an operator armed with nothing being drawn
+// yet, which is F2-2's chip and states the same kind of thing
 static void _creation_bar_update(dt_lib_masks_t *d)
 {
   const dt_masks_form_gui_t *fg = darktable.develop->form_gui;
@@ -1411,7 +1423,11 @@ static void _creation_bar_update(dt_lib_masks_t *d)
     // between entries: inside a sentence that annotation reads as something
     // the shape about to be drawn is going to do
     gchar *name = dt_history_item_get_name(d->arm_module);
-    gchar *text = g_strdup_printf(_("next shape goes to %s"), name);
+    // the shape and not "it": the icon this sentence refers back to is a row
+    // away, above two lists, and a pronoun that far from its antecedent reads
+    // as if the module in brackets were a qualifier of the photograph
+    gchar *text = g_strdup_printf(_("draw the shape on the photograph (%s)"),
+                                  name);
     gtk_label_set_text(GTK_LABEL(d->creation_label), text);
     // the left panel is narrow, the row already carries a button and the
     // module name is what the sentence ends on: the one word the bar exists
@@ -1420,8 +1436,6 @@ static void _creation_bar_update(dt_lib_masks_t *d)
     g_free(text);
     g_free(name);
   }
-
-  gtk_widget_set_visible(d->creation_bar, d->arm_module != NULL);
 
   // and the six toggles follow the very same answer: lit while this panel's
   // creation is in flight, and only the type actually being drawn. upstream
@@ -1485,8 +1499,10 @@ static void _target_row_update(dt_lib_masks_t *d)
 }
 
 // the operator bar. it is up exactly where arming means something: a mask is
-// SELECTED, and that mask already holds at least one shape -- so the next one
-// will not be the base, which takes no operator.
+// pointed at -- a row of it is SELECTED, or a shape is being drawn into it
+// from this panel. what varies inside the bar is what a mask holding nothing
+// yet can take: the first shape lays the base and takes no operator, so two of
+// the three buttons are insensitive there rather than the whole row gone.
 //
 // the selection and not _mask_default_target(): M2 draws this bar only on the
 // panel where a mask is selected, and four of that function's five rules are
@@ -1496,13 +1512,40 @@ static void _target_row_update(dt_lib_masks_t *d)
 //
 // refreshed from _update_all_properties(), so from all four refresh paths of
 // this panel, the selection change included -- which is the one that matters
-static void _arm_bar_update(dt_lib_masks_t *d)
+//
+// rule 1: the mask a row was deliberately clicked on. rule 2: the creation
+// this panel armed -- _start_creation() clears both selections on its way to
+// the canvas (change_form_gui -> dt_dev_masks_selection_change), and rule 1
+// alone therefore took the bar down at the exact moment its promise was about
+// to be kept: the words were on screen everywhere except while the shape was
+// being drawn. read after _creation_bar_update(), which is what keeps
+// arm_module honest -- see _update_all_properties.
+//
+// its own function because _bt_arm_cb() has to answer the same question: the
+// pair it records is compared against this answer on the very next refresh,
+// and a button that resolved the target by rule 1 alone recorded NULL during a
+// creation, was found to disagree, and put itself back down inside its own
+// click
+static dt_iop_module_t *_arm_target_now(dt_lib_masks_t *d)
 {
   dt_iop_module_t *target = d->treeview ? _mask_selected_target(d) : NULL;
+  if(!target && _mask_target_alive(d->arm_module)) target = d->arm_module;
+  return target;
+}
+
+static void _arm_bar_update(dt_lib_masks_t *d)
+{
+  dt_iop_module_t *target = _arm_target_now(d);
+
   const dt_masks_form_t *grp = target
     ? dt_masks_get_from_id(darktable.develop, target->blend_params->mask_id)
     : NULL;
-  const gboolean armable =
+  // an empty mask takes no operator at all: dt_masks_gui_form_save_creation()
+  // only reads the armament inside `if(grp->points)`, the first shape being
+  // the base. F2-4 greys the two that cannot work and keeps the bar up; it
+  // used to vanish, and a row that disappears teaches nothing
+  const gboolean armable = target != NULL;
+  const gboolean composable =
     grp && (grp->type & DT_MASKS_GROUP) && grp->points != NULL;
 
   // the armament belongs to the mask it was chosen for and to no other. it
@@ -1521,29 +1564,15 @@ static void _arm_bar_update(dt_lib_masks_t *d)
     dt_masks_set_next_operator(DT_MASKS_STATE_NONE, NULL);
   }
 
-  if(armable)
-  {
-    // the mask by its name, which is the name its row shows: M2 reads "in
-    // <the mask>:" and then three ways for the next shape to enter it.
-    // unquoted, where M2 draws quotes: every mask a module owns is already
-    // named `group `exposure'' by _set_group_name_from_module(), so a second
-    // pair would nest on every row that was never renamed by hand.
-    // and on a mask still carrying that default name, the module's name
-    // alone. the label is capped at ten characters, so "in group `expos..."
-    // named nothing at all -- while the ten characters "in exposure:" needs
-    // name the very same mask. the same predicate the row itself uses to
-    // decide whether to repeat the module after the name
-    gchar *name = dt_masks_group_name_is_default(grp, target)
-      ? dt_history_item_get_name(target)
-      : g_strdup(grp->name);
-    gchar *text = g_strdup_printf(C_("mask", "in %s:"), name);
-    gtk_label_set_text(GTK_LABEL(d->arm_label), text);
-    // a mask whose name is long is ellipsized all the same; the tooltip hands
-    // it back whole, exactly as the target line above does with its own
-    gtk_widget_set_tooltip_text(d->arm_label, text);
-    g_free(text);
-    g_free(name);
-  }
+  // sensitivity and not visibility: "add" is what the first shape does anyway,
+  // the two others need something already in the mask to work on. the word on
+  // the bar is fixed and set once in gui_init -- it names the moment, which
+  // does not move, where the mask name it used to carry is already on the
+  // highlighted row and on the target line above
+  for(int i = 0; i < (int)G_N_ELEMENTS(_arm_operators); i++)
+    gtk_widget_set_sensitive
+      (d->bt_arm[i],
+       composable || _arm_operators[i].state == DT_MASKS_STATE_UNION);
 
   d->arm_updating = TRUE;
   for(int i = 0; i < (int)G_N_ELEMENTS(_arm_operators); i++)
@@ -1552,6 +1581,46 @@ static void _arm_bar_update(dt_lib_masks_t *d)
   d->arm_updating = FALSE;
 
   gtk_widget_set_visible(d->arm_bar, armable);
+
+  // and the hint row under it, raised here because whether an operator is
+  // still armed was settled six lines above. three things it can say, in the
+  // order the photographer meets them:
+  //   a creation in flight -- the sentence _creation_bar_update() just wrote;
+  //   an operator armed and nothing drawn yet -- F2-2 asks for a persistent
+  //     chip with a cross rather than a pressed button, since a pressed button
+  //     alone never says what to do next, which is the question the three
+  //     words on the bar kept raising;
+  //   a mask holding nothing -- F2-4 asks for the reason two of the three are
+  //     greyed, and a tooltip cannot give it: gtk shows none on an insensitive
+  //     widget.
+  // the cross goes with the first two only: there is nothing to call off in
+  // the third, and a cross beside a plain statement offers to undo the mask.
+  // both of the last two are gated on `armable`, so the row never explains a
+  // bar that is not up: an armament outlives a cancelled creation on purpose
+  // -- see the reset above -- and would otherwise be pointing at three buttons
+  // that went away with their target
+  const gboolean armed = armable && d->arm_op != DT_MASKS_STATE_NONE;
+  if(!d->arm_module)
+  {
+    const gchar *hint = NULL;
+    if(armed)
+      hint = _("now pick a shape above and draw it");
+    else if(armable && !composable)
+      hint = _("the first shape lays the base and takes no operator");
+
+    if(hint)
+    {
+      gtk_label_set_text(GTK_LABEL(d->creation_label), hint);
+      gtk_widget_set_tooltip_text(d->creation_label, hint);
+    }
+    gtk_widget_set_visible(d->bt_creation_cancel, armed);
+    gtk_widget_set_visible(d->creation_bar, hint != NULL);
+  }
+  else
+  {
+    gtk_widget_set_visible(d->bt_creation_cancel, TRUE);
+    gtk_widget_set_visible(d->creation_bar, TRUE);
+  }
 }
 
 // the glyph on one of the three operator buttons of that bar, drawn and not
@@ -1591,8 +1660,9 @@ static void _bt_arm_cb(GtkToggleButton *button, gpointer op)
     : DT_MASKS_STATE_NONE;
   // the mask this is being armed for, recorded with it: the funnel that saves
   // a drawn shape is shared with every other way of drawing one, and only the
-  // pair says which of them this answers for
-  d->arm_target = d->arm_op ? _mask_selected_target(d) : NULL;
+  // pair says which of them this answers for. the same two rules the bar
+  // itself reads, and it has to be the same two -- see _arm_target_now()
+  d->arm_target = d->arm_op ? _arm_target_now(d) : NULL;
   dt_masks_set_next_operator(d->arm_op, d->arm_target);
   // the other two go down: one operator is armed at a time, and the bar has to
   // show which
@@ -1607,14 +1677,26 @@ static void _creation_bar_cancel(GtkButton *button, dt_lib_masks_t *d)
 {
   dt_iop_module_t *module = d->arm_module;
 
+  // one cross for whichever half of the row is up: an armed operator goes down
+  // with it, and it is the only half there is when nothing is being drawn
+  d->arm_op = DT_MASKS_STATE_NONE;
+  d->arm_target = NULL;
+  dt_masks_set_next_operator(DT_MASKS_STATE_NONE, NULL);
+
   _creation_end_continuous();
   if(_mask_target_alive(module))
   {
     dt_masks_set_edit_mode(module, DT_MASKS_EDIT_FULL);
     dt_masks_iop_update(module);
   }
-  else
+  else if(module)
     dt_masks_change_form_gui(NULL);
+  else
+    // nothing was being drawn, so there is no form to drop -- and dropping one
+    // here would take the shapes a selected row put on the photograph off it,
+    // which no cross on this row ever offered to do. the refresh by hand,
+    // because nothing else will come: no form changed
+    _update_all_properties(d);
 
   dt_control_queue_redraw_center();
 }
@@ -1680,10 +1762,13 @@ static gboolean _start_creation(dt_lib_module_t *self,
 
   // the one place the armament is recorded, and all it records is that this
   // panel is what armed the canvas: where the shape goes is form_gui's answer
-  // just above, read back by _creation_bar_update()
+  // just above, read back by _creation_bar_update().
+  // the whole refresh and not that call alone: the hint row is raised by
+  // _arm_bar_update(), which runs after it, and the change_form_gui() above
+  // already went round the proxy while arm_module was still unset
   dt_lib_masks_t *d = self->data;
   d->arm_module = module;
-  _creation_bar_update(d);
+  _update_all_properties(d);
 
   dt_control_queue_redraw_center();
   return TRUE;
@@ -1729,12 +1814,12 @@ static void _bt_add_shape_cb(GtkGestureSingle *gesture,
     dt_modifier_is(dt_gui_current_state(gesture), GDK_CONTROL_MASK);
 
   // taken or refused, the six buttons end up showing what is armed and
-  // nothing else. only the refusal needs the call: _start_creation() returns
-  // before touching the row on that path, and has already said why in the same
+  // nothing else. only the refusal needs the call: _start_creation() refreshes
+  // the panel itself on the other path, and has already said why in the same
   // words every other entry point uses
   if(!_start_creation(self, _mask_default_target(self),
                       GPOINTER_TO_INT(shape), continuous))
-    _creation_bar_update(self->data);
+    _update_all_properties(self->data);
 }
 
 // menu-item adapter. the catalogue and the context menu write the module they
@@ -5406,15 +5491,19 @@ void gui_init(dt_lib_module_t *self)
      _("no module uses them\n"
        "\"delete unused shapes\" removes those no history step refers to either"));
 
-  // the creation bar. it belongs to the panel and not to either resize wrapper:
+  // the hint row. it belongs to the panel and not to either resize wrapper:
   // a row added inside one of them would change what
   // "plugins/darkroom/masks/heightview" measures, and the list would come back
   // one row shorter at the next start
   d->creation_label = dt_ui_label_new("");
   GtkWidget *cancel = dtgtk_button_new(dtgtk_cairo_paint_cancel, 0, NULL);
+  d->bt_creation_cancel = cancel;
   dt_action_define(DT_ACTION(self), N_("shapes"), N_("cancel creation"),
                    cancel, &dt_action_def_button);
-  gtk_widget_set_tooltip_text(cancel, _("do not create the shape"));
+  // it calls off whichever of the two the row is showing -- a shape about to
+  // be drawn, or an operator waiting for one -- and the row only shows the
+  // cross when there is one of them to call off, so a word for both
+  gtk_widget_set_tooltip_text(cancel, _("call it off"));
   g_signal_connect(G_OBJECT(cancel), "clicked",
                    G_CALLBACK(_creation_bar_cancel), d);
   // the operator bar, above the creation bar and below both lists: one says
@@ -5427,16 +5516,22 @@ void gui_init(dt_lib_module_t *self)
   // and the row is measurable now: minimum 172 px against 214 before, under
   // the 228 px the six shape buttons of the row above already ask for, so it
   // can no longer be the row GTK cuts off at the right edge
-  d->arm_label = dt_ui_label_new("");
-  // NOT expanding any more. shoulder to shoulder with three hexpanding
-  // buttons it claimed a quarter of the bar to state a name the row above
-  // already carries. capped, so the sentence is what gives way first and never
-  // a button; dimmed, which is the level M2 gives it.
-  // the cap alone would not hold -- max-width-chars bounds the natural width
-  // and never the minimum -- so the ellipsize dt_ui_label_new() already sets
-  // is what makes the bar narrower than its sentence. said here because the
-  // two only work as a pair
-  gtk_label_set_max_width_chars(GTK_LABEL(d->arm_label), 10);
+  // the two words the bar never said. the question it kept raising was not
+  // which operator, it was WHEN: the answer is "the next one you draw", and it
+  // is written rather than left to a tooltip nobody hovers
+  d->arm_label = dt_ui_label_new(_("next shape:"));
+  // NOT expanding: shoulder to shoulder with three hexpanding buttons an
+  // expanding label claimed a quarter of the bar. and NOT capped either any
+  // more -- the cap was ten characters, set when the label repeated a mask
+  // name the highlighted row already carried and could give way first. it now
+  // carries the only statement of what the three buttons are about, and the
+  // cap would have cut it in every language whose translation runs past it:
+  // "prochaine forme :" is seventeen characters. what still lets the bar be
+  // narrower than its sentence is the ellipsize dt_ui_label_new() sets, on a
+  // natural width that is now the sentence itself.
+  // dimmed, which is the level M2 gives it
+  gtk_widget_set_tooltip_text
+    (d->arm_label, _("how the next shape you draw enters this mask"));
   gtk_label_set_ellipsize(GTK_LABEL(d->arm_label), PANGO_ELLIPSIZE_END);
   dt_gui_add_class(d->arm_label, "dt_dimmed");
   d->arm_bar = dt_gui_hbox(d->arm_label);
@@ -5467,8 +5562,9 @@ void gui_init(dt_lib_module_t *self)
     // one thing, and this is where they are put side by side. the third line
     // is M2's cross on the lit button, said rather than drawn -- a toggle that
     // disarms on a second click is that cross with one target fewer
-    gchar *tip = g_strdup_printf(_("%s\nthe next shape combines this way\n"
-                                   "click it again to stop"),
+    gchar *tip = g_strdup_printf(_("%s\nthe next shape you draw enters the "
+                                   "mask this way\nit stays armed until you "
+                                   "click it again"),
                                  _(_masks_operators[op].name));
     gtk_widget_set_tooltip_text(w, tip);
     g_free(tip);
@@ -5539,9 +5635,10 @@ void gui_init(dt_lib_module_t *self)
   gtk_widget_set_no_show_all(d->arm_bar, TRUE);
   gtk_widget_hide(d->arm_bar);
 
-  // same for the creation bar: show_all reaches the label and the cross once,
-  // then no_show_all keeps a later panel-wide show_all from putting the row
-  // back up
+  // same for the hint row: show_all reaches the label and the cross once, then
+  // no_show_all keeps a later panel-wide show_all from putting the row back up
+  // -- and from putting the cross back with it, which _arm_bar_update() takes
+  // down on the one state of the row that has nothing to call off
   gtk_widget_show_all(d->creation_bar);
   gtk_widget_set_no_show_all(d->creation_bar, TRUE);
   gtk_widget_hide(d->creation_bar);
