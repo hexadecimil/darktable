@@ -1403,6 +1403,17 @@ static void _blendop_blendif_showmask_clicked(GtkGestureSingle *gesture,
 
   dt_iop_request_focus(module);
   dt_iop_refresh_center(module);
+
+  // the mask manager states on every mask row whether that module's mask is
+  // the one on screen. nothing above tells it: dt_iop_request_focus() returns
+  // at once when the module already has the focus, so no lose_focus and no
+  // refresh, and setting module->off active on a module already on emits no
+  // "toggled". without this, switching the display off from here leaves the
+  // row of this very module claiming its mask is still on the photograph.
+  // the two other ways in already do it -- dt_iop_set_mask_display() for the
+  // header indicator and the manager's own cell, dt_iop_gui_blending_lose_focus
+  // for the module that steps aside -- this was the third and last
+  dt_dev_masks_list_update(module->dev);
 }
 
 static void _blendop_masks_modes_none_clicked(GtkGestureSingle *gesture,

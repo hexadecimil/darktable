@@ -39,13 +39,18 @@ static int _paint_cell_compute_size(GtkWidget *widget)
   return s;
 }
 
+// xpad and ypad were ignored in both directions -- neither asked for here nor
+// taken off the drawing area below. that breaks the GtkCellRenderer contract
+// every stock renderer honours, and it left a caller no way to buy air around
+// the glyph other than shrinking the glyph
 static void _paint_cell_get_preferred_width(GtkCellRenderer *r,
                                             GtkWidget *widget,
                                             gint *minimum_size,
                                             gint *natural_size)
 {
-  (void)r;
-  const int s = _paint_cell_compute_size(widget);
+  gint xpad = 0, ypad = 0;
+  gtk_cell_renderer_get_padding(r, &xpad, &ypad);
+  const int s = _paint_cell_compute_size(widget) + 2 * xpad;
   if(minimum_size) *minimum_size = s;
   if(natural_size) *natural_size = s;
 }
@@ -55,8 +60,9 @@ static void _paint_cell_get_preferred_height(GtkCellRenderer *r,
                                              gint *minimum_size,
                                              gint *natural_size)
 {
-  (void)r;
-  const int s = _paint_cell_compute_size(widget);
+  gint xpad = 0, ypad = 0;
+  gtk_cell_renderer_get_padding(r, &xpad, &ypad);
+  const int s = _paint_cell_compute_size(widget) + 2 * ypad;
   if(minimum_size) *minimum_size = s;
   if(natural_size) *natural_size = s;
 }
@@ -79,22 +85,53 @@ static void _paint_cell_render(GtkCellRenderer *r,
   // it at once. gtk_cell_renderer_get_state() is the one call that folds the
   // widget's state, this renderer's own "sensitive" property and the per-cell
   // flags into one, and it is what every stock renderer of GTK uses
+  const GtkStateFlags state = gtk_cell_renderer_get_state(r, widget, flags);
+
+  // and the lit colour by name, because no :checked rule of the theme can
+  // reach a cell: there is no CSS node to hang one on. looked up exactly as
+  // dt_gui_apply_theme() and bauhaus look up every colour they then draw in
+  // cairo. insensitive still wins -- "you cannot reach this" outranks "this
+  // one is on", and the two columns using it never combine the two anyway.
+  // a caller that named no colour keeps the plain path, byte for byte
   GdkRGBA fg;
   GtkStyleContext *ctx = gtk_widget_get_style_context(widget);
-  gtk_style_context_get_color(ctx,
-                              gtk_cell_renderer_get_state(r, widget, flags),
-                              &fg);
+  if(!(self->active
+       && self->active_color
+       && !(state & GTK_STATE_FLAG_INSENSITIVE)
+       && gtk_style_context_lookup_color(ctx, self->active_color, &fg)))
+    gtk_style_context_get_color(ctx, state, &fg);
 
-  const int mx = cell_area->width  / 5;
-  const int my = cell_area->height / 5;
+  gint xpad = 0, ypad = 0;
+  gtk_cell_renderer_get_padding(r, &xpad, &ypad);
+  const int w = cell_area->width  - 2 * xpad;
+  const int h = cell_area->height - 2 * ypad;
+  if(w <= 0 || h <= 0) return;
 
+  // 5 % a side, which is the breathing room #button-canvas gives every icon
+  // button of darktable (data/themes/darktable.css). it was 20 %, and a glyph
+  // in a row came out at a third of the area of the same glyph on the button
+  // that reaches the same setting -- 10 px against 16.
+  // never zero: 5 % of a cell the height of a line of text rounds down to
+  // nothing, and a paint function is entitled to the whole box it is given --
+  // dtgtk_cairo_paint_showmask fills it corner to corner, and the round cap
+  // dtgtk_cairo_paint_switch puts on the top of its stem reaches half a
+  // stroke past it. one point keeps either off the cell next door
+  const int mx = MAX(1, w / 20);
+  const int my = MAX(1, h / 20);
+
+  // CPF_ACTIVE with the lit state, the way dtgtk/togglebutton.c raises it.
+  // it draws nothing by itself for the two functions in a cell today --
+  // dtgtk_cairo_paint_switch reads only CPF_FOCUS, dtgtk_cairo_paint_showmask
+  // reads no flag at all -- it is the contract the rest of paint.c is written
+  // against, and the next function dropped into a cell will find it already
+  // true
   cairo_save(cr);
   gdk_cairo_set_source_rgba(cr, &fg);
   self->paint(cr,
-              cell_area->x + mx, cell_area->y + my,
-              cell_area->width  - 2 * mx,
-              cell_area->height - 2 * my,
-              self->paint_flags, self->paint_data);
+              cell_area->x + xpad + mx, cell_area->y + ypad + my,
+              w - 2 * mx, h - 2 * my,
+              self->paint_flags | (self->active ? CPF_ACTIVE : 0),
+              self->paint_data);
   cairo_restore(cr);
 }
 
@@ -111,6 +148,8 @@ static void dtgtk_paint_cell_init(GtkDarktablePaintCell *self)
   self->paint = NULL;
   self->paint_flags = 0;
   self->paint_data = NULL;
+  self->active_color = NULL;
+  self->active = FALSE;
 }
 
 GtkCellRenderer *dtgtk_paint_cell_new(DTGTKCairoPaintIconFunc paint,
@@ -122,6 +161,22 @@ GtkCellRenderer *dtgtk_paint_cell_new(DTGTKCairoPaintIconFunc paint,
   cell->paint_flags = paint_flags;
   cell->paint_data = paint_data;
   return GTK_CELL_RENDERER(cell);
+}
+
+void dtgtk_paint_cell_set_active_color(GtkDarktablePaintCell *cell,
+                                       const char *css_color)
+{
+  g_return_if_fail(cell != NULL);
+  // kept by reference and never copied: the caller hands over a literal, the
+  // same way the table of dt_gui_apply_theme() holds its colour names
+  cell->active_color = css_color;
+}
+
+void dtgtk_paint_cell_set_active(GtkDarktablePaintCell *cell,
+                                 const gboolean active)
+{
+  g_return_if_fail(cell != NULL);
+  cell->active = active;
 }
 
 // clang-format off

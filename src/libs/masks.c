@@ -2127,13 +2127,15 @@ static void _set_iter_name(dt_lib_masks_t *lm,
     && !dt_is_valid_maskid(grid)
     && live->blend_data != NULL
     && (live->blend_params->mask_mode & DEVELOP_MASK_MASK);
-  // ... and whether it is the one on screen. at most one module carries the
-  // flag: dt_iop_gui_blending_lose_focus() clears it on the module losing the
-  // focus, so this is a radio the engine keeps, not one this panel enforces.
-  // a module that is off is stepped back here too: it renders no blend, so
-  // whatever it may still be requesting is not what is on the photograph
+  // ... and whether it is the one on screen. word for word the test
+  // develop/blend.c makes before it honours the request (`valid_request`):
+  // the focus included, so a request left standing on a module that no longer
+  // has it cannot light a row. that is what makes the cell a radio -- at most
+  // one row lit, because at most one module has the focus -- without this
+  // panel having to enforce one
   const gboolean show_on = show
     && live->enabled
+    && dt_iop_has_focus(live)
     && (live->request_mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK);
 
   // the glyph is drawn exactly where the shape HAS an operator: inside a
@@ -4504,6 +4506,37 @@ static GdkPixbuf *_get_pixbuf_from_cairo(DTGTKCairoPaintIconFunc paint,
                                   cairo_image_surface_get_stride(cst), NULL, NULL);
 }
 
+// a cell renderer has no CSS node, so nothing in the theme can reach it on a
+// state: what the row says about itself has to be handed over by hand, once
+// per row, right before it is drawn. GtkCellLayout applies the model
+// attributes first and this second, so "visible" and "sensitive" above keep
+// working untouched -- same pairing as libs/map_locations.c, which binds
+// "text" and sets a data func on one renderer.
+// two functions and not one taking the column in its user data: the two model
+// columns are not interchangeable, and the wrong one here would light the
+// wrong glyph on every row of the list at once
+static void _power_cell_data(GtkTreeViewColumn *col,
+                             GtkCellRenderer *cell,
+                             GtkTreeModel *model,
+                             GtkTreeIter *iter,
+                             gpointer user_data)
+{
+  gboolean on = FALSE;
+  gtk_tree_model_get(model, iter, TREE_MODULE_ON, &on, -1);
+  dtgtk_paint_cell_set_active(DTGTK_PAINT_CELL(cell), on);
+}
+
+static void _show_cell_data(GtkTreeViewColumn *col,
+                            GtkCellRenderer *cell,
+                            GtkTreeModel *model,
+                            GtkTreeIter *iter,
+                            gpointer user_data)
+{
+  gboolean on = FALSE;
+  gtk_tree_model_get(model, iter, TREE_SHOW_ON, &on, -1);
+  dtgtk_paint_cell_set_active(DTGTK_PAINT_CELL(cell), on);
+}
+
 // both lists are the same widget fed different rows. keeping them built by one
 // function is the whole point: the moment they diverge, every fix has to be
 // written twice and one of the two will be forgotten.
@@ -4691,34 +4724,44 @@ static void _build_masks_view(dt_lib_module_t *self,
     // expanding, so the leftover width still goes to the names and this strip
     // keeps its own.
     //
-    // a fixed width and not a natural one: the cell asks for the row's line
-    // height, which follows the theme's font, and a click target whose cost in
-    // panel width cannot be stated is a click target that gets argued about.
-    // sixteen points is what ic_inverse and ic_used are rasterised near
-    // (thirteen), so the glyph sits in the same optical column as theirs
+    // no fixed width. sixteen raw points against a cell that asks for the
+    // row's line height gave a 14 px cell, and _paint_cell_render then took a
+    // further fifth off each side: 10 px of glyph, where a .dt_module_btn
+    // holding the very same switch is near 16. it was also the one
+    // GTK_TREE_VIEW_COLUMN_FIXED left in darktable, and the precedent this
+    // column claimed -- gui/preferences_ai.c and its info column -- sets no
+    // sizing and no width at all. left natural, the column is 25 px and the
+    // glyph 19: the size of the same switch in the module header, which is
+    // the one place a reader compares it to
     d->power_col = gtk_tree_view_column_new();
     gtk_tree_view_column_set_title(d->power_col, "power");
-    gtk_tree_view_column_set_sizing(d->power_col,
-                                    GTK_TREE_VIEW_COLUMN_FIXED);
-    gtk_tree_view_column_set_fixed_width(d->power_col,
-                                         DT_PIXEL_APPLY_DPI(16));
     gtk_tree_view_append_column(GTK_TREE_VIEW(view), d->power_col);
 
-    // ONE renderer and not two, which is the whole of what the paint cell's
-    // own state buys: the cell reads that state now, so "off" is the theme's
-    // insensitive colour on the same glyph rather than a second pixbuf and a
-    // branch on the row. dtgtk_cairo_paint_switch is the glyph the module's
-    // own button draws (dt_iop_gui_set_enable_button_icon), so the two
-    // switches of one module are the same drawing.
-    // "visible" is TREE_POWER -- a mask row with a reachable switch -- and
+    // ONE renderer, one drawing: dtgtk_cairo_paint_switch, the glyph the
+    // module's own enable button draws (dt_iop_gui_set_enable_button_icon), so
+    // the two switches of one module are the same switch. that button says on
+    // or off by its COLOUR and nothing else -- button:checked, one CSS rule --
+    // and this cell now says it the same way, which is also what M2 asks of it
+    // (".pw" against ".pw.on", one glyph, two colours).
+    // NOT dtgtk_cairo_paint_switch_on for the lit state, tempting as the
+    // filled disc is: that drawing already means "this module cannot be
+    // switched off" in the header and in the history stack, and a third
+    // meaning for it in a third list is how an icon set stops being one.
+    // "visible" is TREE_POWER -- a mask row with a reachable switch --
     // "sensitive" is TREE_MODULE_ON, already written for the struck-through
-    // name: on at full contrast, off stepped back, which is M2 note 7
+    // name, and the lit colour is set per row by the data func below. three
+    // levels: lit, resting, stepped back, which is M2 note 7
     renderer = dtgtk_paint_cell_new(dtgtk_cairo_paint_switch, 0, NULL);
+    g_object_set(renderer, "xpad", (guint)DT_PIXEL_APPLY_DPI(1), NULL);
+    dtgtk_paint_cell_set_active_color(DTGTK_PAINT_CELL(renderer),
+                                      "masks_row_on_fg");
     gtk_tree_view_column_pack_start(d->power_col, renderer, FALSE);
     gtk_tree_view_column_add_attribute(d->power_col, renderer,
                                        "visible", TREE_POWER);
     gtk_tree_view_column_add_attribute(d->power_col, renderer,
                                        "sensitive", TREE_MODULE_ON);
+    gtk_tree_view_column_set_cell_data_func(d->power_col, renderer,
+                                            _power_cell_data, NULL, NULL);
 
     // M2 reads the row left to right and ends on the switch, with the
     // show-mask cell just before it. INSERTED and not appended, at the index
@@ -4727,25 +4770,41 @@ static void _build_masks_view(dt_lib_module_t *self,
     // before this block does not silently move it
     d->show_col = gtk_tree_view_column_new();
     gtk_tree_view_column_set_title(d->show_col, "show mask");
-    gtk_tree_view_column_set_sizing(d->show_col, GTK_TREE_VIEW_COLUMN_FIXED);
-    gtk_tree_view_column_set_fixed_width(d->show_col,
-                                         DT_PIXEL_APPLY_DPI(16));
     gtk_tree_view_insert_column
       (GTK_TREE_VIEW(view), d->show_col,
        gtk_tree_view_get_n_columns(GTK_TREE_VIEW(view)) - 1);
 
     // dtgtk_cairo_paint_showmask is the glyph the module's own header
     // indicator draws (dt_iop_add_remove_mask_indicator), so the two ways to
-    // reach the same request are the same drawing. lit on the module whose
-    // mask is on screen, stepped back on the others -- the same polarity the
-    // switch beside it uses, and the same single renderer a paint cell that
-    // reads its own state makes possible
+    // reach the same request are the same drawing -- and, like the switch
+    // beside it, the same drawing lit and unlit, told apart by colour alone.
+    // the very colour, in fact: one name for both cells, because a reader
+    // scanning the right edge of the list is reading one question, "what is
+    // this row doing right now", and two accents would read as two.
+    // this is the one place M2 and the blending panel disagree. the blending
+    // panel's own display-mask button lights in @field_active_fg, a grey;
+    // M2 puts its accent on the cell, and so does this, because the mask is
+    // drawn in yellow OVER THE PHOTOGRAPH and this cell is what puts it there.
+    // named in darktable.css, so a theme that wants the grey back is one line
     renderer = dtgtk_paint_cell_new(dtgtk_cairo_paint_showmask, 0, NULL);
+    g_object_set(renderer, "xpad", (guint)DT_PIXEL_APPLY_DPI(1), NULL);
+    dtgtk_paint_cell_set_active_color(DTGTK_PAINT_CELL(renderer),
+                                      "masks_row_on_fg");
     gtk_tree_view_column_pack_start(d->show_col, renderer, FALSE);
     gtk_tree_view_column_add_attribute(d->show_col, renderer,
                                        "visible", TREE_SHOW);
+    // "sensitive" is TREE_MODULE_ON and no longer TREE_SHOW_ON: stepped back
+    // here means "this module renders no blend, so there is nothing of its
+    // mask to put on screen" -- the same thing the struck-through name says
+    // one column over, and the same thing M2 note 7 does to the whole row.
+    // and it is not silence either: _op_cell_at_bin() still answers over the
+    // cell with DT_MASKS_OP_HIT_SHOW_OFF, which is the tooltip that says why.
+    // what TREE_SHOW_ON says, "this one is the mask on screen", is now said
+    // by the lit colour, where it belongs
     gtk_tree_view_column_add_attribute(d->show_col, renderer,
-                                       "sensitive", TREE_SHOW_ON);
+                                       "sensitive", TREE_MODULE_ON);
+    gtk_tree_view_column_set_cell_data_func(d->show_col, renderer,
+                                            _show_cell_data, NULL, NULL);
   }
 
   if(library)
