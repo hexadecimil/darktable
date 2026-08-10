@@ -1916,6 +1916,15 @@ treeview#masks-library
   background-color: shade(@bg_color, 0.9);
 }
 
+/* mask manager: the three operator buttons of the bar under the lists carry a
+   glyph and a word, the way M2 draws them. the word sits one step under the
+   body text -- the glyph is what identifies the button, the word is what
+   teaches it -- the same relation .dt_history_switch has with its own row. */
+#masks-arm-word
+{
+  font-size: 0.88em;
+}
+
   /* set active menu items: needed for some Pango issues not rendering synthetic bold for all OS */
 .active_menu_item,
 .active_menu_item label
