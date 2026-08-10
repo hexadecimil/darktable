@@ -307,6 +307,11 @@ typedef struct dt_lib_masks_t
   GtkWidget *shape_row;
   GtkWidget *bt_shape[G_N_ELEMENTS(_new_mask_shapes)];
 
+  // M2's header eye, built by gui_tool_box(). rebuilt with the expander on
+  // every view change, so the field is weak-cleared on destroy there: its
+  // sensitivity is the only thing about it that moves afterwards
+  GtkWidget *bt_hide;
+
   // the creation bar: one row, under both lists, saying where the next drawn
   // shape is about to go and letting it be called off. arm_module is this
   // panel's claim on the creation in flight, not a second source of truth for
@@ -448,6 +453,97 @@ static gboolean _selected_masks_are_used(GtkTreeModel *model,
   }
 
   return FALSE;
+}
+
+// M2's header eye: take every drawn shape off the photograph, without having
+// to find a blank strip in a list that fills its own height. that strip is
+// what the photographer found by himself -- gtk_tree_selection_unselect_all()
+// on a blank click -- and its one limit is real: a full list has no blank.
+//
+// a button and not a toggle, because the engine holds no such state. what is
+// drawn IS dev->form_visible (views/darkroom.c reads it straight, and
+// develop/masks/group.c walks its points with no per-shape flag), so "hidden"
+// can only mean "nothing armed". a toggle would promise a state it cannot
+// keep: the next click on a row, the next shape drawn, a module's own eye all
+// put shapes back without telling this panel.
+//
+// the deselection goes to both lists at once and through
+// _tree_selection_change(), the ONE place this panel writes form_visible, so
+// the lists and the canvas cannot end up disagreeing, and it leaves the lists
+// folded exactly as they were. the other branch cannot: dt_masks_change_form_
+// gui(NULL) lands in _lib_masks_selection_change(), which collapses what it
+// fails to find -- the price of reaching what no row of ours put on screen.
+//
+// it takes away the outlines and nothing else, which is what its tooltip says.
+// the filled overlay of the show-mask cell is a module request that
+// develop/blend.c only honours for the module holding the focus; clearing it
+// would mean dt_iop_set_mask_display(), i.e. a focus change and a pipe
+// recompute inside a button that is meant to cost nothing, and the one cell
+// that can be lit is lit, one click away
+static void _hide_all_shapes(dt_lib_module_t *self)
+{
+  dt_lib_masks_t *d = self->data;
+  gboolean any = FALSE;
+
+  for(int v = 0; v < DT_MASKS_NVIEWS; v++)
+  {
+    GtkWidget *view = _masks_view(d, v);
+    GtkTreeSelection *sel =
+      view ? gtk_tree_view_get_selection(GTK_TREE_VIEW(view)) : NULL;
+    if(sel && gtk_tree_selection_count_selected_rows(sel) > 0)
+    {
+      any = TRUE;
+      gtk_tree_selection_unselect_all(sel);
+    }
+  }
+
+  // and what no row of ours put there: a creation in flight, a form armed
+  // while both lists showed nothing. the form is dropped outright then, which
+  // is what folding the panel already does -- and a continuous run left
+  // standing would chain the next shape drawn anywhere
+  if(!any)
+  {
+    _creation_end_continuous();
+    dt_masks_change_form_gui(NULL);
+  }
+
+  dt_masks_reset_show_masks_icons();
+  dt_control_queue_redraw_center();
+}
+
+static void _bt_hide_cb(GtkButton *button, dt_lib_module_t *self)
+{
+  _hide_all_shapes(self);
+}
+
+// the one hook libs/lib.c offers a panel for a button of its own in the header
+// (lib.c packs it beside the reset and the presets buttons, which is where M2
+// draws this one); libs/collect.c is its only other user. called from
+// dt_lib_gui_get_expander(), i.e. when the view is built, long after gui_init:
+// self->data is there
+GtkWidget *gui_tool_box(dt_lib_module_t *self)
+{
+  dt_lib_masks_t *d = self->data;
+
+  // the glyph every module's blending panel already gives to "show and edit
+  // mask elements": one drawing for one subject, on both sides of the screen
+  d->bt_hide = dtgtk_button_new(dtgtk_cairo_paint_masks_eye, 0, NULL);
+  // the outlines and not the filled overlay, which is the reach this button
+  // has -- see _hide_all_shapes()
+  gtk_widget_set_tooltip_text
+    (d->bt_hide, _("hide the shape outlines drawn over the photograph"));
+  dt_action_define(DT_ACTION(self), N_("shapes"), N_("hide on the photograph"),
+                   d->bt_hide, &dt_action_def_button);
+  g_signal_connect(G_OBJECT(d->bt_hide), "clicked",
+                   G_CALLBACK(_bt_hide_cb), self);
+  // this button lives in the expander header, and views/view.c destroys the
+  // whole expander on every view change while this panel's data survives.
+  // without this the field would outlive the widget and the next refresh --
+  // the selection proxy fires from outside the darkroom too -- would set the
+  // sensitivity of freed memory
+  g_signal_connect(G_OBJECT(d->bt_hide), "destroy",
+                   G_CALLBACK(gtk_widget_destroyed), &d->bt_hide);
+  return d->bt_hide;
 }
 
 void expanded_state(dt_lib_module_t *self,
@@ -1031,6 +1127,18 @@ static void _update_all_properties(dt_lib_masks_t *self)
   // after _target_row_update on purpose: it reads the very target that call
   // has just written down
   _arm_bar_update(self);
+
+  // ... and the header eye, which can only take away what is there. the empty
+  // group _tree_selection_change() leaves behind is not NULL, so the test is
+  // on the points and not on the form. a creation in flight counts too: it
+  // holds no point until the first click on the image, and it is exactly what
+  // the button drops when no row of ours put anything on screen. the two
+  // halves of it are the ones _creation_bar_update() reads
+  const dt_masks_form_gui_t *fg = darktable.develop->form_gui;
+  const gboolean drawing = fg && (fg->creation || fg->creation_module);
+  if(self->bt_hide)
+    gtk_widget_set_sensitive(self->bt_hide,
+                             (form && form->points != NULL) || drawing);
 }
 
 static void _lib_masks_get_values(GtkTreeModel *model,
