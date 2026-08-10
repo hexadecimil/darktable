@@ -4003,16 +4003,20 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
   // be overwritten a few lines later. one writer for what a row displays, so
   // "refresh in place" and "full rebuild" cannot disagree
   char str2[1000] = "";
-  // an out parameter _is_form_used() writes and nothing here reads any more:
-  // the badge it used to raise is gone, and TREE_LINK now says more than a
-  // count could. the tooltip below is the whole of what survives
+  // the badge this count used to raise is gone and TREE_LINK now says more
+  // than a number could, so nothing displays it any more. it survives as a
+  // yes-or-no: is this form filed in any group at all, which is what decides
+  // whether the tooltip below has a list to introduce
   int nbuse = 0;
 
   if(grp_id == 0)
   {
-    // the tooltip keeps its historical meaning, quirks included: this shape is
-    // filed in at least one group, here are their names
-    _is_form_used(form->formid, NULL, str2, sizeof(str2), &nbuse);
+    // the names of the groups holding this form, which is the tooltip's
+    // historical content, quirks included. kept apart from str2 now: it is a
+    // bare list, and a bare list is an ingredient and not a sentence
+    char groups[1000] = "";
+    _is_form_used(form->formid, NULL, groups, sizeof(groups), &nbuse);
+    g_strlcpy(str2, groups, sizeof(str2));
 
     if(!(form->type & DT_MASKS_GROUP))
     {
@@ -4021,23 +4025,39 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
       // the sentence behind it, which needs the names of the groups holding the
       // shape and so cannot be had from the scope alone. short on the row,
       // spelled out under the list and in this tooltip: a library where every
-      // row carries a sentence is a library nobody reads
-      char groups[1000] = "";
-      const dt_masks_shape_scope_t scope =
-        _shape_scope(form->formid, groups, sizeof(groups));
+      // row carries a sentence is a library nobody reads.
+      // NULL for the names: `groups` above already holds them, and asking
+      // _shape_scope() for them a second time would clear it on the very case
+      // that needs it, a shape a module does render
+      const dt_masks_shape_scope_t scope = _shape_scope(form->formid, NULL, 0);
 
-      if(scope != DT_MASKS_SCOPE_MODULE)
-      {
-        if(scope == DT_MASKS_SCOPE_GROUP_ONLY)
-          // "unused" would be a lie in one direction and a trap in the other:
-          // no module renders it, yet the group holding it is real
-          snprintf(str2, sizeof(str2),
-                   _("no module uses this shape\n"
-                     "it is only filed in:\n%s"), groups);
-        else
-          g_strlcpy(str2, _("no module and no group uses this shape"),
-                    sizeof(str2));
-      }
+      if(scope == DT_MASKS_SCOPE_GROUP_ONLY)
+        // "unused" would be a lie in one direction and a trap in the other:
+        // no module renders it, yet the group holding it is real
+        snprintf(str2, sizeof(str2),
+                 _("no module uses this shape\n"
+                   "it is only filed in:\n%s"), groups);
+      else if(scope == DT_MASKS_SCOPE_ORPHAN)
+        g_strlcpy(str2, _("no module and no group uses this shape"),
+                  sizeof(str2));
+      else if(nbuse > 0)
+        // a module does render it, and the list of groups was all this
+        // tooltip ever said on that row. it follows a sentence now, so it
+        // needs one of its own rather than standing there as a bare name
+        snprintf(str2, sizeof(str2), _("filed in:\n%s"), groups);
+
+      // what a click here DOES, on every library row and above whatever else
+      // the row has to say. nothing in the panel states it and the row itself
+      // cannot: selecting a shape puts it on the photograph -- _tree_selection
+      // _change() hands it to dev->form_visible and the canvas takes its
+      // handles from there, which is the whole point of a shape belonging to
+      // the image. a row that only ever answered with a rename box read as a
+      // row that could do nothing else
+      gchar *state = g_strdup(str2);
+      snprintf(str2, sizeof(str2), "%s%s%s",
+               _("click to edit this shape on the photograph"),
+               *state ? "\n\n" : "", state);
+      g_free(state);
     }
   }
 
