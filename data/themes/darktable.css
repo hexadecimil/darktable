@@ -1916,6 +1916,18 @@ treeview#masks-library
   background-color: shade(@bg_color, 0.9);
 }
 
+/* mask manager: the row a drag is about to drop on or between. gtk draws the
+   indicator itself under the "dnd" style class -- a line between rows
+   (reorder) or a frame around the row (add) -- and the reset at the top of
+   this file leaves both invisible (libs/tagging.c hit the same wall, see its
+   FIXME). the accent is the panel's own; note the same class also tints the
+   floating row icon of the drag, which reads as intended. */
+treeview.dnd
+{
+  color: @masks_row_on_fg;
+  border: 1px solid @masks_row_on_fg;
+}
+
 /* mask manager: the three operator buttons of the bar under the lists carry a
    glyph and a word, the way M2 draws them. the word sits one step under the
    body text -- the glyph is what identifies the button, the word is what

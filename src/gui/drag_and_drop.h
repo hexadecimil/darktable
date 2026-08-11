@@ -31,6 +31,7 @@ enum
   DND_TARGET_TAG,
   DND_TARGET_IOP,
   DND_TARGET_LIB,
+  DND_TARGET_MASK_SHAPE,
 };
 
 /* drag & drop for internal image ids */
