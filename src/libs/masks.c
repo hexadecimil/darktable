@@ -55,6 +55,11 @@ static void _lib_masks_get_values(GtkTreeModel *model,
 static gboolean
 _update_foreach(GtkTreeModel *model, GtkTreePath *path, GtkTreeIter *iter, gpointer data);
 
+// defined with the other grp->points walkers below; the module list of the
+// context menu needs the direct-membership answer before that point
+static int _group_point_index(const dt_masks_form_t *grp,
+                              const dt_mask_id_t formid);
+
 // three states, computed once per library row by _shape_scope() below
 typedef enum dt_masks_shape_scope_t
 {
@@ -1919,6 +1924,37 @@ static void _target_set_cb(GtkMenuItem *item, gpointer module)
   dt_masks_change_form_gui(NULL);
 }
 
+// send an existing shape to a module, wherever the gesture came from: the
+// context menu of a library row now, the drop of a library drag later. the
+// engine creates the module's mask when it has none, the module is switched
+// to drawn masking first -- nothing in develop/masks/*.c ever writes
+// mask_mode, see _start_creation -- and a refused add writes no history
+static gboolean _shape_add_to_module(dt_iop_module_t *module,
+                                     const dt_mask_id_t formid)
+{
+  // the pipe can be rebuilt between the gesture that opened the menu and the
+  // click that lands here -- same guard as _start_creation
+  if(!_mask_target_alive(module) || !_mask_target_ok(module)) return FALSE;
+
+  dt_iop_gui_enable_drawn_mask(module);
+
+  if(!dt_masks_iop_add_exist(module, formid)) return FALSE;
+
+  // reselect the mask that took the shape once the lists are rebuilt, the
+  // way _tree_add_exist follows its own add
+  dt_dev_masks_selection_change(darktable.develop, NULL,
+                                module->blend_params->mask_id);
+  return TRUE;
+}
+
+// menu-item adapter: the module is the callback argument, the shape rides on
+// the item as an id -- never a form pointer, the menu outlives the pipe
+static void _add_to_module_cb(GtkMenuItem *item, gpointer module)
+{
+  _shape_add_to_module(module,
+    GPOINTER_TO_INT(g_object_get_data(G_OBJECT(item), "formid")));
+}
+
 // every module that could take the shape. `flat` picks which of the two menus
 // this is: in the catalogue each entry carries the same list of types one
 // level down, so picking there picks the target AND the shape in one gesture;
@@ -1926,9 +1962,13 @@ static void _target_set_cb(GtkMenuItem *item, gpointer module)
 // shapes are the row 20 px underneath and a menu repeating them would be a
 // second, slower copy of it. `current` is the module to leave out: it is the
 // one already named on the line this list hangs from
+// ... and `add_formid`, when valid, turns the list into its third job:
+// activating an entry adds THAT shape to the module -- the mirror, seen from
+// a shape, of the group rows' "add existing shape"
 static gboolean _new_mask_other_modules(GtkMenuShell *menu,
                                         const dt_iop_module_t *current,
-                                        const gboolean flat)
+                                        const gboolean flat,
+                                        const dt_mask_id_t add_formid)
 {
   gboolean any = FALSE;
   int last_rank = -1;
@@ -1956,14 +1996,39 @@ static gboolean _new_mask_other_modules(GtkMenuShell *menu,
         gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
       last_rank = r;
 
+      // does this module's mask already hold the shape on offer? direct
+      // membership only, never dt_masks_is_in_module(): a shape filed in a
+      // sub-group is another row and a legitimate second add
+      const gboolean has_it = dt_is_valid_maskid(add_formid)
+        && _group_point_index(dt_masks_get_from_id(darktable.develop,
+                                                   m->blend_params->mask_id),
+                              add_formid) >= 0;
+
       gchar *label = _mask_target_label(m);
+      if(has_it)
+      {
+        // gtk3 delivers no tooltip to an insensitive item: the reason lives
+        // in the label, like every other refusal of this menu
+        gchar *said = g_strdup_printf("%s (%s)", label,
+                                      _("already has this shape"));
+        g_free(label);
+        label = said;
+      }
       GtkWidget *item = gtk_menu_item_new_with_label(label);
       g_free(label);
 
-      if(!_mask_target_ok(m))
+      if(!_mask_target_ok(m) || has_it)
         // on a raster mask: _blendop_masks_modes_toggle() would refuse the
-        // switch, so the entry stays and says so rather than disappearing
+        // switch, so the entry stays and says so rather than disappearing.
+        // a mask already holding the shape follows the same rule
         gtk_widget_set_sensitive(item, FALSE);
+      else if(dt_is_valid_maskid(add_formid))
+      {
+        g_object_set_data(G_OBJECT(item), "formid",
+                          GUINT_TO_POINTER(add_formid));
+        g_signal_connect(item, "activate",
+                         G_CALLBACK(_add_to_module_cb), m);
+      }
       else if(flat)
         g_signal_connect(item, "activate", G_CALLBACK(_target_set_cb), m);
       else
@@ -2001,7 +2066,8 @@ static void _new_mask_target_header(GtkMenuShell *menu,
   g_free(header);
 
   GtkWidget *others = gtk_menu_new();
-  if(_new_mask_other_modules(GTK_MENU_SHELL(others), target, FALSE))
+  if(_new_mask_other_modules(GTK_MENU_SHELL(others), target, FALSE,
+                             INVALID_MASKID))
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), others);
   else
   {
@@ -2065,7 +2131,7 @@ static void _target_menu_clicked(GtkButton *button, dt_lib_module_t *self)
   const dt_iop_module_t *target = _mask_default_target(self);
 
   GtkMenuShell *menu = GTK_MENU_SHELL(gtk_menu_new());
-  if(!_new_mask_other_modules(menu, target, TRUE))
+  if(!_new_mask_other_modules(menu, target, TRUE, INVALID_MASKID))
   {
     // one module in the whole pipe can hold a drawn mask and it is the one
     // already on the line: nothing to open. sink the floating reference first,
@@ -3332,6 +3398,30 @@ static void _tree_context_menu(dt_lib_module_t *self,
       item = gtk_menu_item_new_with_label(_("add existing shape"));
       gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), menu0);
       gtk_menu_shell_append(menu, item);
+    }
+  }
+
+  // a library row offers the mirror of the group rows' "add existing shape":
+  // send THIS shape to a module. the same rank-ordered module list as the
+  // target row's "...", each entry carrying the shape; a module whose mask
+  // already holds it stays, greyed, and says why -- F4's "already linked".
+  // grpid holds TREE_FORMID of the selected row, see the note above
+  if(nb == 1 && !from_group && view == lm->library
+     && dt_is_valid_maskid(grpid))
+  {
+    GtkWidget *others = gtk_menu_new();
+    if(_new_mask_other_modules(GTK_MENU_SHELL(others), NULL, FALSE, grpid))
+    {
+      item = gtk_menu_item_new_with_label(_("add to module"));
+      gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), others);
+      gtk_menu_shell_append(menu, item);
+    }
+    else
+    {
+      // nothing in this pipe can take a drawn shape: no entry at all. sink
+      // the floating reference first, as _new_mask_target_header does
+      g_object_ref_sink(others);
+      g_object_unref(others);
     }
   }
 

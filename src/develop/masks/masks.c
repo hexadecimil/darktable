@@ -1712,12 +1712,16 @@ static void _menu_add_shape(dt_iop_module_t *module,
   dt_control_queue_redraw_center();
 }
 
-static void _menu_add_exist(dt_iop_module_t *module,
-                            const dt_mask_id_t formid)
+// add an existing shape to a module's drawn mask, creating that mask when the
+// module has none yet -- _group_create and _group_from_module are private to
+// this file, so this is the one door. writes ONE masks history item, and only
+// when the add really happened: dt_masks_group_add_form() can refuse
+gboolean dt_masks_iop_add_exist(dt_iop_module_t *module,
+                                const dt_mask_id_t formid)
 {
-  if(!module) return;
+  if(!module) return FALSE;
   dt_masks_form_t *form = dt_masks_get_from_id(darktable.develop, formid);
-  if(!form) return;
+  if(!form) return FALSE;
 
   // is there already a masks group for this module ?
   dt_masks_form_t *grp = _group_from_module(darktable.develop, module);
@@ -1726,12 +1730,20 @@ static void _menu_add_exist(dt_iop_module_t *module,
     grp = _group_create(darktable.develop, module, DT_MASKS_GROUP);
   }
   // we add the form in this group
-  dt_masks_group_add_form(grp, form);
+  if(!dt_masks_group_add_form(grp, form)) return FALSE;
+
   // we save the group
-  // and we ensure that we are in edit mode
   dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
   dt_masks_iop_update(module);
-  dt_masks_set_edit_mode(module, DT_MASKS_EDIT_FULL);
+  return TRUE;
+}
+
+static void _menu_add_exist(dt_iop_module_t *module,
+                            const dt_mask_id_t formid)
+{
+  // we ensure that we are in edit mode
+  if(dt_masks_iop_add_exist(module, formid))
+    dt_masks_set_edit_mode(module, DT_MASKS_EDIT_FULL);
 }
 
 void dt_masks_group_update_name(dt_iop_module_t *module)
