@@ -60,6 +60,7 @@ _update_foreach(GtkTreeModel *model, GtkTreePath *path, GtkTreeIter *iter, gpoin
 // context menu needs the direct-membership answer before that point
 static int _group_point_index(const dt_masks_form_t *grp,
                               const dt_mask_id_t formid);
+static dt_iop_module_t *_mask_group_owner(const dt_mask_id_t formid);
 
 // three states, computed once per library row by _shape_scope() below
 typedef enum dt_masks_shape_scope_t
@@ -3707,9 +3708,45 @@ static void _drag_dest_resolve(dt_lib_masks_t *lm,
     return;
   }
 
-  // the drag left the library: nothing takes it yet -- the masks list
-  // only reorders its own rows
-  gtk_tree_path_free(path);
+  // a shape pulled out of the library: the drop adds it to the MASK under
+  // the pointer -- the whole depth-1 row, wherever inside an unfolded mask
+  // the pointer sits. one gesture, one meaning: a nested group keeps its own
+  // "add existing shape" in the menu
+  while(gtk_tree_path_get_depth(path) > 1)
+    gtk_tree_path_up(path);
+  if(!gtk_tree_model_get_iter(model, &iter, path))
+  {
+    gtk_tree_path_free(path);
+    return;
+  }
+
+  dt_mask_id_t grp_id = INVALID_MASKID;
+  _lib_masks_get_values(model, &iter, NULL, NULL, &grp_id);
+
+  dt_masks_form_t *grp = dt_masks_get_from_id(darktable.develop, grp_id);
+  // the live owner, from dev->iop -- the row's module pointer can be one
+  // refresh stale
+  dt_iop_module_t *module = _mask_group_owner(grp_id);
+
+  // refused: not a group any more, a module that cannot take a drawn shape,
+  // or a mask that already holds this very shape -- the direct membership
+  // dt_masks_group_add_form() does not check on this branch, so the drop
+  // would otherwise duplicate the row silently. the library never lists
+  // groups, so self-inclusion cannot happen here
+  if(!grp || !(grp->type & DT_MASKS_GROUP)
+     || (module && !_mask_target_ok(module))
+     || _group_point_index(grp, lm->drag_formid) >= 0)
+  {
+    gtk_tree_path_free(path);
+    return;
+  }
+
+  drop->ok = TRUE;
+  drop->reorder = FALSE;
+  drop->grp = grp;
+  drop->module = module;
+  drop->row = path;
+  drop->pos = GTK_TREE_VIEW_DROP_INTO_OR_BEFORE;
 }
 
 static gboolean _tree_drag_motion_cb(GtkWidget *widget,
@@ -3741,7 +3778,8 @@ static gboolean _tree_drag_motion_cb(GtkWidget *widget,
   }
 
   gtk_tree_view_set_drag_dest_row(GTK_TREE_VIEW(widget), drop.row, drop.pos);
-  gdk_drag_status(context, GDK_ACTION_MOVE, time);
+  gdk_drag_status(context,
+                  drop.reorder ? GDK_ACTION_MOVE : GDK_ACTION_LINK, time);
   gtk_tree_path_free(drop.row);
   return TRUE;
 }
@@ -3797,6 +3835,25 @@ static gboolean _tree_drag_drop_cb(GtkWidget *widget,
     // one gesture, one history entry, one undo -- however many steps
     dt_dev_add_masks_history_item(darktable.develop, NULL, TRUE);
     _lib_masks_recreate_list(self);
+  }
+  else if(drop.module)
+    // the very path of the context menu's "add to <module>": enable, add,
+    // reselect -- one gesture, one behaviour. the engine appends at the END
+    // of grp->points with UNION, so no shape ever ARRIVES at index 0 and no
+    // handover is due on this branch
+    _shape_add_to_module(drop.module, dragged);
+  else
+  {
+    // a stand-alone group: no module to enable and no combo to refresh --
+    // otherwise the same queue as _tree_add_exist
+    dt_masks_form_t *form =
+      dt_masks_get_from_id(darktable.develop, dragged);
+    if(form && dt_masks_group_add_form(drop.grp, form))
+    {
+      dt_dev_add_masks_history_item(darktable.develop, NULL, FALSE);
+      dt_dev_masks_selection_change(darktable.develop, NULL,
+                                    drop.grp->formid);
+    }
   }
 
   return TRUE;
@@ -4038,7 +4095,12 @@ static void _tree_motion_cb(GtkEventControllerMotion *controller,
     {
       GtkTargetList *targets = gtk_target_list_new(&_masks_dnd_target, 1);
       GdkEvent *event = gtk_get_current_event();
-      gtk_drag_begin_with_coordinates(view, targets, GDK_ACTION_MOVE,
+      // LINK from the library -- adding a shape links it, F4's whole point,
+      // and the copy cursor's "+" badge would promise the independent copy
+      // F4 argues against -- MOVE inside the masks: the row leaves its slot
+      gtk_drag_begin_with_coordinates(view, targets,
+                                      view == lm->library ? GDK_ACTION_LINK
+                                                          : GDK_ACTION_MOVE,
                                       GDK_BUTTON_PRIMARY, event,
                                       lm->drag_x, lm->drag_y);
       if(event) gdk_event_free(event);
@@ -4150,9 +4212,9 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
     g_object_get(lm->name_cell[dview], "editable", &editing, NULL);
 
   if(button == GDK_BUTTON_PRIMARY && n_press == 1 && mouse_path && !editing
-     && dview == 0 && mouse_col == lm->name_col[dview]
+     && dview >= 0 && mouse_col == lm->name_col[dview]
      && dt_modifier_is(dt_gui_current_state(gesture), 0)
-     && gtk_tree_path_get_depth(mouse_path) >= 2)
+     && gtk_tree_path_get_depth(mouse_path) >= (dview == 1 ? 1 : 2))
   {
     GdkRectangle cell = { 0 };
     gtk_tree_view_get_cell_area(GTK_TREE_VIEW(treeview), mouse_path,
@@ -4546,6 +4608,8 @@ static gboolean _tree_query_tooltip(GtkWidget *widget,
         const int depth = gtk_tree_path_get_depth(path);
         if(dview == 0 && depth >= 2)
           hint = _("drag to change when it applies");
+        else if(dview == 1 && depth == 1)
+          hint = _("drag onto a mask to add it");
       }
     }
   }
@@ -5844,9 +5908,10 @@ static void _build_masks_view(dt_lib_module_t *self,
   g_signal_connect(view, "query-tooltip", G_CALLBACK(_tree_query_tooltip), d);
   g_signal_connect(selection, "changed", G_CALLBACK(_tree_selection_change), d);
   // a click target inside a list does not announce itself; the pointer does.
-  // masks zone only: the library has no operator column, so nothing to point at
-  if(!library)
-    dt_gui_connect_motion(view, _tree_motion_cb, NULL, _tree_leave_cb, self);
+  // both lists now: the library has no operator column -- the hit test can
+  // never match there, the handler returns at once -- but the drag of one of
+  // its rows starts from this very handler
+  dt_gui_connect_motion(view, _tree_motion_cb, NULL, _tree_leave_cb, self);
   dt_gui_connect_click_all(view, _tree_button_pressed_cb, NULL, self);
   // the double click, on both lists. it is emitted by the tree view's own
   // gesture, which our handler above never claims -- see the note there
@@ -5866,7 +5931,8 @@ static void _build_masks_view(dt_lib_module_t *self,
                    G_CALLBACK(_tree_drag_data_get_cb), self);
   if(!library)
   {
-    gtk_drag_dest_set(view, 0, &_masks_dnd_target, 1, GDK_ACTION_MOVE);
+    gtk_drag_dest_set(view, 0, &_masks_dnd_target, 1,
+                      GDK_ACTION_MOVE | GDK_ACTION_LINK);
     g_signal_connect(view, "drag-motion",
                      G_CALLBACK(_tree_drag_motion_cb), self);
     g_signal_connect(view, "drag-leave",
