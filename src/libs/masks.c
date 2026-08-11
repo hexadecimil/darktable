@@ -26,6 +26,7 @@
 #include "develop/imageop.h"
 #include "dtgtk/paint_cell.h"
 #include "gui/accelerators.h"
+#include "gui/drag_and_drop.h"
 #include "gui/draw.h"
 #include "gui/gtk.h"
 #include "gui/preferences.h"
@@ -236,6 +237,16 @@ typedef struct dt_lib_masks_t
   // that never opened is a cell the next plain click would edit -- the very
   // behaviour the arming exists to remove
   gboolean rename_started;
+  // the drag in flight, as ids and the view it left from -- never a path, an
+  // iter or a form pointer: gui_update swaps both stores under an open drag
+  // without notice, so every drag-motion and the drop itself re-resolve these
+  // against the model and grp->points of the moment. armed by a qualifying
+  // press in _tree_button_pressed_cb, turned into a real drag by
+  // _tree_motion_cb past the drag threshold, cleared by "drag-end"
+  GtkWidget *drag_view;
+  dt_mask_id_t drag_formid;
+  dt_mask_id_t drag_groupid;
+  gint drag_x, drag_y;
   // the masks zone's operator column, and the whole of the click target: a
   // click is "on the operator" when GTK hands back THIS column, never when a
   // pixel offset falls inside a range. one field for both lists, and it only
@@ -2713,6 +2724,27 @@ static void _add_tree_operations(GtkMenuShell *menu,
                         !is_base_row);
 }
 
+// one step of the application order, shared by the context menu and by the
+// drop of a drag: the handover at the base crossing and the move are one
+// unit, and a path that called dt_masks_form_move() without the first half
+// would recreate the uninitialised-buffer render group.c is patched against
+static void _shape_move_step(dt_masks_form_t *grp,
+                             const dt_mask_id_t id,
+                             const gboolean later)
+{
+  const int rank = _group_point_index(grp, id);
+
+  // crossing index 0 hands the base over to another shape. both ids are
+  // resolved BEFORE the move, and _handover_base_state only touches state
+  // bits, never positions
+  if(later && rank == 0)
+    _handover_base_state(grp, _group_point_id(grp, 1), id);
+  else if(!later && rank == 1)
+    _handover_base_state(grp, id, _group_point_id(grp, 0));
+
+  dt_masks_form_move(grp, id, later);
+}
+
 // reordering is a per-shape operation. the old code looped over the whole
 // selection and moved each row against a tree model already stale after the
 // first move; it also called gtk_tree_model_iter_next() without checking its
@@ -2756,17 +2788,7 @@ static void _tree_move_shape(dt_lib_module_t *self, const gboolean later)
     if(can_move)
     {
       dt_masks_clear_form_gui(darktable.develop);
-
-      // crossing index 0 hands the base over to another shape. both ids are
-      // resolved BEFORE the move, and _handover_base_state only touches state
-      // bits, never positions
-      if(later && rank == 0)
-        _handover_base_state(grp, _group_point_id(grp, 1), id);
-      else if(!later && rank == 1)
-        _handover_base_state(grp, id, _group_point_id(grp, 0));
-
-      dt_masks_form_move(grp, id, later);
-
+      _shape_move_step(grp, id, later);
       dt_dev_add_masks_history_item(darktable.develop, NULL, TRUE);
       _lib_masks_recreate_list(self);
     }
@@ -3578,6 +3600,273 @@ static void _tree_context_menu(dt_lib_module_t *self,
   gdk_event_free(event);
 }
 
+// the one target of this panel's drag and drop. the payload never travels
+// through it -- both ends of the drag live in dt_lib_masks_t -- but the NAME
+// is what keeps a filmstrip image or a tag from being droppable here
+static const GtkTargetEntry _masks_dnd_target =
+  { "masks-shape-dnd", GTK_TARGET_SAME_APP, DND_TARGET_MASK_SHAPE };
+
+// defined below with the other tree walkers; the drag icon needs it early
+gboolean _find_mask_iter_by_values(GtkTreeModel *model,
+                                   GtkTreeIter *iter,
+                                   const dt_iop_module_t *module,
+                                   const dt_mask_id_t formid,
+                                   const int level);
+
+// what a drop at (x,y) over the masks list would do. `ok` FALSE means the
+// drop is refused and there is no indicator to draw; `row` is owned by the
+// caller when set
+typedef struct dt_masks_drop_t
+{
+  gboolean ok;
+  gboolean reorder;         // TRUE: reorder inside a mask; FALSE: library add
+  dt_masks_form_t *grp;     // the group acted on
+  dt_iop_module_t *module;  // live owner of the mask row, or NULL
+  int src, dst;             // reorder only: ranks in grp->points
+  GtkTreePath *row;         // the row the indicator is drawn on
+  GtkTreeViewDropPosition pos;
+} dt_masks_drop_t;
+
+// resolved from the model of the moment and from grp->points -- never from
+// anything remembered at the press beyond the two ids: gui_update swaps the
+// stores under an open drag without notice, so every motion and the drop
+// itself re-ask from scratch. a group gone missing simply answers "refused"
+static void _drag_dest_resolve(dt_lib_masks_t *lm,
+                               GtkWidget *view,
+                               const gint x,
+                               const gint y,
+                               dt_masks_drop_t *drop)
+{
+  *drop = (dt_masks_drop_t){ 0 };
+
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
+  if(!model || !lm->drag_view || !dt_is_valid_maskid(lm->drag_formid))
+    return;
+
+  GtkTreePath *path = NULL;
+  GtkTreeViewDropPosition pos;
+  if(!gtk_tree_view_get_dest_row_at_pos(GTK_TREE_VIEW(view), x, y,
+                                        &path, &pos))
+    return;
+
+  GtkTreeIter iter;
+  if(!gtk_tree_model_get_iter(model, &iter, path))
+  {
+    gtk_tree_path_free(path);
+    return;
+  }
+
+  if(lm->drag_view == view)
+  {
+    // reordering, inside one group only (F5): the row under the pointer
+    // must be a member of the very group the drag left from. TREE_GROUPID
+    // is the immediate parent, so a nested row reorders inside its own
+    // sub-group and never leaves it -- the same reach the menu has
+    dt_mask_id_t grid = INVALID_MASKID;
+    dt_mask_id_t id = INVALID_MASKID;
+    _lib_masks_get_values(model, &iter, NULL, &grid, &id);
+
+    dt_masks_form_t *grp =
+      dt_masks_get_from_id(darktable.develop, lm->drag_groupid);
+    const int src = _group_point_index(grp, lm->drag_formid);
+    const int over = _group_point_index(grp, id);
+
+    if(gtk_tree_path_get_depth(path) < 2 || grid != lm->drag_groupid
+       || src < 0 || over < 0)
+    {
+      gtk_tree_path_free(path);
+      return;
+    }
+
+    // an insertion line between rows, never a drop "into" a shape
+    if(pos == GTK_TREE_VIEW_DROP_INTO_OR_BEFORE)
+      pos = GTK_TREE_VIEW_DROP_BEFORE;
+    if(pos == GTK_TREE_VIEW_DROP_INTO_OR_AFTER)
+      pos = GTK_TREE_VIEW_DROP_AFTER;
+
+    // the rank the shape would hold once out of its own slot. the screen
+    // order IS grp->points -- base on top -- so this is list arithmetic
+    int dst = over;
+    if(pos == GTK_TREE_VIEW_DROP_BEFORE && src < over) dst--;
+    if(pos == GTK_TREE_VIEW_DROP_AFTER && src > over) dst++;
+
+    if(dst == src)
+    {
+      // dropping where it already sits: nothing would happen, say so
+      gtk_tree_path_free(path);
+      return;
+    }
+
+    drop->ok = TRUE;
+    drop->reorder = TRUE;
+    drop->grp = grp;
+    drop->src = src;
+    drop->dst = dst;
+    drop->row = path;
+    drop->pos = pos;
+    return;
+  }
+
+  // the drag left the library: nothing takes it yet -- the masks list
+  // only reorders its own rows
+  gtk_tree_path_free(path);
+}
+
+static gboolean _tree_drag_motion_cb(GtkWidget *widget,
+                                     GdkDragContext *context,
+                                     const gint x,
+                                     const gint y,
+                                     const guint time,
+                                     dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
+  // a flags-0 dest hears about EVERY drag that crosses it -- a filmstrip
+  // image, a module header, a file from the desktop -- and the resolver
+  // reads the payload from lm, never from the context. the one test tying
+  // THIS drag to that payload is the source widget, the way the module
+  // reorder of develop/imageop.c asks it; a foreign drag answers NULL and
+  // is refused with the rest
+  dt_masks_drop_t drop = { 0 };
+  if(lm->drag_view
+     && gtk_drag_get_source_widget(context) == lm->drag_view)
+    _drag_dest_resolve(lm, widget, x, y, &drop);
+
+  if(!drop.ok)
+  {
+    gtk_tree_view_set_drag_dest_row(GTK_TREE_VIEW(widget), NULL,
+                                    GTK_TREE_VIEW_DROP_BEFORE);
+    // 0 is the refusal: the forbidden cursor of F5
+    gdk_drag_status(context, 0, time);
+    return TRUE;
+  }
+
+  gtk_tree_view_set_drag_dest_row(GTK_TREE_VIEW(widget), drop.row, drop.pos);
+  gdk_drag_status(context, GDK_ACTION_MOVE, time);
+  gtk_tree_path_free(drop.row);
+  return TRUE;
+}
+
+static void _tree_drag_leave_cb(GtkWidget *widget,
+                                GdkDragContext *context,
+                                const guint time,
+                                dt_lib_module_t *self)
+{
+  gtk_tree_view_set_drag_dest_row(GTK_TREE_VIEW(widget), NULL,
+                                  GTK_TREE_VIEW_DROP_BEFORE);
+}
+
+static gboolean _tree_drag_drop_cb(GtkWidget *widget,
+                                   GdkDragContext *context,
+                                   const gint x,
+                                   const gint y,
+                                   const guint time,
+                                   dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
+  // the same gate as "drag-motion": only the drag this panel began may land
+  dt_masks_drop_t drop = { 0 };
+  if(lm->drag_view
+     && gtk_drag_get_source_widget(context) == lm->drag_view)
+    _drag_dest_resolve(lm, widget, x, y, &drop);
+
+  gtk_tree_view_set_drag_dest_row(GTK_TREE_VIEW(widget), NULL,
+                                  GTK_TREE_VIEW_DROP_BEFORE);
+  // the payload, copied out BEFORE the finish: what the finish tells the
+  // source ends in "drag-end", which clears the drag state -- through the
+  // event queue today, but nothing below should rest on that ordering
+  const dt_mask_id_t dragged = lm->drag_formid;
+  // finish first, commit after, as develop/imageop.c does: the rebuild the
+  // commit queues must find the drag already over
+  gtk_drag_finish(context, drop.ok, FALSE, time);
+  if(!drop.ok) return TRUE;
+  gtk_tree_path_free(drop.row);
+
+  if(drop.reorder)
+  {
+    // the same path as "apply earlier / later", one step at a time: each
+    // crossing of the base is a handover, and a jump straight to the slot
+    // would skip it. gui->group_edited is a positional index into the very
+    // list about to move, so the canvas gui goes down first, as the menu does
+    dt_masks_clear_form_gui(darktable.develop);
+
+    const gboolean later = drop.dst > drop.src;
+    int steps = later ? drop.dst - drop.src : drop.src - drop.dst;
+    while(steps-- > 0)
+      _shape_move_step(drop.grp, dragged, later);
+
+    // one gesture, one history entry, one undo -- however many steps
+    dt_dev_add_masks_history_item(darktable.develop, NULL, TRUE);
+    _lib_masks_recreate_list(self);
+  }
+
+  return TRUE;
+}
+
+static void _tree_drag_begin_cb(GtkWidget *widget,
+                                GdkDragContext *context,
+                                dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
+  if(lm->drag_view != widget) return;
+
+  // the pointer is grabbed for the length of the drag and gtk3 does not
+  // reliably deliver the leave event for a grab crossing -- same cleanup as
+  // the operator menu makes before popping up
+  GdkWindow *bin = gtk_tree_view_get_bin_window(GTK_TREE_VIEW(widget));
+  if(bin) gdk_window_set_cursor(bin, NULL);
+
+  // the row itself as the drag icon, as libs/tagging.c does. resolved by id
+  // and not by a stored path: first row carrying it -- for a shape worn by
+  // two masks that may be the twin row, which shows the same shape under
+  // the same name
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(widget));
+  GtkTreeIter iter;
+  if(model && gtk_tree_model_get_iter_first(model, &iter)
+     && _find_mask_iter_by_values(model, &iter, NULL, lm->drag_formid, 1))
+  {
+    GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
+    cairo_surface_t *row =
+      gtk_tree_view_create_row_drag_icon(GTK_TREE_VIEW(widget), path);
+    if(row)
+    {
+      gtk_drag_set_icon_surface(context, row);
+      cairo_surface_destroy(row);
+    }
+    gtk_tree_path_free(path);
+  }
+}
+
+static void _tree_drag_end_cb(GtkWidget *widget,
+                              GdkDragContext *context,
+                              dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
+  // this can land after gui_update swapped the stores: touch nothing but
+  // the drag state and the indicator
+  lm->drag_view = NULL;
+  lm->drag_formid = INVALID_MASKID;
+  lm->drag_groupid = INVALID_MASKID;
+  if(lm->treeview)
+    gtk_tree_view_set_drag_dest_row(GTK_TREE_VIEW(lm->treeview), NULL,
+                                    GTK_TREE_VIEW_DROP_BEFORE);
+}
+
+// nothing ever asks for the data -- both ends of the drag live in
+// dt_lib_masks_t -- but a source is expected to answer, so answer empty,
+// exactly as libs/tagging.c does for its own widget-bound payload
+static void _tree_drag_data_get_cb(GtkWidget *widget,
+                                   GdkDragContext *context,
+                                   GtkSelectionData *selection_data,
+                                   const guint target_type,
+                                   const guint time,
+                                   dt_lib_module_t *self)
+{
+  if(target_type == DND_TARGET_MASK_SHAPE)
+    gtk_selection_data_set(selection_data,
+                           gtk_selection_data_get_target(selection_data),
+                           _DWORD, NULL, 0);
+}
+
 // what one of the clickable columns has to say at a point, if anything
 typedef enum dt_masks_op_hit_t
 {
@@ -3730,6 +4019,34 @@ static void _tree_motion_cb(GtkEventControllerMotion *controller,
   GdkWindow *bin = gtk_tree_view_get_bin_window(GTK_TREE_VIEW(view));
   if(!bin) return;
 
+  // an armed press that travels the drag threshold with the button still
+  // down becomes a drag, started by hand exactly as views/map.c starts its
+  // own. gtk_drag_source_set() is deliberately not used: it would start a
+  // drag from ANY press on the widget -- the power switch, the show-mask
+  // cell, the operator strip -- and the only veto it leaves, cancelling from
+  // inside "drag-begin", tears the source info down while gtk is still
+  // setting it up
+  if(lm->drag_view == view)
+  {
+    GdkModifierType state = 0;
+    gtk_get_current_event_state(&state);
+    if(!(state & GDK_BUTTON1_MASK))
+      // released before the threshold: an ordinary click, stand down
+      lm->drag_view = NULL;
+    else if(gtk_drag_check_threshold(view, lm->drag_x, lm->drag_y,
+                                     (gint)x, (gint)y))
+    {
+      GtkTargetList *targets = gtk_target_list_new(&_masks_dnd_target, 1);
+      GdkEvent *event = gtk_get_current_event();
+      gtk_drag_begin_with_coordinates(view, targets, GDK_ACTION_MOVE,
+                                      GDK_BUTTON_PRIMARY, event,
+                                      lm->drag_x, lm->drag_y);
+      if(event) gdk_event_free(event);
+      gtk_target_list_unref(targets);
+      return;
+    }
+  }
+
   gint bx, by;
   gtk_tree_view_convert_widget_to_bin_window_coords(GTK_TREE_VIEW(view),
                                                     (gint)x, (gint)y, &bx, &by);
@@ -3797,11 +4114,12 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
                                                     &bin_x, &bin_y);
 
   GtkTreePath *mouse_path = NULL;
+  GtkTreeViewColumn *mouse_col = NULL;
   GtkTreeIter iter;
   dt_iop_module_t *module = NULL;
   gboolean on_row = FALSE;
   if(gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(treeview),
-                                   bin_x, bin_y, &mouse_path, NULL,
+                                   bin_x, bin_y, &mouse_path, &mouse_col,
                                    NULL, NULL))
   {
     on_row = TRUE;
@@ -3812,8 +4130,50 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
     }
   }
 
-  /* single click with the right mouse button? */
   const guint button = gtk_gesture_single_get_current_button(gesture);
+
+  // a drag may leave this press: record what it would carry, with the same
+  // hit information as every other gesture of the two lists. the name column
+  // only -- the operator strip, the power switch and the show-mask cell act
+  // on the press, and a held click on any of them must never become a drag;
+  // bin_x against the cell area keeps the expander triangle out, gtk reports
+  // it as part of the name column. one row, the pressed one, never the
+  // selection: reordering is a per-shape operation (F5). any depth under a
+  // mask: a row in a nested group is a member of its own group and moves
+  // inside it, the same reach the menu has. NOT guarded by rename_started,
+  // which is a one-shot receipt that stays TRUE long after an edit ended:
+  // the cell's own "editable" is armed for exactly one rename
+  lm->drag_view = NULL;
+  const int dview = _masks_view_index(lm, treeview);
+  gboolean editing = FALSE;
+  if(dview >= 0)
+    g_object_get(lm->name_cell[dview], "editable", &editing, NULL);
+
+  if(button == GDK_BUTTON_PRIMARY && n_press == 1 && mouse_path && !editing
+     && dview == 0 && mouse_col == lm->name_col[dview]
+     && dt_modifier_is(dt_gui_current_state(gesture), 0)
+     && gtk_tree_path_get_depth(mouse_path) >= 2)
+  {
+    GdkRectangle cell = { 0 };
+    gtk_tree_view_get_cell_area(GTK_TREE_VIEW(treeview), mouse_path,
+                                mouse_col, &cell);
+    if(bin_x >= cell.x && gtk_tree_model_get_iter(model, &iter, mouse_path))
+    {
+      dt_mask_id_t grid = INVALID_MASKID;
+      dt_mask_id_t id = INVALID_MASKID;
+      _lib_masks_get_values(model, &iter, NULL, &grid, &id);
+      if(dt_is_valid_maskid(id))
+      {
+        lm->drag_view = treeview;
+        lm->drag_formid = id;
+        lm->drag_groupid = grid;
+        lm->drag_x = (gint)x;
+        lm->drag_y = (gint)y;
+      }
+    }
+  }
+
+  /* single click with the right mouse button? */
   if(button == GDK_BUTTON_PRIMARY)
   {
     // dt_gui_current_state() and not gtk_get_current_event_state(): a press
@@ -4081,6 +4441,7 @@ static gboolean _tree_query_tooltip(GtkWidget *widget,
   GtkTreeModel *model = gtk_tree_view_get_model(tree_view);
   GtkTreePath *path = NULL;
   gchar *tmp = NULL;
+  const gchar *hint = NULL;
   gboolean show = FALSE;
 
   if(!gtk_tree_view_get_tooltip_context(tree_view, &x, &y,
@@ -4165,18 +4526,44 @@ static gboolean _tree_query_tooltip(GtkWidget *widget,
       gtk_tree_path_free(path);
       return TRUE;
     }
+
+    // the name cell is the one affordance of this panel with no glyph and
+    // no pointer change to announce it: it can be dragged. every other
+    // click target of these lists names itself in a tooltip, see the hits
+    // above, so this one does too -- on the row, next to the "used by"
+    // text when the row carries one. the same conditions as the arming in
+    // _tree_button_pressed_cb, or the sentence promises a drag that could
+    // not start
+    GtkTreeViewColumn *col = NULL;
+    if(gtk_tree_view_get_path_at_pos(tree_view, x, y, NULL, &col,
+                                     NULL, NULL))
+    {
+      const int dview = _masks_view_index(lm, widget);
+      dt_mask_id_t id = INVALID_MASKID;
+      _lib_masks_get_values(model, &iter, NULL, NULL, &id);
+      if(dview >= 0 && col == lm->name_col[dview] && dt_is_valid_maskid(id))
+      {
+        const int depth = gtk_tree_path_get_depth(path);
+        if(dview == 0 && depth >= 2)
+          hint = _("drag to change when it applies");
+      }
+    }
   }
 
   gtk_tree_model_get(model, &iter, TREE_USED_TEXT, &tmp, -1);
   // it used to be tied to the "used" badge being visible, so the one row that
   // most needs a word -- a shape nothing references -- was the one row that
   // stayed silent
-  show = tmp && *tmp;
+  show = (tmp && *tmp) || hint != NULL;
   if(show)
   {
     // plain text, not markup: this string carries group names typed by the
     // photographer, and a single "&" in one of them blanked the whole tooltip
-    gtk_tooltip_set_text(tooltip, tmp);
+    gchar *text = (tmp && *tmp && hint)
+      ? g_strdup_printf("%s\n%s", tmp, hint)
+      : g_strdup(tmp && *tmp ? tmp : hint);
+    gtk_tooltip_set_text(tooltip, text);
+    g_free(text);
     gtk_tree_view_set_tooltip_row(tree_view, tooltip, path);
   }
 
@@ -5468,6 +5855,25 @@ static void _build_masks_view(dt_lib_module_t *self,
   // both lists: the same menu, the same entries, and no reason for one of them
   // to answer the keyboard and the other not
   g_signal_connect(view, "popup-menu", G_CALLBACK(_tree_popup_menu_cb), self);
+  // the drag leaves either list -- started by hand from _tree_motion_cb once
+  // a press armed above travels the threshold -- and only the masks list
+  // receives: the library is where shapes rest, not a place a drag
+  // rearranges. no GTK_DEST_DEFAULT_*: the veto lives in "drag-motion",
+  // which answers per row, where DEFAULT_HIGHLIGHT frames the whole view
+  g_signal_connect(view, "drag-begin", G_CALLBACK(_tree_drag_begin_cb), self);
+  g_signal_connect(view, "drag-end", G_CALLBACK(_tree_drag_end_cb), self);
+  g_signal_connect(view, "drag-data-get",
+                   G_CALLBACK(_tree_drag_data_get_cb), self);
+  if(!library)
+  {
+    gtk_drag_dest_set(view, 0, &_masks_dnd_target, 1, GDK_ACTION_MOVE);
+    g_signal_connect(view, "drag-motion",
+                     G_CALLBACK(_tree_drag_motion_cb), self);
+    g_signal_connect(view, "drag-leave",
+                     G_CALLBACK(_tree_drag_leave_cb), self);
+    g_signal_connect(view, "drag-drop",
+                     G_CALLBACK(_tree_drag_drop_cb), self);
+  }
 }
 
 void gui_init(dt_lib_module_t *self)
