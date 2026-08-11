@@ -703,6 +703,8 @@ void dt_masks_iop_combo_populate(GtkWidget *w,
                                  struct dt_iop_module_t **m);
 void dt_masks_iop_use_same_as(struct dt_iop_module_t *module,
                               struct dt_iop_module_t *src);
+gboolean dt_masks_iop_add_exist(struct dt_iop_module_t *module,
+                                const dt_mask_id_t formid);
 dt_hash_t dt_masks_group_hash(dt_hash_t hash, dt_masks_form_t *form);
 
 void dt_masks_form_remove(struct dt_iop_module_t *module,
