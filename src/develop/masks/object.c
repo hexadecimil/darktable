@@ -2322,6 +2322,35 @@ static gboolean _finalize_apply_idle(gpointer data)
     }
   }
   g_free(want_file);
+  gboolean created = FALSE;
+  if(!rf)
+  {
+    // no free instance: create one, exactly as the multi-instance button
+    // does -- dt_iop_gui_duplicate handles pipe order, history, gui and
+    // focus in one call. the base instance of every module always sits
+    // in dev->iop, so a seed is always available. darktable has no
+    // instance cap: the only refusals are IOP_FLAGS_ONE_INSTANCE, which
+    // rasterfile does not carry but is guarded against anyway, and an
+    // allocation failure returning NULL -- both keep the old message
+    dt_iop_module_t *base = NULL;
+    for(GList *l = dev->iop; l; l = g_list_next(l))
+    {
+      dt_iop_module_t *m = l->data;
+      if(!strcmp(m->op, "rasterfile"))
+      {
+        base = m;
+        break;
+      }
+    }
+    if(base && !(base->flags() & IOP_FLAGS_ONE_INSTANCE))
+      rf = dt_iop_gui_duplicate(base, FALSE);
+    if(rf)
+    {
+      created = TRUE;
+      // what _gui_copy_callback does after the same call
+      dt_iop_connect_accels_multi(rf->so);
+    }
+  }
   if(!rf)
   {
     dt_control_log(_("precise raster mask saved (no free raster instance)"));
@@ -2391,6 +2420,12 @@ static gboolean _finalize_apply_idle(gpointer data)
 
     dt_dev_add_history_item(dev, target, TRUE);
     if(target->gui_data) dt_iop_gui_update(target);
+    // dt_iop_gui_duplicate focused the instance it created; the user's
+    // gesture was about `target`, so hand the focus back to it. when the
+    // instance was found, nothing moved and nothing moves here -- the
+    // two outcomes of the same gesture end on the same module. with no
+    // target the focus stays on the new instance, where the mask lives
+    if(created) dt_iop_request_focus(target);
     dt_control_log(_("precise raster mask applied to %s"), target->name());
   }
   else
