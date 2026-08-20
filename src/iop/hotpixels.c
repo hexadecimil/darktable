@@ -203,10 +203,15 @@ static int _process_monochrome(const dt_iop_hotpixels_data_t *data,
           fixed++;
           if(markfixed)
           {
+            // one step of the marker is one photosite, thus `planes` floats.
+            // the loop bounds guarantee col+i stays inside the row, so the
+            // stride must be `planes` too; a hardcoded 4 would walk 4 times
+            // too far for planes == 1 (monochrome bayer), marking unrelated
+            // photosites and reaching outside the row on narrow buffers.
             for(int i = -1; i >= -10 && i >= -col; i -= 1)
-              for(int c = 0; c < planes; c++) out[4*i + c] = *in;
+              for(int c = 0; c < planes; c++) out[planes * i + c] = *in;
             for(int i = 1; i <= 10 && i < width - col; i++)
-              for(int c = 0; c < planes; c++) out[4*i + c] = *in;
+              for(int c = 0; c < planes; c++) out[planes * i + c] = *in;
           }
         }
       }

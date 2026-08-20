@@ -2339,7 +2339,9 @@ static float _path_mean_border(dt_masks_form_t *form)
     const dt_masks_point_path_t *bp = bl->data;
     mean += bp->border[0] + bp->border[1];
   }
-  return fmaxf(0.0005f, mean / (2.0f * (float)nb));
+  // sub-pixel floor: a precise path whose borders are all below the legacy
+  // 0.0005 minimum must keep them through a grow/shrink re-vectorization
+  return fmaxf(0.00002f, mean / (2.0f * (float)nb));
 }
 
 // Convert a (positive) resize amount in the chosen unit to an absolute offset in
@@ -2657,7 +2659,7 @@ static GList *_path_revectorize(float *morphed,
   // holes. A hole can have more nodes than the outer contour, so select on the
   // sign first and only use node count as a tie-breaker among outer boundaries.
   GList *signs = NULL;
-  GList *new_forms = ras2forms(morphed, rw, rh, NULL, 0.5f, 2, alphamax, &signs);
+  GList *new_forms = ras2forms(morphed, rw, rh, NULL, 0.5f, 2, alphamax, 0.3, &signs);
 
   dt_masks_form_t *best = NULL;
   int best_n = 0;
@@ -3008,15 +3010,17 @@ static int _path_events_mouse_scrolled(dt_iop_module_t *module,
         {
           dt_masks_point_path_t *point = l->data;
 
+          // floor at the sub-pixel minimum, not the legacy 0.0005: shrinking
+          // an already sub-pixel border must never inflate it back up
           point->border[0] = dt_masks_change_size
             (up,
              point->border[0],
-             0.0005f,
+             0.00002f,
              0.5f);
           point->border[1] = dt_masks_change_size
             (up,
              point->border[1],
-             0.0005f,
+             0.00002f,
              0.5f);
 
           feather_size += point->border[0] + point->border[1];
@@ -3428,8 +3432,10 @@ static int _path_events_button_pressed(dt_iop_module_t *module,
         const GList* second = g_list_next_wraparound(first, form->points);
         dt_masks_point_path_t *left = first->data;
         dt_masks_point_path_t *right = second->data;
-        bzpt->border[0] = MAX(0.0005f, (left->border[0] + right->border[0]) * 0.5);
-        bzpt->border[1] = MAX(0.0005f, (left->border[1] + right->border[1]) * 0.5);
+        // sub-pixel floor: inserting a node on a precise path must not bump
+        // its border back to the legacy 0.0005 minimum
+        bzpt->border[0] = MAX(0.00002f, (left->border[0] + right->border[0]) * 0.5);
+        bzpt->border[1] = MAX(0.00002f, (left->border[1] + right->border[1]) * 0.5);
 
         form->points = g_list_insert(form->points, bzpt, gui->seg_selected + 1);
         _path_init_ctrl_points(form);
@@ -3875,11 +3881,24 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
     const int k = gui->point_border_dragging;
 
     // now we want to know the position reflected on actual corner/border segment
-    const float a = (gpt->border[k * 6 + 1] - gpt->points[k * 6 + 3])
-                    / (float)(gpt->border[k * 6] - gpt->points[k * 6 + 2]);
-    const float b = gpt->points[k * 6 + 3] - a * gpt->points[k * 6 + 2];
+    const float sdx = gpt->border[k * 6] - gpt->points[k * 6 + 2];
+    const float sdy = gpt->border[k * 6 + 1] - gpt->points[k * 6 + 3];
 
-    float pts[2] = { (a * pzy * ht + pzx * wd - b * a) / (a * a + 1.0), a * pts[0] + b };
+    float pts[2];
+    if(fabsf(sdx) > 1e-6f)
+    {
+      const float a = sdy / sdx;
+      const float b = gpt->points[k * 6 + 3] - a * gpt->points[k * 6 + 2];
+      pts[0] = (a * pzy * ht + pzx * wd - b * a) / (a * a + 1.0f);
+      pts[1] = a * pts[0] + b;
+    }
+    else
+    {
+      // collapsed or vertical corner/border segment: the slope is undefined,
+      // use the raw pointer position instead
+      pts[0] = pzx * wd;
+      pts[1] = pzy * ht;
+    }
 
     dt_dev_distort_backtransform(darktable.develop, pts, 1);
 
@@ -3890,7 +3909,9 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
     const float bdr = nr / fminf(iwidth,
                                  iheight);
 
-    point->border[0] = point->border[1] = bdr;
+    // never let a degenerate segment or transform leak NaN into the params
+    if(isfinite(bdr))
+      point->border[0] = point->border[1] = bdr;
 
     // we recreate the form points
     dt_masks_gui_form_create(form, gui, index, module);
@@ -5529,11 +5550,13 @@ static void _path_modify_property(dt_masks_form_t *const form,
       for(const GList *l = form->points; l; l = g_list_next(l))
       {
         dt_masks_point_path_t *point = l->data;
-        point->border[0] = CLAMP(point->border[0] * ratio, 0.0005f, 1.0f);
-        point->border[1] = CLAMP(point->border[1] * ratio, 0.0005f, 1.0f);
+        // sub-pixel floor: keep the slider range consistent with borders
+        // smaller than the legacy 0.0005 minimum
+        point->border[0] = CLAMP(point->border[0] * ratio, 0.00002f, 1.0f);
+        point->border[1] = CLAMP(point->border[1] * ratio, 0.00002f, 1.0f);
         *sum += point->border[0] + point->border[1];
         *max = fminf(*max, fminf(1.0f / point->border[0], 1.0f / point->border[1]));
-        *min = fmaxf(*min, fmaxf(0.0005f / point->border[0], 0.0005f / point->border[1]));
+        *min = fmaxf(*min, fmaxf(0.00002f / point->border[0], 0.00002f / point->border[1]));
         *count += 2;
       }
       if(geom_changed)

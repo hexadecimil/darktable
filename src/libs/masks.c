@@ -1310,6 +1310,15 @@ static gboolean _mask_target_alive(const dt_iop_module_t *m)
 // dereferenced -- the alive test only compares pointers
 static dt_iop_module_t *_mask_selected_target(dt_lib_masks_t *lm)
 {
+  // the one place both the toolbar buttons and the tree context menu go
+  // through: creating a shape calls dt_masks_change_form_gui, which tears
+  // down a mask computation in flight without a word
+  if(dt_masks_shapes_locked())
+  {
+    dt_control_log(_("mask still computing, try again in a moment"));
+    return;
+  }
+
   dt_iop_module_t *module = NULL;
   GtkTreeModel *model = NULL;
   GList *selected = gtk_tree_selection_get_selected_rows

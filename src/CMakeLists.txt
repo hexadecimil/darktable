@@ -85,6 +85,7 @@ FILE(GLOB SOURCE_FILES
   "common/pwstorage/backend_kwallet.c"
   "common/pwstorage/pwstorage.c"
   "common/ras2vect.c"
+  "common/rasterfile_recipe.c"
   "common/ratings.c"
   "common/resource_limits.c"
   "common/selection.c"
@@ -469,6 +470,7 @@ if(USE_AI)
   FILE(GLOB SOURCE_FILES_AI
     "common/ai_models.c"
     "common/ai/segmentation.c"
+    "common/ai/refine.c"
     "common/ai/restore.c"
     "common/ai/restore_rgb.c"
     "common/ai/restore_raw_bayer.c"

@@ -17,22 +17,47 @@
 */
 
 #include "common/ai/segmentation.h"
+#include "common/ai/refine.h"
 #include "common/ai_models.h"
 #include "common/colorspaces.h"
 #include "common/debug.h"
 #include "common/densecrf.h"
+#include "common/guided_filter.h"
+
+#include "common/rasterfile_recipe.h"
+// mirror of iop/rasterfile.c's parameter layout (v2), which lives in the
+// module file only. keep in sync; introspection guards the size at history
+// level, and the recipe struct itself is shared through rasterfile_recipe.h
+#define RASTERFILE_MAXFILE 2048
+typedef enum dt_iop_rasterfile_mode_t
+{
+  DT_RASTERFILE_MODE_ALL = 7,
+} dt_iop_rasterfile_mode_t;
+typedef struct dt_iop_rasterfile_params_t
+{
+  dt_iop_rasterfile_mode_t mode;
+  char path[RASTERFILE_MAXFILE];
+  char file[RASTERFILE_MAXFILE];
+  int32_t _pad;
+  dt_rf_recipe_t recipe;
+} dt_iop_rasterfile_params_t;
 #include "common/distance_transform.h"
 #include "common/mipmap_cache.h"
 #include "common/ras2vect.h"
 #include "control/conf.h"
 #include "control/control.h"
+#include "control/jobs.h"
 #include "develop/blend.h"
 #include "develop/imageop.h"
 #include "develop/masks.h"
+#include "develop/masks/object_recipe.h"
 #include "develop/openmp_maths.h"
 #include "develop/pixelpipe_hb.h"
 #include "gui/gtk.h"
 #include "imageio/imageio_common.h"
+
+#include <png.h>
+#include <setjmp.h>
 #include "views/view.h"
 
 #include <limits.h>
@@ -50,6 +75,8 @@
 #define CONF_OBJECT_REFINE_BOUNDARY_ITER_KEY "plugins/darkroom/masks/object/refine_boundary_iterations"
 #define CONF_OBJECT_REFINE_BOUNDARY_SIGMA_COLOR_KEY "plugins/darkroom/masks/object/refine_boundary_sigma_color"
 #define CONF_OBJECT_REFINE_BOUNDARY_W_BILATERAL_KEY "plugins/darkroom/masks/object/refine_boundary_weight_bilateral"
+#define CONF_OBJECT_AI_REFINE_KEY "plugins/darkroom/masks/object/ai_refine"
+#define CONF_OBJECT_AI_REFINE_MARGIN_KEY "plugins/darkroom/masks/object/ai_refine_margin"
 
 // default render target (longest side in pixels).
 // the SAM encoder internally downscales to 1024 so encoding quality
@@ -73,6 +100,20 @@ typedef enum _encode_state_t
 // minimum drag distance (preview pipe pixels) to distinguish click from drag
 #define DRAG_THRESHOLD 5.0f
 
+typedef enum _decode_state_t
+{
+  DECODE_ERROR = -1,    // compute failed; drained by the publication machine
+  DECODE_IDLE = 0,      // no decode in flight
+  DECODE_RUNNING = 1,   // compute thread working
+  DECODE_READY = 2,     // result waiting for publication on the GUI thread
+} _decode_state_t;
+
+typedef struct _decode_job_t _decode_job_t;
+typedef struct _edit_replay_job_t _edit_replay_job_t;
+static void _decode_job_free(_decode_job_t *job);
+static gboolean _modifier_poll(gpointer data);
+static void _clear_selection(dt_masks_form_gui_t *gui);
+
 typedef struct _object_data_t
 {
   dt_ai_environment_t *env; // AI environment for model registry
@@ -84,6 +125,16 @@ typedef struct _object_data_t
   dt_imgid_t encoded_imgid; // image ID that was encoded
   dt_hash_t encoded_distort_hash; // distort hash at encode time (detects crop/rotate)
   int encode_w, encode_h;   // encoding resolution (for coordinate mapping)
+  int encoded_render_size;  // render cap the CURRENT encoding was produced
+                            // under, as the RAW preference value: every use
+                            // point applies MAX(..., 1024), so the recipe
+                            // records the preference and never the effective
+                            // cap -- ONE convention, shared by the capture,
+                            // the pinned encode and the headless replay.
+                            // written by the launch (pinned or plain) and
+                            // read unconditionally by _capture_recipe, so
+                            // encode_w/h and render_size always describe the
+                            // SAME render whatever became of the session
   guint modifier_poll_id;   // timer to detect shift key changes
   GThread *encode_thread;   // background encoding thread
   gboolean dragging;        // TRUE between press and release during click drag
@@ -97,11 +148,327 @@ typedef struct _object_data_t
   float preview_smoothing;          // current smoothing (potrace alphamax, 0.0-1.3)
   float preview_feather;            // path border/feather (0.0-0.5, normalized)
   gboolean preview_refine;          // run DenseCRF edge refinement on each decode
+  dt_refine_context_t *refine;      // CascadePSP contour refinement, loaded lazily
+  gboolean refine_failed;           // TRUE once loading failed, do not retry
+  // -- asynchronous decode --
+  int decode_state;                 // _decode_state_t values (atomic access)
+  GThread *decode_thread;           // in-flight compute, joined at publication
+  _decode_job_t *decode_job;        // job of the in-flight compute
+  gboolean decode_pending;          // GUI thread only: clicks landed mid-decode
+  int decode_launched_count;        // GUI thread only: point count at launch
+  gboolean decode_busy_shown;       // GUI thread only: busy_enter needs a leave
+  GArray *decode_marks;             // GUI thread only: one _decode_mark_t per
+                                    // accumulated click, provenance recording
+  // provenance: scalars of the last launched decode. the mask the
+  // finalisation captures is the one that decode computed, so the recipe
+  // must record these values, not the conf/preview state at capture time
+  // (a toggle after the last decode would otherwise poison the recipe).
+  // threshold stays per-boundary in decode_marks
+  gboolean last_do_crf;
+  int last_crf_iter;
+  float last_crf_sigma_color;
+  float last_crf_w_bilateral;
+  gboolean last_do_refine;
+  float last_refine_margin;
+  int last_n_passes;
+  // -- ai edit session (reopening a saved recipe interactively) --
+  // owned by the edit machine below; every transition happens on the GUI
+  // thread (post_expose, kept ticking by the 100 ms poll timer),
+  // edit_pending is read atomically
+  int edit_pending;            // _edit_pending_t values (atomic access)
+  gboolean edit_valid;         // TRUE while an edit session drives this data
+  gboolean edit_dirty;         // a clear happened: never report a no-op
+  gboolean edit_model_pinned;  // seg was loaded BY ID for the session:
+                               // never persist it in the active-model slot
+  gboolean edit_no_sink;       // the session opened with no focused module
+                               // and must close into none. SURVIVES
+                               // _edit_session_end: the closing gesture is
+                               // the last thing to run, and by then
+                               // dev->gui_module may hold whatever module
+                               // the user unfolded in the meantime
+  dt_rf_recipe_t edit_recipe;  // owned copy of the recipe being replayed
+  // -- the session's own parameters --
+  // during an edit session these hold the RECORDED values, so a decode
+  // added after the replay continues the recorded chain instead of
+  // whatever the preferences drifted to since the mask was created. read
+  // through the _session_* accessors below, which fall back to the conf
+  // outside a session. the rule they enforce is greppable: no decode,
+  // replay or finalisation path reads these conf keys directly, and none
+  // of them is ever WRITTEN from a session (they are the user's global
+  // persistent preferences, clobbering them on every edit would destroy
+  // the user's values)
+  float edit_threshold;        // NAN outside an edit session
+  int edit_n_passes;
+  int edit_crf_iter;
+  float edit_crf_sigma_color;
+  float edit_crf_w_bilateral;
+  gboolean edit_do_refine;
+  float edit_refine_margin;
+  int edit_render_size;        // recorded render cap, raw (see
+                               // encoded_render_size for the convention)
+  // no-op baseline: the recipe the session WOULD re-capture at the end of
+  // the replay. closing with a byte-identical re-capture means the session
+  // produced nothing new. snapshotting the recipe instead of a point count
+  // makes the criterion exhaustive by construction -- every parameter that
+  // reaches the mask reaches the recipe, so no mutator has to remember to
+  // raise a flag and no future field can escape the check
+  dt_rf_recipe_t edit_baseline_recipe;
+  gboolean edit_baseline_valid;
+  GThread *edit_replay_thread; // in-flight replay; joined by the machine
+                               // (or by _destroy_data on teardown), NEVER
+                               // by _decode_finish
+  _edit_replay_job_t *edit_replay_job;
 } _object_data_t;
+
+// clicks can outpace the compute (coalescing), so N points do not mean N
+// decodes. the provenance recipe must replay decodes exactly at the
+// boundaries where they really happened to reproduce the iterative
+// refinement context, so each click records whether a decode was launched
+// right after it, and with which threshold
+typedef struct _decode_mark_t
+{
+  float threshold;
+  gboolean launched;
+} _decode_mark_t;
+
+static void _marks_resize(_object_data_t *d, const int count)
+{
+  if(!d->decode_marks)
+    d->decode_marks = g_array_new(FALSE, TRUE, sizeof(_decode_mark_t));
+  g_array_set_size(d->decode_marks, count);
+}
+
+// ---------------------- ai edit session: state machine ----------------------
+//
+// an edit session reopened from a saved provenance recipe is a NORMAL
+// creation session of the object tool, plus this machine driving it:
+//
+//   EDIT_NONE -> EDIT_WAIT_ENCODE       dt_object_mask_edit_begin
+//   EDIT_WAIT_ENCODE -> EDIT_REPLAYING  post_expose at ENCODE_READY: join
+//        of the encode thread (its decoder warmup outlives ENCODE_READY),
+//        injection of the recorded clicks AND decode marks, replay thread
+//        started on a stand-in _object_data_t
+//   EDIT_REPLAYING -> EDIT_ACTIVE       post_expose when the replay thread
+//        is done: joined by this machine EXCLUSIVELY, final mask published,
+//        provenance scalars restored, no-op baseline snapshotted
+//   EDIT_ACTIVE -> EDIT_NONE            every session exit (finalise,
+//        no-op close, cancel, image change, teardown)
+//   any -> EDIT_FAILED                  encode or replay failure; only the
+//        edit bookkeeping ends, the tool session survives as a plain one
+//
+// while WAIT_ENCODE or REPLAYING the session data is FROZEN: clicks are
+// refused, the publication machine consumes nothing, the invalidation
+// branch defers its teardown -- the replay thread has exclusive rights on
+// the shared segmentation context
+typedef enum _edit_pending_t
+{
+  EDIT_FAILED = -1,
+  EDIT_NONE = 0,
+  EDIT_WAIT_ENCODE = 1,
+  EDIT_REPLAYING = 2,
+  EDIT_ACTIVE = 3,
+} _edit_pending_t;
+
+// the replay job: the recorded decode chain, executed on a worker thread
+// against a STAND-IN _object_data_t whose seg/env/refine fields ALIAS the
+// session's. passing the session's own data instead would publish
+// DECODE_READY at every boundary (last store of _decode_thread_func) and
+// the publication machine would join the replay thread in mid-flight from
+// the GUI side, then let a click start a second thread on the same ONNX
+// context. od.decode_state is stored per boundary and polled by nobody --
+// the exact pattern of the headless replay's local stand-in; the machine
+// polls `done`, this thread's very last store
+struct _edit_replay_job_t
+{
+  _object_data_t od;    // stand-in; seg/env/refine ALIAS the session's
+  dt_rf_recipe_t recipe;
+  float *enc_pts;       // prompts in session encode space, snapshotted on
+                        // the GUI thread at launch
+  int n_points;
+  int last_decode;      // index of the last recorded decode boundary
+  float *out_mask;      // final boundary's mask, owned until published
+  int out_w, out_h;
+  gboolean ok;
+  int done;             // atomic; set as the thread's last instruction
+};
+
+static gboolean _edit_replay_running(const _object_data_t *d)
+{
+  return d->edit_replay_thread && d->edit_replay_job
+         && !g_atomic_int_get(&d->edit_replay_job->done);
+}
+
+// TRUE while the machine holds the session frozen (encode pending or
+// replay in flight): clicks, publication and invalidation all test this
+static gboolean _edit_frozen(const _object_data_t *d)
+{
+  const int ep = d ? g_atomic_int_get(&d->edit_pending) : EDIT_NONE;
+  return ep == EDIT_WAIT_ENCODE || ep == EDIT_REPLAYING;
+}
+
+// ---------------------- the session parameter accessors ---------------------
+//
+// the ONE boundary between an edit session and the global preferences.
+// during a session every scalar a decode consumes comes from the RECIPE:
+// the format assumes these scalars are constant over a session, and the
+// preferences have usually drifted since the mask was created -- a new
+// click reading the conf would refine the replayed prefix with different
+// parameters than the ones the re-captured recipe records, and the
+// regenerated file would then diverge from the mask the user validated,
+// under the very same fingerprint.
+//
+// the invariant is local and greppable: outside these accessors NO decode,
+// replay or finalisation path reads CONF_OBJECT_THRESHOLD_KEY,
+// CONF_OBJECT_REFINE_PASSES_KEY, CONF_OBJECT_REFINE_BOUNDARY_*_KEY,
+// CONF_OBJECT_AI_REFINE_KEY or CONF_OBJECT_AI_REFINE_MARGIN_KEY. an
+// override, never a conf write: those keys stay the user's persistent
+// preferences
+
+static float _session_threshold(const _object_data_t *d)
+{
+  if(d && d->edit_valid && !isnan(d->edit_threshold))
+    return CLAMP(d->edit_threshold, 0.3f, 0.9f);
+  return CLAMP(dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY), 0.3f, 0.9f);
+}
+
+static int _session_n_passes(const _object_data_t *d)
+{
+  if(d && d->edit_valid)
+    return CLAMP(d->edit_n_passes, 1, 3);
+  return CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_PASSES_KEY), 1, 3);
+}
+
+static int _session_crf_iter(const _object_data_t *d)
+{
+  if(d && d->edit_valid)
+    return CLAMP(d->edit_crf_iter, 1, 10);
+  return CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_BOUNDARY_ITER_KEY), 1, 10);
+}
+
+static float _session_crf_sigma_color(const _object_data_t *d)
+{
+  if(d && d->edit_valid)
+    return CLAMP(d->edit_crf_sigma_color, 1.0f, 50.0f);
+  return CLAMP(dt_conf_get_float(CONF_OBJECT_REFINE_BOUNDARY_SIGMA_COLOR_KEY),
+               1.0f, 50.0f);
+}
+
+static float _session_crf_w_bilateral(const _object_data_t *d)
+{
+  if(d && d->edit_valid)
+    return CLAMP(d->edit_crf_w_bilateral, 0.5f, 30.0f);
+  return CLAMP(dt_conf_get_float(CONF_OBJECT_REFINE_BOUNDARY_W_BILATERAL_KEY),
+               0.5f, 30.0f);
+}
+
+// refine_failed is deliberately NOT folded in here: it is a runtime
+// outcome, not a parameter, and the callers that must honour it (the
+// decode launch) differ from the ones that must not (the capture, which
+// records what the decode really did)
+static gboolean _session_do_refine(const _object_data_t *d)
+{
+  if(d && d->edit_valid)
+    return d->edit_do_refine;
+  return dt_conf_get_bool(CONF_OBJECT_AI_REFINE_KEY);
+}
+
+static float _session_refine_margin(const _object_data_t *d)
+{
+  if(d && d->edit_valid)
+    return CLAMPF(d->edit_refine_margin, 0.0f, 0.5f);
+  return CLAMPF(dt_conf_get_float(CONF_OBJECT_AI_REFINE_MARGIN_KEY),
+                0.0f, 0.5f);
+}
+
+// the render cap a PLAIN session encodes under, raw: the single reader of
+// the render-size preference. every use point applies MAX(..., 1024)
+static int _conf_render_size(void)
+{
+  return dt_conf_key_exists(CONF_OBJECT_RENDER_SIZE_KEY)
+    ? dt_conf_get_int(CONF_OBJECT_RENDER_SIZE_KEY)
+    : SEG_RENDER_DEFAULT;
+}
+
+// end-of-session bookkeeping, shared by EVERY exit path (finalise, no-op
+// close, cancel, failure, image or geometry change, teardown): the
+// proactive-recompute gate falls, the threshold override falls with it.
+// GUI thread; idempotent
+static void _edit_session_end(_object_data_t *d, const int final_state)
+{
+  if(!d)
+    return;
+  if(d->edit_valid)
+    dt_object_mask_edit_clear_active();
+  d->edit_valid = FALSE;
+  d->edit_threshold = NAN;
+  d->edit_baseline_valid = FALSE;
+  g_atomic_int_set(&d->edit_pending, final_state);
+}
+
+// THE single place that knows how to undo a pinned encode: the recorded
+// model loaded BY ID and the render made at the recorded dimensions under
+// the recorded cap. every non-nominal exit of the machine calls it, so a
+// session that survives a failure is really the "plain, empty session" its
+// toast promises -- otherwise it would keep decoding on the recorded model
+// and capture recipes whose encode_w/h come from a cap the session no
+// longer claims. dropping the encoding sends post_expose back through the
+// plain launch (ACTIVE model, current preference).
+//
+// returns TRUE when something was dropped. GUI thread, and only where
+// nothing computes on d->seg -- every caller is past the replay join. an
+// encode that FAILED is left alone: nothing was pinned successfully and
+// resetting its state would only spin a relaunch loop
+static gboolean _edit_drop_pinned_encode(_object_data_t *d)
+{
+  if(!d || !d->edit_model_pinned
+     || g_atomic_int_get(&d->encode_state) != ENCODE_READY)
+    return FALSE;
+
+  if(d->seg)
+  {
+    dt_seg_free(d->seg);
+    d->seg = NULL;
+  }
+  d->model_loaded = FALSE;
+  d->edit_model_pinned = FALSE;
+  d->encode_w = d->encode_h = 0;
+  d->encoded_render_size = 0;
+  g_atomic_int_set(&d->encode_state, ENCODE_IDLE);
+  return TRUE;
+}
 
 static _object_data_t *_get_data(dt_masks_form_gui_t *gui)
 {
   return (gui && gui->scratchpad) ? (_object_data_t *)gui->scratchpad : NULL;
+}
+
+// the queryable form of "a computation owns this session", read STRAIGHT
+// from the session machines -- the encode, the decode and the edit replay.
+// no mirror flag to keep in sync, so a state a later version adds cannot
+// escape the answer by omission; the price is that the three enums below
+// are the contract, and any new one belongs here.
+//
+// the session data IS the scratchpad of the live mask gui: once _free_data
+// cleared it the answer is rightly FALSE whatever threads still finish in
+// the void, because there is no longer a session a new shape could
+// destroy. deliberately NOT covering the finalisation and recompute jobs:
+// they own no session either (the finalisation frees it before enqueuing),
+// they compete for VRAM, which the compute paths already arbitrate on
+// their own. GUI thread
+gboolean dt_masks_object_session_busy(void)
+{
+  const dt_develop_t *dev = darktable.develop;
+  const _object_data_t *d = dev ? _get_data(dev->form_gui) : NULL;
+  if(!d)
+    return FALSE;
+  // MSG_SHOWN counts: the encode is committed, the next expose starts the
+  // thread, and the frame in between must not become a hole in the lock
+  const int es = g_atomic_int_get(&d->encode_state);
+  return es == ENCODE_MSG_SHOWN
+         || es == ENCODE_RUNNING
+         || g_atomic_int_get(&d->decode_state) == DECODE_RUNNING
+         || _edit_frozen(d)
+         || _edit_replay_running(d);
 }
 
 // compute a hash of all distortion module parameters
@@ -167,8 +534,10 @@ static void _free_preview_forms(_object_data_t *d)
   d->preview_signs = NULL;
 }
 
-// free all resources in _object_data_t (must be called after thread has joined),
-// preserves seg+env in persistent statics so the model stays loaded
+// free all resources in _object_data_t. joins any remaining worker thread
+// itself -- never call while a compute is still RUNNING, the join would block
+// the GUI thread. preserves seg+env in persistent statics so the model stays
+// loaded
 static void _destroy_data(_object_data_t *d)
 {
   if(!d)
@@ -177,13 +546,39 @@ static void _destroy_data(_object_data_t *d)
     g_source_remove(d->modifier_poll_id);
   if(d->encode_thread)
     g_thread_join(d->encode_thread);
+  if(d->decode_thread)
+    g_thread_join(d->decode_thread);
+  if(d->decode_job)
+    _decode_job_free(d->decode_job);
+  // teardown path of an edit replay the machine never got to finish (the
+  // machine is the joiner on the live path; here the machine is gone).
+  // _free_data defers to _deferred_cleanup while the thread still runs
+  if(d->edit_replay_thread)
+    g_thread_join(d->edit_replay_thread);
+  if(d->edit_replay_job)
+  {
+    _edit_replay_job_t *rj = d->edit_replay_job;
+    // a refinement context lazily loaded DURING the replay lives in the
+    // stand-in only; free it unless it aliases the session's own
+    if(rj->od.refine && rj->od.refine != d->refine)
+      dt_refine_free(rj->od.refine);
+    g_free(rj->enc_pts);
+    g_free(rj->out_mask);
+    g_free(rj);
+  }
+  if(d->decode_busy_shown)
+    dt_control_busy_leave();
 
   // save model to persistent storage - keeps it loaded across
   // mask sessions, disk cache handles embedding persistence.
   // only persist if nobody already claimed the slot (guards
   // against deferred cleanup racing with a new session)
   dt_ai_seg_t *ps = &darktable.ai_seg;
-  const gboolean persist = dt_conf_get_bool(CONF_OBJECT_PERSIST_KEY);
+  // the persistent slot is an optimization for the ACTIVE model; a model
+  // an edit session loaded BY ID does not belong there (a later plain
+  // session would discard it anyway, after paying the swap)
+  const gboolean persist = dt_conf_get_bool(CONF_OBJECT_PERSIST_KEY)
+                           && !d->edit_model_pinned;
   if(persist && !ps->ctx && d->seg)
   {
     dt_seg_reset_encoding(d->seg);
@@ -201,17 +596,22 @@ static void _destroy_data(_object_data_t *d)
     d->env = NULL;
   }
 
+  if(d->refine) dt_refine_free(d->refine);
+  if(d->decode_marks) g_array_free(d->decode_marks, TRUE);
   g_free(d->mask);
   _free_preview_forms(d);
   g_free(d);
 }
 
-// idle callback for deferred cleanup when background thread was still running
+// idle callback for deferred cleanup when background thread was still running.
+// inherited limitation shared with the encode: if the main loop stops before
+// the next tick, the worker thread leaks at exit
 static gboolean _deferred_cleanup(gpointer data)
 {
   _object_data_t *d = data;
-  const int state = g_atomic_int_get(&d->encode_state);
-  if(state == ENCODE_RUNNING)
+  if(g_atomic_int_get(&d->encode_state) == ENCODE_RUNNING
+     || g_atomic_int_get(&d->decode_state) == DECODE_RUNNING
+     || _edit_replay_running(d))
     return G_SOURCE_CONTINUE;
   _destroy_data(d);
   return G_SOURCE_REMOVE;
@@ -224,10 +624,26 @@ static void _free_data(dt_masks_form_gui_t *gui)
     return;
   gui->scratchpad = NULL;
 
-  const int state = g_atomic_int_get(&d->encode_state);
-  if(state == ENCODE_RUNNING)
+  // whatever ends the session data ends the edit session: do the
+  // bookkeeping NOW, on the GUI thread, even when the destruction below
+  // defers -- a later dt_object_mask_edit_begin (GUI thread too) must
+  // never observe a stale gate from a session being torn down
+  _edit_session_end(d, EDIT_NONE);
+
+  // the session is gone and so is the reason to hold the shape buttons.
+  // this is the ONE exit every teardown funnels through -- finalise, no-op
+  // close, cancel, image or geometry change, module refocus, view change,
+  // module destruction -- and the poll timer that keeps the lock fresh
+  // dies with the data below, so the last word has to be said here
+  dt_masks_update_shapes_sensitivity();
+
+  if(g_atomic_int_get(&d->encode_state) == ENCODE_RUNNING
+     || g_atomic_int_get(&d->decode_state) == DECODE_RUNNING
+     || _edit_replay_running(d))
   {
-    // thread still running, defer cleanup so we don't block the UI
+    // a thread still runs on this data: defer, don't block the UI. safe
+    // because the compute works from its own snapshot -- the dynbufs and
+    // preview structures freed by our caller are never touched by it
     g_timeout_add(200, _deferred_cleanup, d);
     return;
   }
@@ -241,7 +657,73 @@ typedef struct _encode_thread_data_t
   dt_imgid_t imgid;        // image to encode (thread renders via export pipe)
   int32_t history_end;     // darkroom history_end (may be ahead of database)
   dt_hash_t distort_hash;  // hash from live darkroom state (for disk cache key)
+  // -- ai edit session: reproduce the RECORDED encode --
+  // when pinned, the thread loads the recorded model BY ID and renders at
+  // the recorded dimensions instead of the active model at the current
+  // render preference. every deviation from the plain session mirrors the
+  // headless replay (dt_object_recipe_compute), the fidelity reference
+  gboolean pinned;
+  char pin_model[DT_RF_RECIPE_MODEL_ID_LEN];
+  int pin_w, pin_h;        // recorded encode dimensions
+  // the render cap this encoding runs under, raw: the recorded one when
+  // pinned (it recovers the exact scale), the current preference
+  // otherwise. always set, so the render never re-reads the conf and the
+  // session can record the cap its encoding really came from
+  int render_size;
+  dt_rf_recipe_t pin_recipe; // to disable the edited rasterfile instance
 } _encode_thread_data_t;
+
+// convert the float RGBA backbuf of a processed export pipe to the uint8
+// RGB layout the segmentation encoder expects. NULL when the render failed
+// or on allocation failure. shared by the interactive encode thread and
+// the headless recipe replay
+static uint8_t *_backbuf_to_rgb8(const dt_dev_pixelpipe_t *pipe,
+                                 const int w,
+                                 const int h)
+{
+  if(!pipe->backbuf)
+    return NULL;
+  const float *outbuf = (const float *)pipe->backbuf;
+  uint8_t *rgb = g_try_malloc((size_t)w * h * 3);
+  if(!rgb)
+    return NULL;
+  for(size_t i = 0; i < (size_t)w * h; i++)
+  {
+    rgb[i * 3 + 0] = (uint8_t)CLAMP(outbuf[i * 4 + 0] * 255.0f + 0.5f, 0, 255);
+    rgb[i * 3 + 1] = (uint8_t)CLAMP(outbuf[i * 4 + 1] * 255.0f + 0.5f, 0, 255);
+    rgb[i * 3 + 2] = (uint8_t)CLAMP(outbuf[i * 4 + 2] * 255.0f + 0.5f, 0, 255);
+  }
+  return rgb;
+}
+
+// encode `rgb` with `*seg`, falling back to a CPU-provider reload of the
+// model on failure. `model_id` names the model to reload; NULL reloads the
+// active "mask" model (fetched lazily, only when the fallback triggers).
+// on a failed reload *seg is NULL on return. shared by the interactive
+// encode thread and the headless recipe replay -- keep both callers'
+// behaviour identical when touching this
+static gboolean _seg_encode_cpu_fallback(dt_seg_context_t **seg,
+                                         dt_ai_environment_t *env,
+                                         const char *model_id,
+                                         const uint8_t *rgb,
+                                         const int w,
+                                         const int h)
+{
+  gboolean ok = dt_seg_encode_image(*seg, rgb, w, h);
+  if(!ok)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] encoding failed, retrying with CPU provider");
+    dt_seg_free(*seg);
+    dt_ai_env_set_provider(env, DT_AI_PROVIDER_CPU);
+    char *active = model_id ? NULL : dt_ai_models_get_active_for_task("mask");
+    *seg = dt_seg_load(env, model_id ? model_id : active);
+    g_free(active);
+    if(*seg)
+      ok = dt_seg_encode_image(*seg, rgb, w, h);
+  }
+  return ok;
+}
 
 // background thread: loads model, renders image via export pipe, and encodes,
 // does ZERO GLib/GTK calls - only computation + atomic state set,
@@ -253,6 +735,12 @@ static gpointer _encode_thread_func(gpointer data)
   const dt_imgid_t imgid = td->imgid;
   const int32_t td_history_end = td->history_end;
   const dt_hash_t distort_hash = td->distort_hash;
+  const gboolean pinned = td->pinned;
+  char pin_model[DT_RF_RECIPE_MODEL_ID_LEN];
+  g_strlcpy(pin_model, td->pin_model, sizeof(pin_model));
+  const int pin_w = td->pin_w, pin_h = td->pin_h;
+  const int render_size = td->render_size;
+  const dt_rf_recipe_t pin_recipe = td->pin_recipe;
   g_free(td);
 
   // load model if needed
@@ -261,7 +749,14 @@ static gpointer _encode_thread_func(gpointer data)
     if(!d->env)
       d->env = dt_ai_env_init(NULL);
 
-    char *model_id = dt_ai_models_get_active_for_task("mask");
+    // an edit session loads the RECORDED segmentation model by id, exactly
+    // like the headless replay: the session reproduces the recorded
+    // decodes, and the active model may be another one even when the
+    // model-gap verdict passed at edit_begin (the verdict checks installed
+    // state, not active-ness, for the segmentation model). plain sessions
+    // keep loading the active model
+    char *model_id = pinned ? g_strdup(pin_model)
+                            : dt_ai_models_get_active_for_task("mask");
     d->seg = dt_seg_load(d->env, model_id);
     g_free(model_id);
 
@@ -283,6 +778,30 @@ static gpointer _encode_thread_func(gpointer data)
   // so synch_all applies all current edits
   if(td_history_end > 0 && td_history_end > dev.history_end)
     dev.history_end = td_history_end;
+
+  // edit session: reproduce the FIRST capture's state, mechanism of the
+  // headless replay -- the loaded history contains the very rasterfile
+  // instance being edited; left enabled, its consumers would render with
+  // the edited mask's own effect (or a zeroed one when the file is
+  // missing) baked into this encode, which the original session -- made
+  // before the mask existed -- never saw. disable the instances that
+  // carry OUR recipe (verbatim compare); other raster masks keep their
+  // effect. this only protects the RE-RENDERED path: a shared .seg cache
+  // hit below returns embeddings made by whoever wrote the cache, possibly
+  // with the carrier instance enabled. that divergence is DETERMINISTIC
+  // (the carrier's effect is baked into the cached render) and merely
+  // revealed at random by the state of the cache -- not ONNX variance. TC2
+  // decides whether it is visible; if it is, the pinned path must refuse a
+  // hit whose render could contain the carrier
+  if(pinned)
+    for(GList *l = dev.iop; l; l = g_list_next(l))
+    {
+      dt_iop_module_t *m = l->data;
+      if(!strcmp(m->op, "rasterfile") && m->enabled && m->params
+         && memcmp(&((dt_iop_rasterfile_params_t *)m->params)->recipe,
+                   &pin_recipe, sizeof(pin_recipe)) == 0)
+        m->enabled = FALSE;
+    }
 
   dt_mipmap_buffer_t buf;
   dt_mipmap_cache_get(&buf, imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
@@ -323,27 +842,86 @@ static gpointer _encode_thread_func(gpointer data)
                                   &pipe.processed_width,
                                   &pipe.processed_height);
 
-  const int render_target = dt_conf_key_exists(CONF_OBJECT_RENDER_SIZE_KEY)
-    ? MAX(dt_conf_get_int(CONF_OBJECT_RENDER_SIZE_KEY), 1024)
-    : SEG_RENDER_DEFAULT;
+  // edit session: the render cap is the RECORDED one -- the recipe's
+  // prompt geometry is bound to the recorded encode dimensions, and the
+  // current preference may have moved since (headless replay rule: never
+  // re-read the render-size conf for a replayed encode)
+  // render_size is the raw cap the launch snapshotted (pinned or not); the
+  // MAX is the one convention every use point applies
+  const int render_target = MAX(render_size, 1024);
   const double scale = fmin((double)render_target / (double)pipe.processed_width,
                             (double)render_target / (double)pipe.processed_height);
-  const double final_scale = fmin(scale, 1.0); // don't upscale
-  const int out_w = (int)(final_scale * pipe.processed_width);
-  const int out_h = (int)(final_scale * pipe.processed_height);
+  double final_scale = fmin(scale, 1.0); // don't upscale
+  int out_w = (int)(final_scale * pipe.processed_width);
+  int out_h = (int)(final_scale * pipe.processed_height);
+  if(pinned)
+  {
+    // the recipe travels in the XMP and is untrusted input: the encode
+    // render never upscales, so recorded dims above the processed frame
+    // are necessarily corrupt (headless replay rule)
+    if(pin_w <= 0 || pin_h <= 0
+       || pin_w > pipe.processed_width || pin_h > pipe.processed_height)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] edit: recorded encode dims %dx%d unusable for"
+               " the processed frame %dx%d",
+               pin_w, pin_h, pipe.processed_width, pipe.processed_height);
+      dt_dev_pixelpipe_cleanup(&pipe);
+      dt_mipmap_cache_release(&buf);
+      dt_dev_cleanup(&dev);
+      g_atomic_int_set(&d->encode_state, ENCODE_ERROR);
+      return NULL;
+    }
+    if(out_w != pin_w || out_h != pin_h)
+    {
+      // recorded dims from a .seg cache made under another cap: fall back
+      // to the dim ratio, mirror of the headless replay (sub-pixel
+      // sampling difference, accepted for that rare case); reject dims
+      // the render cannot reach even so
+      final_scale = fmin((double)pin_w / (double)pipe.processed_width,
+                         (double)pin_h / (double)pipe.processed_height);
+      if((int)(final_scale * pipe.processed_width) + 1 < pin_w
+         || (int)(final_scale * pipe.processed_height) + 1 < pin_h)
+      {
+        dt_print(DT_DEBUG_AI,
+                 "[object mask] edit: recorded dims %dx%d not reachable"
+                 " from the processed frame", pin_w, pin_h);
+        dt_dev_pixelpipe_cleanup(&pipe);
+        dt_mipmap_cache_release(&buf);
+        dt_dev_cleanup(&dev);
+        g_atomic_int_set(&d->encode_state, ENCODE_ERROR);
+        return NULL;
+      }
+    }
+    out_w = pin_w;
+    out_h = pin_h;
+  }
 
   // use distort hash from darkroom's live state (passed by caller)
   // instead of computing from the thread's dev, which may have
   // stale history (not yet flushed to database)
   if(dt_seg_disk_cache_load(d->seg, imgid, distort_hash))
   {
-    dt_dev_pixelpipe_cleanup(&pipe);
-    dt_mipmap_cache_release(&buf);
-    dt_dev_cleanup(&dev);
-    dt_seg_get_encoded_rgb(d->seg, &d->encode_w, &d->encode_h);
-    g_atomic_int_set(&d->encode_state, ENCODE_READY);
-    dt_seg_warmup_decoder(d->seg);
-    return NULL;
+    int cw = 0, ch = 0;
+    dt_seg_get_encoded_rgb(d->seg, &cw, &ch);
+    // edit session: the cache is validated without dimensions, and a hit
+    // at other dims than the recipe records would put the replayed
+    // prompts on the wrong grid -- re-encode then (headless replay rule)
+    if(!pinned || (cw == pin_w && ch == pin_h))
+    {
+      dt_dev_pixelpipe_cleanup(&pipe);
+      dt_mipmap_cache_release(&buf);
+      dt_dev_cleanup(&dev);
+      d->encode_w = cw;
+      d->encode_h = ch;
+      g_atomic_int_set(&d->encode_state, ENCODE_READY);
+      dt_seg_warmup_decoder(d->seg);
+      return NULL;
+    }
+    dt_print(DT_DEBUG_AI,
+             "[object mask] edit: cached encoding is %dx%d, recipe records"
+             " %dx%d, re-encoding", cw, ch, pin_w, pin_h);
+    dt_seg_reset_encoding(d->seg);
   }
 
   dt_print(DT_DEBUG_AI,
@@ -352,22 +930,15 @@ static gpointer _encode_thread_func(gpointer data)
 
   dt_dev_pixelpipe_process_no_gamma(&pipe, &dev, 0, 0, out_w, out_h, final_scale);
 
-  // backbuf is float RGBA after process_no_gamma, convert to uint8 RGB for SAM
+  // backbuf is float RGBA after process_no_gamma, convert to uint8 RGB for SAM.
+  // edit session: a render that landed on other dims than the recorded ones
+  // would put the replayed prompts on the wrong grid -- fail instead
+  // (headless replay's own guard)
   uint8_t *rgb = NULL;
-  if(pipe.backbuf)
-  {
-    const float *outbuf = (const float *)pipe.backbuf;
-    rgb = g_try_malloc((size_t)out_w * out_h * 3);
-    if(rgb)
-    {
-      for(size_t i = 0; i < (size_t)out_w * out_h; i++)
-      {
-        rgb[i * 3 + 0] = (uint8_t)CLAMP(outbuf[i * 4 + 0] * 255.0f + 0.5f, 0, 255);
-        rgb[i * 3 + 1] = (uint8_t)CLAMP(outbuf[i * 4 + 1] * 255.0f + 0.5f, 0, 255);
-        rgb[i * 3 + 2] = (uint8_t)CLAMP(outbuf[i * 4 + 2] * 255.0f + 0.5f, 0, 255);
-      }
-    }
-  }
+  if(!pinned
+     || (pipe.backbuf
+         && pipe.backbuf_width == out_w && pipe.backbuf_height == out_h))
+    rgb = _backbuf_to_rgb8(&pipe, out_w, out_h);
 
   dt_dev_pixelpipe_cleanup(&pipe);
   dt_mipmap_cache_release(&buf);
@@ -384,34 +955,24 @@ static gpointer _encode_thread_func(gpointer data)
   d->encode_w = out_w;
   d->encode_h = out_h;
 
-  // encode the image
-  gboolean ok = dt_seg_encode_image(d->seg, rgb, out_w, out_h);
+  // encode the image, falling back to CPU when acceleration fails; an edit
+  // session pins the fallback reload to the recorded model, as the replay does
+  const gboolean ok
+    = _seg_encode_cpu_fallback(&d->seg, d->env, pinned ? pin_model : NULL,
+                               rgb, out_w, out_h);
+  if(!d->seg)
+    d->model_loaded = FALSE;
 
-  // if accelerated encoding failed, fall back to CPU
-  if(!ok)
-  {
-    dt_print(DT_DEBUG_AI,
-             "[object mask] encoding failed, retrying with CPU provider");
-    dt_seg_free(d->seg);
-    dt_ai_env_set_provider(d->env, DT_AI_PROVIDER_CPU);
-    char *model_id = dt_ai_models_get_active_for_task("mask");
-    d->seg = dt_seg_load(d->env, model_id);
-    g_free(model_id);
-
-    if(d->seg)
-      ok = dt_seg_encode_image(d->seg, rgb, out_w, out_h);
-    else
-      d->model_loaded = FALSE;
-  }
-
-  // dt_seg_encode_image keeps its own copy of rgb for edge refinement
-  if(ok)
+  // dt_seg_encode_image keeps its own copy of rgb for edge refinement.
+  // edit session: never clobber an existing per-image cache slot -- it may
+  // hold a plain session's working resolution (headless replay rule)
+  if(ok && (!pinned || !dt_seg_disk_cache_exists(imgid)))
     dt_seg_disk_cache_save(d->seg, imgid, distort_hash,
                            rgb, out_w, out_h);
   g_free(rgb);
 
   // signal ready so the user can start placing points; warmup continues
-  // on this thread; _run_decoder joins the thread on the first click to
+  // on this thread; _launch_decode joins the thread on the first click to
   // avoid a race with warmup on the shared segmentation context
   g_atomic_int_set(&d->encode_state, ok ? ENCODE_READY : ENCODE_ERROR);
 
@@ -636,74 +1197,66 @@ static gboolean _compute_bbox(const float *const restrict mask,
   return TRUE;
 }
 
-static void _run_decoder(dt_masks_form_gui_t *gui)
+// ---------------------------- interactive decode ----------------------------
+//
+// three parts: _launch_decode snapshots every input on the GUI thread into a
+// self-contained job and starts the compute thread; _decode_thread_func
+// computes from that job alone -- its shared state is d->seg / d->refine /
+// d->refine_failed / d->env, on which it has exclusive rights while a decode
+// runs, plus the atomic decode_state it sets as its last instruction;
+// _decode_finish joins the thread on the GUI side and publishes the result
+// into d->mask (or drains it)
+
+struct _decode_job_t
 {
-  _object_data_t *d = _get_data(gui);
-  if(!d || !d->seg || !dt_seg_is_encoded(d->seg))
-    return;
-  if(gui->guipoints_count <= 0)
-    return;
+  _object_data_t *d;         // owner; stays valid while a decode runs
+                             // (_free_data defers to _deferred_cleanup)
+  // -- inputs, snapshotted on the GUI thread; the compute never reads the
+  // live dynbufs, the preview pipe geometry or any gui->* field --
+  dt_seg_point_t *points;    // mapped to encode space, with pass headroom
+  int n_prompt_points;
+  int n_passes;
+  int seed_x, seed_y;        // unclamped; clamped against the mask dims
+  gboolean reset_prev_mask;  // snapshotted; see _launch_decode
+  float threshold;
+  gboolean do_crf;
+  int crf_iter;
+  float crf_sigma_color;
+  float crf_w_bilateral;
+  gboolean do_refine;
+  float refine_margin;
+  // -- private output of the compute --
+  float *out_mask;
+  int out_w, out_h;
+};
 
-  // wait for encode thread: warmup may still be running after ENCODE_READY
-  if(d->encode_thread)
-  {
-    g_thread_join(d->encode_thread);
-    d->encode_thread = NULL;
-  }
+static void _decode_job_free(_decode_job_t *job)
+{
+  if(!job) return;
+  g_free(job->points);
+  g_free(job->out_mask);
+  g_free(job);
+}
 
-  dt_gui_cursor_set_busy();
+// the compute. runs from the job snapshot only; writes its result into the
+// job, never into d->mask
+static gpointer _decode_thread_func(gpointer data)
+{
+  _decode_job_t *job = data;
+  _object_data_t *d = job->d;
 
-  const float *gp = dt_masks_dynbuf_buffer(gui->guipoints);
-  const float *gpp = dt_masks_dynbuf_buffer(gui->guipoints_payload);
-
-  // points are stored in preview pipe pixel space, scale to encoding space
-  float wd, ht, iwidth, iheight;
-  dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
-  const float sx = (wd > 0) ? (float)d->encode_w / wd : 1.0f;
-  const float sy = (ht > 0) ? (float)d->encode_h / ht : 1.0f;
-
-  // always send all accumulated points; on the first click reset the
-  // previous mask, on subsequent clicks keep it so the decoder gets
-  // both all points AND the previous mask as boundary context;
-  // after decode, prev_mask carries refinement context, don't reset it
-  const int n_prompt_points = gui->guipoints_count;
-  if(gui->guipoints_count <= 1 && !d->has_selection)
+  if(job->reset_prev_mask)
     dt_seg_reset_prev_mask(d->seg);
 
-  // headroom: one peak point per pass + 2 box corners (SAM only)
-  const int n_passes = CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_PASSES_KEY),
-                             1, 3);
-  dt_seg_point_t *points = g_new(dt_seg_point_t, n_prompt_points + n_passes + 2);
-  for(int i = 0; i < n_prompt_points; i++)
-  {
-    points[i].x = gp[i * 2 + 0] * sx;
-    points[i].y = gp[i * 2 + 1] * sy;
-    points[i].label = (int)gpp[i];
-  }
-  int n_points = n_prompt_points;
-
-  // find seed point for connected component filter:
-  // always search ALL accumulated points (not just prompt points)
-  int seed_x = -1, seed_y = -1;
-  for(int i = gui->guipoints_count - 1; i >= 0; i--)
-  {
-    const int label = (int)gpp[i];
-    if(label == 1)
-    {
-      seed_x = (int)(gp[i * 2 + 0] * sx);
-      seed_y = (int)(gp[i * 2 + 1] * sy);
-      break;
-    }
-  }
-
-  const float threshold
-    = CLAMP(dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY), 0.3f, 0.9f);
+  dt_seg_point_t *points = job->points;
+  int n_points = job->n_prompt_points;
+  const float threshold = job->threshold;
   const gboolean supports_box = dt_seg_supports_box(d->seg);
   int mw = 0, mh = 0;
   float *mask = NULL;
   gboolean box_added = FALSE;
 
-  for(int pass = 0; pass < n_passes; pass++)
+  for(int pass = 0; pass < job->n_passes; pass++)
   {
     float *new_mask = dt_seg_compute_mask(d->seg, points, n_points, &mw, &mh);
     if(!new_mask) break;
@@ -713,13 +1266,13 @@ static void _run_decoder(dt_masks_form_gui_t *gui)
       g_free(mask);
       mask = new_mask;
       dt_print(DT_DEBUG_AI,
-               "[object mask] converged at pass %d/%d", pass + 1, n_passes);
+               "[object mask] converged at pass %d/%d", pass + 1, job->n_passes);
       break;
     }
     g_free(mask);
     mask = new_mask;
 
-    if(pass + 1 >= n_passes) break;
+    if(pass + 1 >= job->n_passes) break;
 
     gboolean any_added = FALSE;
     dt_seg_point_t peak;
@@ -742,47 +1295,212 @@ static void _run_decoder(dt_masks_form_gui_t *gui)
     }
     if(!any_added) break;
   }
-  g_free(points);
 
   if(mask)
   {
     // remove disconnected blobs: keep only the component at the seed point
-    seed_x = CLAMP(seed_x, 0, mw - 1);
-    seed_y = CLAMP(seed_y, 0, mh - 1);
+    const int seed_x = CLAMP(job->seed_x, 0, mw - 1);
+    const int seed_y = CLAMP(job->seed_y, 0, mh - 1);
     _keep_seed_component(mask, mw, mh, threshold, seed_x, seed_y);
 
     // optional DenseCRF edge refinement using the encoded RGB as guide
-    if(d->preview_refine)
+    if(job->do_crf)
     {
       int rgb_w = 0, rgb_h = 0;
       const uint8_t *rgb = dt_seg_get_encoded_rgb(d->seg, &rgb_w, &rgb_h);
       if(rgb && rgb_w == mw && rgb_h == mh)
       {
-        const int crf_iter
-          = CLAMP(dt_conf_get_int(CONF_OBJECT_REFINE_BOUNDARY_ITER_KEY),
-                  1, 10);
-        const float crf_sigma_color
-          = CLAMP(dt_conf_get_float(CONF_OBJECT_REFINE_BOUNDARY_SIGMA_COLOR_KEY),
-                  1.0f, 50.0f);
-        const float crf_w_bilateral
-          = CLAMP(dt_conf_get_float(CONF_OBJECT_REFINE_BOUNDARY_W_BILATERAL_KEY),
-                  0.5f, 30.0f);
         const double t0 = dt_get_wtime();
         dt_dense_crf_binary(mask, rgb, mw, mh,
-                            5.0f, crf_sigma_color,
-                            3.0f, crf_w_bilateral, crf_iter);
+                            5.0f, job->crf_sigma_color,
+                            3.0f, job->crf_w_bilateral, job->crf_iter);
         dt_print(DT_DEBUG_AI,
                  "[object mask] CRF refinement: %dx%d (%.2fs)",
                  mw, mh, dt_get_wtime() - t0);
       }
     }
 
-    g_free(d->mask);
-    d->mask = mask;
-    d->mask_w = mw;
-    d->mask_h = mh;
+    // optional CascadePSP contour refinement. the segmentation decoder emits
+    // a fixed 256x256 mask, so on a large image one mask pixel spans dozens
+    // of image pixels and no resampling can recover the contour. a dedicated
+    // network re-derives it from the image, given the coarse mask as a hint.
+    if(job->do_refine)
+    {
+      int rgb_w = 0, rgb_h = 0;
+      const uint8_t *rgb = dt_seg_get_encoded_rgb(d->seg, &rgb_w, &rgb_h);
+      if(rgb && rgb_w == mw && rgb_h == mh)
+      {
+        // lazy-load here on purpose: while a decode runs this code has
+        // exclusive rights on d->refine / d->refine_failed
+        if(!d->refine && !d->refine_failed)
+        {
+          d->refine = dt_refine_load(d->env);
+          if(!d->refine)
+          {
+            d->refine_failed = TRUE;
+            dt_print(DT_DEBUG_AI,
+                     "[object mask] contour refinement unavailable, disabled"
+                     " for this mask");
+          }
+        }
+
+        if(d->refine)
+        {
+          dt_seg_point_t tl, br;
+          if(_compute_bbox(mask, mw, mh, threshold, job->refine_margin,
+                           &tl, &br))
+          {
+            const int rx = CLAMP((int)tl.x, 0, mw - 1);
+            const int ry = CLAMP((int)tl.y, 0, mh - 1);
+            const int rw = CLAMP((int)br.x - rx + 1, 1, mw - rx);
+            const int rh = CLAMP((int)br.y - ry + 1, 1, mh - ry);
+            const double t1 = dt_get_wtime();
+            if(dt_refine_run(d->refine, rgb, mw, mh, mask, threshold,
+                             rx, ry, rw, rh))
+              dt_print(DT_DEBUG_AI,
+                       "[object mask] contour refinement: %dx%d region (%.2fs)",
+                       rw, rh, dt_get_wtime() - t1);
+          }
+        }
+      }
+    }
   }
-  dt_gui_cursor_clear_busy();
+
+  job->out_mask = mask;
+  job->out_w = mw;
+  job->out_h = mh;
+  // last instruction: hand the result to the GUI side. the publication
+  // machine in post_expose (woken by the 100 ms poll timer redraw) joins
+  // the thread and publishes
+  g_atomic_int_set(&job->d->decode_state, mask ? DECODE_READY : DECODE_ERROR);
+  return NULL;
+}
+
+// GUI thread: snapshot every input into a job and start the compute thread.
+// coalesces on its own: while a decode is in flight it only flags
+// decode_pending -- the dynbuf holds the clicks and IS the queue
+static void _launch_decode(dt_masks_form_gui_t *gui)
+{
+  _object_data_t *d = _get_data(gui);
+  if(!d || !d->seg || !dt_seg_is_encoded(d->seg))
+    return;
+  if(gui->guipoints_count <= 0)
+    return;
+
+  // frozen while an edit replay owns the segmentation context: the event
+  // handlers refuse clicks first, this is the structural backstop -- a
+  // decode launched here would run a second thread on the same ONNX
+  // context as the replay
+  if(_edit_frozen(d))
+    return;
+
+  // a decode is already in flight: the point is accumulated in the dynbuf
+  // (which IS the queue); publication will relaunch with ALL points
+  if(g_atomic_int_get(&d->decode_state) != DECODE_IDLE)
+  {
+    d->decode_pending = TRUE;
+    return;
+  }
+
+  // wait for encode thread: warmup may still be running after ENCODE_READY
+  if(d->encode_thread)
+  {
+    g_thread_join(d->encode_thread);
+    d->encode_thread = NULL;
+  }
+
+  // non-modal busy indicator: a modal grab would swallow the very clicks
+  // the coalescing is meant to accumulate
+  if(!d->decode_busy_shown)
+  {
+    dt_control_busy_enter();
+    d->decode_busy_shown = TRUE;
+  }
+
+  const float *gp = dt_masks_dynbuf_buffer(gui->guipoints);
+  const float *gpp = dt_masks_dynbuf_buffer(gui->guipoints_payload);
+
+  // points are stored in preview pipe pixel space, scale to encoding space
+  float wd, ht, iwidth, iheight;
+  dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
+  const float sx = (wd > 0) ? (float)d->encode_w / wd : 1.0f;
+  const float sy = (ht > 0) ? (float)d->encode_h / ht : 1.0f;
+
+  _decode_job_t *job = g_malloc0(sizeof(_decode_job_t));
+  job->d = d;
+  job->n_prompt_points = gui->guipoints_count;
+  // always FALSE from the interactive path today: has_selection is set
+  // before the launch. snapshotted to preserve the historical behaviour bit
+  // for bit -- do not attach first-click semantics to it
+  job->reset_prev_mask = (gui->guipoints_count <= 1 && !d->has_selection);
+  job->n_passes = _session_n_passes(d);
+
+  // headroom: one peak point per pass + 2 box corners (SAM only)
+  job->points
+    = g_new(dt_seg_point_t, job->n_prompt_points + job->n_passes + 2);
+  for(int i = 0; i < job->n_prompt_points; i++)
+  {
+    job->points[i].x = gp[i * 2 + 0] * sx;
+    job->points[i].y = gp[i * 2 + 1] * sy;
+    job->points[i].label = (int)gpp[i];
+  }
+
+  // seed point for the connected component filter: last positive point
+  job->seed_x = -1;
+  job->seed_y = -1;
+  for(int i = gui->guipoints_count - 1; i >= 0; i--)
+  {
+    if((int)gpp[i] == 1)
+    {
+      job->seed_x = (int)(gp[i * 2 + 0] * sx);
+      job->seed_y = (int)(gp[i * 2 + 1] * sy);
+      break;
+    }
+  }
+
+  // through the session accessors: an edit session decodes with the
+  // recipe's recorded scalars, not the preferences of the day. a click
+  // added after the replay must refine the recorded chain with the
+  // parameters that built it -- the recipe format assumes they are
+  // constant over the session, and the re-capture records them
+  job->threshold = _session_threshold(d);
+  job->do_crf = d->preview_refine;
+  job->crf_iter = _session_crf_iter(d);
+  job->crf_sigma_color = _session_crf_sigma_color(d);
+  job->crf_w_bilateral = _session_crf_w_bilateral(d);
+  job->do_refine = _session_do_refine(d) && !d->refine_failed;
+  job->refine_margin = _session_refine_margin(d);
+
+  d->decode_pending = FALSE;
+  d->decode_launched_count = gui->guipoints_count;
+
+  // provenance: scalars of the last launched decode. the mask a later
+  // finalisation captures is the one THIS job computes; the conf and the
+  // preview toggles may move before the capture, so the recipe must read
+  // these snapshots, never the live state (threshold is recorded
+  // per-boundary through the mark below)
+  d->last_do_crf = job->do_crf;
+  d->last_crf_iter = job->crf_iter;
+  d->last_crf_sigma_color = job->crf_sigma_color;
+  d->last_crf_w_bilateral = job->crf_w_bilateral;
+  d->last_do_refine = job->do_refine;
+  d->last_refine_margin = job->refine_margin;
+  d->last_n_passes = job->n_passes;
+
+  // provenance: this decode's boundary is the last point it covers
+  _marks_resize(d, gui->guipoints_count);
+  _decode_mark_t *mark = &g_array_index(d->decode_marks, _decode_mark_t,
+                                        job->n_prompt_points - 1);
+  mark->threshold = job->threshold;
+  mark->launched = TRUE;
+
+  d->decode_job = job;
+  g_atomic_int_set(&d->decode_state, DECODE_RUNNING);
+  // the poll timer (started with the encode) redraws every 100 ms; the
+  // publication machine in post_expose detects completion
+  if(!d->modifier_poll_id)
+    d->modifier_poll_id = g_timeout_add(100, _modifier_poll, NULL);
+  d->decode_thread = g_thread_new("ai-mask-decode", _decode_thread_func, job);
 }
 
 // run vectorization with current preview parameters, store result in scratchpad,
@@ -810,12 +1528,11 @@ static void _update_preview(_object_data_t *d)
   for(size_t i = 0; i < n; i++)
     inv_mask[i] = 1.0f - d->mask[i];
 
-  const float thresh = 1.0f - CLAMP(dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY),
-                                    0.3f, 0.9f);
+  const float thresh = 1.0f - _session_threshold(d);
   d->preview_forms = ras2forms(inv_mask, d->mask_w, d->mask_h, NULL,
                                thresh,
                                d->preview_cleanup, (double)d->preview_smoothing,
-                               &d->preview_signs);
+                               0.3, &d->preview_signs);
   g_free(inv_mask);
 
   // apply feather to all path points
@@ -832,44 +1549,281 @@ static void _update_preview(_object_data_t *d)
   }
 }
 
-// save the raster mask as an RGB PNG to the raster mask root folder
-// (compatible with the external raster masks module)
-static void _save_raster_mask(const float *mask,
-                              const int w,
-                              const int h,
-                              const float threshold)
+// GUI thread: join a finished decode and either publish its result or drop
+// it. dropping (publish=FALSE) is the drain used by _clear_selection, the
+// invalidation branch and the stale-geometry check in the publication
+// machine: without it, a posthumous publication would resurrect a mask the
+// user just tore down. handles the coalesced relaunch. called from the
+// expose handler like the encode machine -- keep this path light
+static void _decode_finish(dt_masks_form_gui_t *gui, const gboolean publish)
 {
-  if(!mask || w <= 0 || h <= 0) return;
+  _object_data_t *d = _get_data(gui);
+  if(!d) return;
+  const int st = g_atomic_int_get(&d->decode_state);
+  if(st != DECODE_READY && st != DECODE_ERROR) return;
 
-  const dt_imgid_t imgid = darktable.develop->image_storage.id;
-  if(!dt_is_valid_imgid(imgid)) return;
-
-  // get the raster mask root folder from preferences
-  gchar *root = dt_conf_get_string("plugins/darkroom/segments/def_path");
-  if(!root || !*root)
+  if(d->decode_thread)
   {
-    g_free(root);
-    dt_control_log(_("set raster mask root folder in preferences"));
-    return;
+    g_thread_join(d->decode_thread);
+    d->decode_thread = NULL;
+  }
+  _decode_job_t *job = d->decode_job;
+  d->decode_job = NULL;
+
+  // a failed decode never produced a boundary: retract the provenance mark
+  // posted optimistically at launch, or a later capture would record a
+  // decode the session never completed and the replay would diverge
+  if(st == DECODE_ERROR && d->decode_marks
+     && d->decode_launched_count > 0
+     && d->decode_launched_count <= (int)d->decode_marks->len)
+  {
+    _decode_mark_t *mark = &g_array_index(d->decode_marks, _decode_mark_t,
+                                          d->decode_launched_count - 1);
+    mark->launched = FALSE;
+    mark->threshold = 0.0f;
   }
 
-  // ensure the directory exists
+  gboolean published = FALSE;
+  if(publish && st == DECODE_READY && job && job->out_mask)
+  {
+    g_free(d->mask);
+    d->mask = job->out_mask;
+    d->mask_w = job->out_w;
+    d->mask_h = job->out_h;
+    job->out_mask = NULL;   // ownership moved
+    published = TRUE;
+  }
+  _decode_job_free(job);
+  g_atomic_int_set(&d->decode_state, DECODE_IDLE);
+
+  if(published)
+  {
+    _update_preview(d);
+    if(darktable.develop->proxy.masks.module)
+      darktable.develop->proxy.masks.list_change(
+        darktable.develop->proxy.masks.module);
+  }
+
+  // coalescing: clicks landed while the compute ran -- relaunch once with
+  // ALL accumulated points ("last click wins" by accumulation). after an
+  // error, only an explicit pending click relaunches (no error loop)
+  gboolean relaunch = FALSE;
+  if(publish)
+  {
+    if(st == DECODE_READY)
+      relaunch = d->decode_pending
+                 || gui->guipoints_count != d->decode_launched_count;
+    else
+      relaunch = d->decode_pending;
+  }
+  d->decode_pending = FALSE;
+
+  if(relaunch && gui->guipoints_count > 0)
+    _launch_decode(gui);        // keeps the busy indicator shown
+
+  // default branch, not an else: the enter/leave pairing must hold locally,
+  // whatever early-return the relaunch attempt above may have taken
+  if(g_atomic_int_get(&d->decode_state) != DECODE_RUNNING
+     && d->decode_busy_shown)
+  {
+    dt_control_busy_leave();
+    d->decode_busy_shown = FALSE;
+  }
+
+  // a failed compute otherwise ends with a silent busy-indicator removal,
+  // and the user is left clicking into the void
+  if(publish && st == DECODE_ERROR
+     && g_atomic_int_get(&d->decode_state) != DECODE_RUNNING)
+    dt_control_log(_("object mask: computation failed"));
+
+  if(published)
+  {
+    // dismiss "computing mask..." unless a coalesced relaunch took off
+    if(g_atomic_int_get(&d->decode_state) != DECODE_RUNNING)
+      dt_control_log_ack_all();
+    dt_control_queue_redraw_center();
+  }
+}
+
+// self-documenting wrappers for the two lifecycle transitions above
+static void _decode_publish(dt_masks_form_gui_t *gui)
+{
+  _decode_finish(gui, TRUE);
+}
+
+static void _decode_drain(dt_masks_form_gui_t *gui)
+{
+  _decode_finish(gui, FALSE);
+}
+
+// write a mask as a 16-bit RGB PNG to the raster mask folder. the external
+// raster mask module reads that depth with a 1/65535 normaliser and no
+// thresholding, so the alpha survives intact; the three channels carry the
+// same value and deflate collapses them
+static gboolean _write_mask_png16(const char *path,
+                                  const float *const restrict mask,
+                                  const int w,
+                                  const int h)
+{
+  FILE *f = g_fopen(path, "wb");
+  if(!f) return FALSE;
+
+  uint16_t *row = g_try_malloc((size_t)w * 3 * sizeof(uint16_t));
+  if(!row)
+  {
+    fclose(f);
+    return FALSE;
+  }
+
+  png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+  if(!png)
+  {
+    g_free(row);
+    fclose(f);
+    return FALSE;
+  }
+  png_infop info = png_create_info_struct(png);
+  if(!info || setjmp(png_jmpbuf(png)))
+  {
+    // libpng error path: free everything and remove the truncated file
+    png_destroy_write_struct(&png, info ? &info : NULL);
+    g_free(row);
+    fclose(f);
+    g_unlink(path);
+    return FALSE;
+  }
+
+  png_init_io(png, f);
+  png_set_IHDR(png, info, w, h, 16, PNG_COLOR_TYPE_RGB,
+               PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
+               PNG_FILTER_TYPE_DEFAULT);
+  png_set_compression_level(png, 6);
+  png_write_info(png, info);
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
+  png_set_swap(png);   // PNG wants big-endian samples
+#endif
+
+  for(int y = 0; y < h; y++)
+  {
+    const float *const src = mask + (size_t)y * w;
+    for(int x = 0; x < w; x++)
+    {
+      const uint16_t v = (uint16_t)lrintf(CLAMPF(src[x], 0.0f, 1.0f) * 65535.0f);
+      row[x * 3 + 0] = v;
+      row[x * 3 + 1] = v;
+      row[x * 3 + 2] = v;
+    }
+    png_write_row(png, (png_bytep)row);
+  }
+
+  png_write_end(png, NULL);
+  png_destroy_write_struct(&png, &info);
+  g_free(row);
+  if(fclose(f) != 0)
+  {
+    // the final flush can fail on a full disk: a truncated file must never
+    // be reported as success, the caller would wire it into the history
+    g_unlink(path);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+// cheap validation of an existing mask file: non-empty and carrying the
+// PNG signature. a zero-byte or truncated file under a content-addressed
+// name would otherwise be trusted forever ("exists = success") and the
+// broken mask could never self-repair
+// this validation must be at least as strict as the raster module's reader:
+// a file it accepts but the reader rejects would loop forever between the
+// pipe's failed read and a recompute that trusts the existing file. the
+// signature catches wrong files, the trailing IEND chunk catches truncation
+// -- the two ways a PNG breaks without a decoder
+static gboolean _mask_png_valid(const char *path)
+{
+  GStatBuf st;
+  // 8 signature bytes + IHDR (25) + IEND (12) is the bare minimum
+  if(g_stat(path, &st) != 0 || st.st_size < 45)
+    return FALSE;
+  FILE *f = g_fopen(path, "rb");
+  if(!f)
+    return FALSE;
+  guchar sig[8] = { 0 };
+  guchar tail[12] = { 0 };
+  const gboolean ok =
+    fread(sig, 1, sizeof(sig), f) == sizeof(sig)
+    && png_sig_cmp(sig, 0, sizeof(sig)) == 0
+    && fseek(f, -(long)sizeof(tail), SEEK_END) == 0
+    && fread(tail, 1, sizeof(tail), f) == sizeof(tail)
+    && memcmp(tail + 4, "IEND", 4) == 0;
+  fclose(f);
+  return ok;
+}
+
+// content-addressed write: to a temp name unique to this writer, then an
+// atomic move. an existing valid file under the same fingerprint was made
+// from the same recipe -- it already is this content, keep it; an invalid
+// one (truncated by a crash, zero bytes) is replaced. the unique temp name
+// matters: the interactive finalisation and a headless replay of the same
+// fingerprint, or two instances sharing the mask root, must never
+// interleave writes into the same temp file. shared by the finalisation
+// job and the headless recipe replay
+static gboolean _write_mask_png16_atomic(const char *outpath,
+                                         const float *const restrict mask,
+                                         const int w,
+                                         const int h)
+{
+  gchar *tmp = g_strdup_printf("%s.%d-%p.tmp", outpath,
+                               (int)getpid(), (void *)g_thread_self());
+  gboolean written = _write_mask_png16(tmp, mask, w, h);
+  if(written)
+  {
+    if(_mask_png_valid(outpath))
+      g_unlink(tmp);
+    else
+    {
+      // no-op when the target does not exist; drops an invalid leftover
+      g_unlink(outpath);
+      if(g_rename(tmp, outpath) != 0)
+      {
+        g_unlink(tmp);
+        // a concurrent writer of the same fingerprint may have won the
+        // rename race: the file now under the target name is the same
+        // content by construction, that still is a success
+        written = g_file_test(outpath, G_FILE_TEST_EXISTS);
+      }
+    }
+  }
+  else
+    g_unlink(tmp);
+  g_free(tmp);
+  return written;
+}
+
+
+/* Build a unique output path <def_path>/<image>_mask[_N].png. NULL on error.
+ * May be called from a worker job: dt_control_log is thread-safe. */
+static gchar *_build_mask_path(const dt_imgid_t imgid)
+{
+  if(!dt_is_valid_imgid(imgid)) return NULL;
+
+  // the mask file is a local cache, not part of the library: the recipe
+  // lives in the history/XMP, the file can always be regenerated with a new
+  // finalisation
+  gchar *root = dt_rasterfile_mask_root();
   if(g_mkdir_with_parents(root, 0755) != 0)
   {
     dt_print(DT_DEBUG_AI, "[object mask] cannot create folder: %s", root);
     dt_control_log(_("cannot create raster mask folder"));
     g_free(root);
-    return;
+    return NULL;
   }
 
-  // get image filename without directory and extension
   char imgpath[PATH_MAX] = { 0 };
   dt_image_full_path(imgid, imgpath, sizeof(imgpath), NULL);
   gchar *basename = g_path_get_basename(imgpath);
   char *dot = g_strrstr(basename, ".");
   if(dot) *dot = '\0';
 
-  // build output path, append _1, _2, ... if file already exists
   gchar *mask_name = g_strdup_printf("%s_mask.png", basename);
   gchar *outpath = g_build_filename(root, mask_name, NULL);
   g_free(mask_name);
@@ -883,59 +1837,3064 @@ static void _save_raster_mask(const float *mask,
     outpath = g_build_filename(root, mask_name, NULL);
     g_free(mask_name);
   }
-
   g_free(basename);
   g_free(root);
+  return outpath;
+}
 
-  // create RGB buffer (rasterfile module expects 3-channel PNG)
-  const int stride = cairo_format_stride_for_width(CAIRO_FORMAT_RGB24, w);
-  uint8_t *buf = g_try_malloc0((size_t)stride * h);
-  if(!buf)
+
+/* ------------------- native-resolution mask finalisation -------------------
+ *
+ * The interactive loop works on a render capped at 1536 px, where one pixel
+ * spans ~4 native pixels: whatever the segmentation and its refinement
+ * achieve, the contour position stays quantised to that grid. Finalisation
+ * re-renders only the subject's bounding box at scale 1.0, re-derives the
+ * alpha there with a guided filter -- whose local affine model in RGB is
+ * exactly the inversion of the compositing equation I = a*F + (1-a)*B --
+ * inside a narrow band around the contour, maps the result back to
+ * full-frame *input* space (the space every mask form is normalised to, so
+ * a crop added or changed later keeps working), and writes a 16-bit PNG for
+ * the external raster mask module.
+ *
+ * Runs once, on a worker job, a few seconds. The interactive loop is not
+ * touched. */
+
+typedef struct _finalize_job_t
+{
+  dt_imgid_t imgid;
+  int32_t history_end;
+  float *hint;          // copy of the working-grid mask, owned by the job
+  int hint_w, hint_h;
+  int bx, by, bw, bh;   // subject bounding box on the hint grid, margin included
+  float threshold;
+  // target module for auto-wiring the produced mask, identified by name --
+  // never by pointer, the job outlives any UI guarantee
+  char target_op[32];
+  int target_multi_priority;
+  gboolean has_target;
+  gboolean vectorize;   // TRUE: produce path forms instead of a raster file
+  int cleanup;          // potrace turdsize, working-grid px^2 (scaled inside)
+  float smoothing;      // potrace alphamax
+  float feather;        // border applied to the resulting path points
+  int render_target;    // effective cap of the native render, snapshotted
+                        // at launch from the cap the ENCODING ran under --
+                        // the very value the captured recipe records, so
+                        // this render and the headless regeneration of that
+                        // recipe land on the same pixels. re-reading the
+                        // preference here would silently detach the two in
+                        // an edit session (whose cap is the recorded one)
+  dt_hash_t distort_hash;  // distortion state at launch; revalidated at
+                           // APPLY time on the GUI thread (same context)
+  // provenance of the mask, captured on the GUI thread at launch. when
+  // valid, outpath holds the content-addressed target file name derived
+  // from its fingerprint; otherwise the job falls back to a sequential name
+  dt_rf_recipe_t recipe;
+  gboolean has_recipe;
+  gchar *outpath;       // owned by the job
+  // TRUE once _finalize_job_run entered: the serialisation token is reset
+  // by the run itself, so the destroy callback needs to know whether a run
+  // ever happened to release it for a job the queue discarded
+  gboolean ran;
+} _finalize_job_t;
+
+// GUI thread: record everything needed to regenerate the finalised mask
+// file from the raw -- the provenance recipe stored with the raster
+// module's params, so a library opened on another machine (or after the
+// cache was purged) can recompute the file instead of showing a broken
+// mask. returns FALSE when the session cannot be described (more clicks
+// than the recipe holds); the caller then falls back to a plain file
+static gboolean _capture_recipe(_object_data_t *d,
+                                dt_masks_form_gui_t *gui,
+                                dt_rf_recipe_t *recipe)
+{
+  memset(recipe, 0, sizeof(*recipe));
+  const int n = gui->guipoints_count;
+  if(n <= 0 || n > DT_RF_RECIPE_MAX_POINTS)
+    return FALSE;
+
+  float wd, ht, iwidth, iheight;
+  dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
+  if(iwidth <= 0 || iheight <= 0)
+    return FALSE;
+
+  recipe->magic = DT_RF_RECIPE_MAGIC;
+  recipe->version = DT_RF_RECIPE_VERSION;
+  // the hash of the distortion state the ENCODING was made on -- the render
+  // the prompt points were clicked against, not whatever the history holds
+  // at capture time
+  recipe->distort_hash = (int64_t)d->encoded_distort_hash;
+
+  const char *seg_id = dt_seg_get_model_id(d->seg);
+  if(seg_id)
   {
-    g_free(outpath);
-    return;
+    g_strlcpy(recipe->seg_model, seg_id, sizeof(recipe->seg_model));
+    const char *v = dt_ai_model_get_version(seg_id);
+    if(v)
+      g_strlcpy(recipe->seg_model_version, v,
+                sizeof(recipe->seg_model_version));
   }
 
-  for(int y = 0; y < h; y++)
+  // the mask being finalised was computed by the LAST launched decode:
+  // record that job's scalars, not the live conf/preview state -- a toggle
+  // flipped after the last decode never reached the mask. refine_failed
+  // still absorbs a load failure: the decode then ran without refinement,
+  // so ai_refine=0 is exact
+  recipe->ai_refine = (d->last_do_refine && !d->refine_failed) ? 1 : 0;
+  if(recipe->ai_refine)
   {
-    uint8_t *row = buf + y * stride;
-    for(int x = 0; x < w; x++)
+    char *refine_id = dt_ai_models_get_active_for_task("refine");
+    if(refine_id)
     {
-      const uint8_t v = (mask[y * w + x] > threshold) ? 255 : 0;
-      // cairo RGB24 is native-endian BGRX in memory
-      row[x * 4 + 0] = v; // B
-      row[x * 4 + 1] = v; // G
-      row[x * 4 + 2] = v; // R
-      row[x * 4 + 3] = 0; // unused
+      g_strlcpy(recipe->refine_model, refine_id,
+                sizeof(recipe->refine_model));
+      const char *v = dt_ai_model_get_version(refine_id);
+      if(v)
+        g_strlcpy(recipe->refine_model_version, v,
+                  sizeof(recipe->refine_model_version));
+      g_free(refine_id);
     }
   }
 
-  cairo_surface_t *surface
-    = cairo_image_surface_create_for_data(buf, CAIRO_FORMAT_RGB24,
-                                          w, h, stride);
-  if(surface)
+  recipe->encode_w = d->encode_w;
+  recipe->encode_h = d->encode_h;
+  // the cap the ENCODING was really made under, whatever the session's
+  // state is now: the truth is carried by the encode, never re-derived
+  // from the session validity or the current preference. an edit session
+  // encoded under the RECORDED cap, and it still holds that encoding after
+  // a failure ended the edit bookkeeping -- reading the conf here would
+  // then name a cap encode_w/h never came from, and the recipe's own
+  // headless replay would fall into the dim-ratio path for no reason.
+  // stored raw (see encoded_render_size): the value the capture writes is
+  // the one a gen-1 recipe wrote, so a re-capture stays byte-identical
+  recipe->render_size = d->encoded_render_size;
+  recipe->refine_passes = CLAMP(d->last_n_passes, 1, 3);
+  // the final threshold is genuinely a finalisation-time input (the native
+  // pass and its bbox read it at the right click), so the live read is the
+  // correct capture here -- unlike the per-decode scalars above. through
+  // the session accessor: an edit session records its recorded override
+  recipe->threshold = _session_threshold(d);
+  recipe->crf_enabled = d->last_do_crf ? 1 : 0;
+  recipe->crf_iterations = d->last_crf_iter;
+  recipe->crf_sigma_color = d->last_crf_sigma_color;
+  recipe->crf_w_bilateral = d->last_crf_w_bilateral;
+  recipe->ai_refine_margin = d->last_refine_margin;
+  recipe->cleanup = d->preview_cleanup;
+  recipe->smoothing = d->preview_smoothing;
+  recipe->feather = d->preview_feather;
+
+  // points: preview-pipe pixel space -> normalized input space, the same
+  // convention every stored mask form uses
+  const float *gp = dt_masks_dynbuf_buffer(gui->guipoints);
+  const float *gpp = dt_masks_dynbuf_buffer(gui->guipoints_payload);
+  float *pts = g_new(float, (size_t)n * 2);
+  memcpy(pts, gp, (size_t)n * 2 * sizeof(float));
+  dt_dev_distort_backtransform(darktable.develop, pts, n);
+
+  recipe->n_points = n;
+  for(int i = 0; i < n; i++)
   {
-    const cairo_status_t st = cairo_surface_write_to_png(surface, outpath);
-    cairo_surface_destroy(surface);
-    if(st == CAIRO_STATUS_SUCCESS)
+    dt_rf_recipe_point_t *rp = &recipe->points[i];
+    rp->x = pts[i * 2 + 0] / iwidth;
+    rp->y = pts[i * 2 + 1] / iheight;
+    rp->label = (int32_t)gpp[i];
+    if(d->decode_marks && i < (int)d->decode_marks->len)
     {
-      dt_print(DT_DEBUG_AI, "[object mask] raster mask saved: %s", outpath);
-      dt_control_log(_("raster mask saved"));
+      const _decode_mark_t *mark
+        = &g_array_index(d->decode_marks, _decode_mark_t, i);
+      rp->decode_after = mark->launched ? 1 : 0;
+      rp->threshold = mark->launched ? mark->threshold : 0.0f;
+    }
+  }
+  g_free(pts);
+  return TRUE;
+}
+
+// content hash of a group of paths for the ai trailer: the group's own
+// serialized blob (the dt_masks_point_group_t sequence the masks history
+// writes, trailer excluded) followed by each child's point blob in list
+// order. THE single definition shared by the capture at creation time and
+// the re-edit arbitration -- child states (union/difference), opacities,
+// list order and membership all change it. children are resolved in
+// `forms`; a child that does not resolve still contributes its group
+// entry, so the hash cannot accidentally match a later state where the
+// child resolves again
+static int64_t _ai_trailer_group_hash(GList *forms,
+                                      const dt_masks_form_t *grp)
+{
+  dt_hash_t hash = DT_INITHASH;
+  for(GList *l = grp->points; l; l = g_list_next(l))
+    hash = dt_hash(hash, l->data, sizeof(dt_masks_point_group_t));
+  for(GList *l = grp->points; l; l = g_list_next(l))
+  {
+    const dt_masks_point_group_t *pt = l->data;
+    const dt_masks_form_t *child = dt_masks_get_from_id_ext(forms, pt->formid);
+    // nested groups are deliberately skipped, not recursed into: a
+    // non-path child forces the context fallback at edit time anyway.
+    // must mirror the recalculation in outil/verifier_trailer.py
+    if(!child || !child->functions || (child->type & DT_MASKS_GROUP))
+      continue;
+    const size_t point_size = child->functions->point_struct_size;
+    for(GList *p = child->points; p; p = g_list_next(p))
+      hash = dt_hash(hash, p->data, point_size);
+  }
+  return (int64_t)hash;
+}
+
+// identity of the image the session ran on, folded to the trailer's 32-bit
+// field: basename without extension, sensor dimensions, capture datetime --
+// the rasterfile fingerprint's ingredients. detects a history pasted onto
+// another image. mirrored by outil/verifier_trailer.py
+static uint32_t _ai_trailer_image_hash(const dt_image_t *img)
+{
+  gchar *base = g_path_get_basename(img->filename);
+  char *dot = g_strrstr(base, ".");
+  if(dot) *dot = '\0';
+  dt_hash_t h = dt_hash(DT_INITHASH, base, strlen(base));
+  const int32_t w = img->width, ht = img->height;
+  h = dt_hash(h, &w, sizeof(w));
+  h = dt_hash(h, &ht, sizeof(ht));
+  const int64_t taken = img->exif_datetime_taken;
+  h = dt_hash(h, &taken, sizeof(taken));
+  g_free(base);
+  return (uint32_t)h;
+}
+
+// GUI thread: stamp the ai provenance trailer on a freshly created group
+// of paths -- the session recipe plus the content hash of the group as
+// just built. `forms` is the list the group's children live in
+// (dev->forms); must run after the group is fully assembled and before
+// the masks history item is committed
+static void _ai_trailer_stamp(GList *forms,
+                              dt_masks_form_t *grp,
+                              const dt_rf_recipe_t *recipe)
+{
+  memset(&grp->ai_trailer, 0, sizeof(grp->ai_trailer));
+  grp->ai_trailer.magic = DT_MASKS_AI_TRAILER_MAGIC;
+  grp->ai_trailer.version = DT_MASKS_AI_TRAILER_VERSION;
+  grp->ai_trailer.flags = 0;  // no synthetic context on the creation routes
+  grp->ai_trailer.image_hash
+    = _ai_trailer_image_hash(&darktable.develop->image_storage);
+  grp->ai_trailer.recipe = *recipe;
+  grp->ai_trailer.paths_hash = _ai_trailer_group_hash(forms, grp);
+}
+
+// GUI thread: the content-addressed target path of a recipe, under the
+// local mask root. must derive exactly what rasterfile.c's commit_params
+// derives on resolution. NULL when the root folder cannot be created
+static gchar *_recipe_outpath(const dt_rf_recipe_t *recipe)
+{
+  const dt_image_t *img = &darktable.develop->image_storage;
+  gchar *base = g_path_get_basename(img->filename);
+  char *dot = g_strrstr(base, ".");
+  if(dot) *dot = '\0';
+  gchar *fname = dt_rasterfile_recipe_filename(recipe, base,
+                                               img->width, img->height,
+                                               img->exif_datetime_taken);
+  gchar *root = dt_rasterfile_mask_root();
+  gchar *outpath = NULL;
+  if(g_mkdir_with_parents(root, 0755) == 0)
+    outpath = g_build_filename(root, fname, NULL);
+  else
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] cannot create folder: %s", root);
+    dt_control_log(_("cannot create raster mask folder"));
+  }
+  g_free(root);
+  g_free(fname);
+  g_free(base);
+  return outpath;
+}
+
+/* Payload handed from the worker job to the GUI thread once the file is
+ * written: everything needed to wire the mask into the pipeline. */
+typedef struct _finalize_apply_t
+{
+  dt_imgid_t imgid;
+  gchar *outpath;
+  char target_op[32];
+  int target_multi_priority;
+  gboolean has_target;
+  gboolean vectorize;
+  GList *forms;         // dt_masks_form_t*, points already input-normalized
+  GList *signs;
+  dt_rf_recipe_t recipe;  // provenance stored with the raster module params
+  gboolean has_recipe;
+  dt_hash_t distort_hash; // distortion state at launch; applying a result
+                          // computed on a since-changed geometry would wire
+                          // a misaligned mask
+} _finalize_apply_t;
+
+// destroy-notify of the apply idle: owns everything the payload carries.
+// runs on source destruction, so the payload is freed exactly once whether
+// the callback ran or the main loop went down before its tick
+static void _finalize_apply_free(gpointer data)
+{
+  _finalize_apply_t *a = data;
+  if(a->forms) g_list_free_full(a->forms, (GDestroyNotify)dt_masks_free_form);
+  g_list_free(a->signs);
+  g_free(a->outpath);
+  g_free(a);
+}
+
+// GUI thread: activate the external raster mask module on the produced file
+// and connect the target module's blending to it. this is exactly what the
+// user would do by hand in the raster-mask combo (blend_gui.c), automated.
+// frees nothing: the payload belongs to _finalize_apply_free
+static gboolean _finalize_apply_idle(gpointer data)
+{
+  _finalize_apply_t *a = data;
+  dt_develop_t *dev = darktable.develop;
+
+  // leaving the darkroom does not reset image_storage.id, and it tears
+  // down dev->iop and the form lists this idle works on -- check the
+  // actual view, not just the image
+  if(!dev || dev->image_storage.id != a->imgid
+     || dt_view_get_current() != DT_VIEW_DARKROOM
+     || !dev->form_gui)
+  {
+    if(a->vectorize)
+      dt_control_log(_("image changed, precise paths discarded"));
+    else
+      dt_control_log(_("precise raster mask saved (image changed, not applied)"));
+    return G_SOURCE_REMOVE;
+  }
+
+  // same develop, same GUI thread as the launch-time capture: this compares
+  // like with like, and covers the whole job lifetime (queue wait included)
+  if(_compute_distort_hash(dev) != a->distort_hash)
+  {
+    dt_control_log(_("image geometry changed while the precise mask was"
+                     " computed, result discarded"));
+    return G_SOURCE_REMOVE;
+  }
+
+  if(a->vectorize)
+  {
+    // wrap the native-resolution paths in a group and attach it to the
+    // target module -- mirrors _register_vectorized_forms and the classic
+    // right-click path, with coordinates already input-normalized by the job
+    if(!a->forms)
+    {
+      dt_control_log(_("no mask extracted from AI segmentation"));
+      return G_SOURCE_REMOVE;
+    }
+
+    // forms were created on the worker thread; their ids are atomic but
+    // unicity against this dev's forms is only checkable here, on the GUI
+    // thread, right before insertion. siblings must be checked too: they
+    // are not in dev->forms yet, and the trailer's content hash resolves
+    // children BY id -- a duplicate id would make it cover the wrong form
+    for(GList *l = a->forms; l; l = g_list_next(l))
+    {
+      dt_masks_form_t *f = l->data;
+      gboolean clash = TRUE;
+      while(clash)
+      {
+        clash = dt_masks_get_from_id(dev, f->formid) != NULL;
+        for(GList *k = a->forms; !clash && k != l; k = g_list_next(k))
+          clash = ((dt_masks_form_t *)k->data)->formid == f->formid;
+        if(clash) f->formid++;
+      }
+    }
+
+    const char *group_prefix = _("ai object group");
+    const char *path_prefix = _("ai object");
+    guint grp_nb = 0, path_nb = 0;
+    for(GList *l = dev->forms; l; l = g_list_next(l))
+    {
+      const dt_masks_form_t *f = l->data;
+      if(strncmp(f->name, group_prefix, strlen(group_prefix)) == 0) grp_nb++;
+      if(strncmp(f->name, path_prefix, strlen(path_prefix)) == 0) path_nb++;
+    }
+    grp_nb++;
+    path_nb++;
+    for(GList *l = a->forms; l; l = g_list_next(l))
+    {
+      dt_masks_form_t *f = l->data;
+      snprintf(f->name, sizeof(f->name), "%s #%d", path_prefix, (int)path_nb++);
+    }
+
+    dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
+    snprintf(grp->name, sizeof(grp->name), "%s #%d", group_prefix, (int)grp_nb);
+
+    for(GList *l = a->forms; l; l = g_list_next(l))
+      dev->forms = g_list_append(dev->forms, l->data);
+
+    GList *sg = a->signs;
+    for(GList *l = a->forms; l; l = g_list_next(l), sg = sg ? g_list_next(sg) : NULL)
+    {
+      const int sign = sg ? GPOINTER_TO_INT(sg->data) : '+';
+      dt_masks_point_group_t *grpt = dt_masks_group_add_form(grp, l->data);
+      if(grpt && sign == '-')
+        grpt->state = (grpt->state & ~DT_MASKS_STATE_UNION) | DT_MASKS_STATE_DIFFERENCE;
+    }
+    dev->forms = g_list_append(dev->forms, grp);
+
+    // stamp the provenance trailer on the fully assembled group: the
+    // recorded session clicks travel with it, a later ai edit can reopen
+    // the group from its exact prompts (the hash detects manual
+    // retouching in between). must precede the history item below
+    if(a->has_recipe)
+      _ai_trailer_stamp(dev->forms, grp, &a->recipe);
+
+    // attach to the target module's blend mask group, as the classic path does
+    dt_iop_module_t *target = NULL;
+    if(a->has_target)
+      for(GList *l = dev->iop; l; l = g_list_next(l))
+      {
+        dt_iop_module_t *m = l->data;
+        if(!strcmp(m->op, a->target_op)
+           && m->multi_priority == a->target_multi_priority)
+        {
+          target = m;
+          break;
+        }
+      }
+
+    if(target && target->blend_params)
+    {
+      dt_masks_form_t *mod_grp
+        = dt_masks_get_from_id(dev, target->blend_params->mask_id);
+      if(!mod_grp)
+      {
+        mod_grp = dt_masks_create(DT_MASKS_GROUP);
+        gchar *label = dt_history_item_get_name(target);
+        snprintf(mod_grp->name, sizeof(mod_grp->name), _("group '%s'"), label);
+        g_free(label);
+        dev->forms = g_list_append(dev->forms, mod_grp);
+        target->blend_params->mask_id = mod_grp->formid;
+      }
+      dt_masks_point_group_t *grpt = dt_masks_group_add_form(mod_grp, grp);
+      if(grpt)
+        grpt->opacity = dt_conf_get_float("plugins/darkroom/masks/opacity");
+      // additive: never tear down a conditional blend already configured
+      target->blend_params->mask_mode
+        |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+      dt_dev_add_masks_history_item(dev, target, TRUE);
+      if(target->gui_data) dt_iop_gui_update(target);
+      dt_control_log(_("precise paths applied to %s"), target->name());
+      // entering edit mode clears any form_gui in creation -- if the user
+      // started a new mask session while the job ran, leave their session
+      // alone, the group is attached and committed either way
+      if(!dev->form_gui->creation && !dev->form_visible)
+      {
+        dt_masks_set_edit_mode(target, DT_MASKS_EDIT_FULL);
+        dt_masks_iop_update(target);
+      }
     }
     else
     {
-      dt_print(DT_DEBUG_AI, "[object mask] failed to write: %s", outpath);
-      dt_control_log(_("failed to save raster mask"));
+      dt_dev_add_masks_history_item(dev, NULL, TRUE);
+      dt_control_log(_("precise paths created"));
+    }
+
+    g_list_free(a->forms);   // cells only: ownership moved to dev->forms
+    a->forms = NULL;
+    dt_dev_reprocess_all(dev);
+    dt_control_queue_redraw_center();
+    return G_SOURCE_REMOVE;
+  }
+
+  // ---- source side: the external raster mask module ----
+  // never requisition an instance already serving another mask: take one
+  // whose file is empty, ours already, or that feeds no sink
+  dt_iop_module_t *rf = NULL;
+  gchar *want_file = g_path_get_basename(a->outpath);
+  for(GList *l = dev->iop; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *m = l->data;
+    if(strcmp(m->op, "rasterfile") || !m->params)
+      continue;
+    // never requisition the instance an edit session is open on: it is the
+    // one the user is editing, its recipe is the one the session replays,
+    // and the zero-users criterion below matches it (standalone masks are
+    // exactly how this tool creates them). the gate already identifies it
+    // by op+multi_priority -- consult it here too
+    if(dt_object_mask_edit_active(m->op, m->multi_priority))
+      continue;
+    dt_iop_rasterfile_params_t *mp = (dt_iop_rasterfile_params_t *)m->params;
+    if(mp->file[0] == '\0'
+       || !strcmp(mp->file, want_file)
+       || g_hash_table_size(m->raster_mask.source.users) == 0)
+    {
+      rf = m;
+      break;
     }
   }
-  g_free(buf);
+  g_free(want_file);
+  if(!rf)
+  {
+    dt_control_log(_("precise raster mask saved (no free raster instance)"));
+    return G_SOURCE_REMOVE;
+  }
+
+  {
+    // v2 params of rasterfile, through the layout mirror at the top of this
+    // file. path/file are informative when a recipe is present: resolution
+    // then derives the file name from the recipe fingerprint
+    dt_iop_rasterfile_params_t *p = (dt_iop_rasterfile_params_t *)rf->params;
+    gchar *dir = g_path_get_dirname(a->outpath);
+    gchar *base = g_path_get_basename(a->outpath);
+    p->mode = DT_RASTERFILE_MODE_ALL;
+    g_strlcpy(p->path, dir, sizeof(p->path));
+    g_strlcpy(p->file, base, sizeof(p->file));
+    g_free(dir);
+    g_free(base);
+    if(a->has_recipe)
+      p->recipe = a->recipe;
+    else
+      memset(&p->recipe, 0, sizeof(p->recipe));
+    rf->enabled = TRUE;
+    dt_dev_add_history_item(dev, rf, TRUE);
+    // resync the module's widgets, or the stale combo would re-commit the
+    // previous file on the next interaction
+    if(rf->gui_data) dt_iop_gui_update(rf);
+  }
+
+  // ---- sink side: the module the mask was created from ----
+  dt_iop_module_t *target = NULL;
+  if(a->has_target)
+    for(GList *l = dev->iop; l; l = g_list_next(l))
+    {
+      dt_iop_module_t *m = l->data;
+      if(!strcmp(m->op, a->target_op)
+         && m->multi_priority == a->target_multi_priority)
+      {
+        target = m;
+        break;
+      }
+    }
+
+  if(target && target->blend_params)
+  {
+    if(target->raster_mask.sink.source)
+      g_hash_table_remove(
+        target->raster_mask.sink.source->raster_mask.source.users, target);
+
+    target->raster_mask.sink.source = rf;
+    target->raster_mask.sink.id = BLEND_RASTER_ID;
+    g_hash_table_add(rf->raster_mask.source.users, target);
+
+    memcpy(target->blend_params->raster_mask_source, rf->op,
+           sizeof(target->blend_params->raster_mask_source));
+    target->blend_params->raster_mask_instance = rf->multi_priority;
+    target->blend_params->raster_mask_id = BLEND_RASTER_ID;
+    // the raster mask replaces a drawn mask (that is the gesture), but a
+    // conditional blend stays -- and a silent replacement is announced
+    const uint32_t old_mode = target->blend_params->mask_mode;
+    target->blend_params->mask_mode
+      = (old_mode & ~DEVELOP_MASK_MASK)
+        | DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
+    if(old_mode & DEVELOP_MASK_MASK)
+      dt_control_log(_("the drawn mask of %s was replaced by the raster mask"),
+                     target->name());
+
+    dt_dev_add_history_item(dev, target, TRUE);
+    if(target->gui_data) dt_iop_gui_update(target);
+    dt_control_log(_("precise raster mask applied to %s"), target->name());
+  }
+  else
+    dt_control_log(_("precise raster mask saved and loaded in the raster module"));
+
+  dt_dev_reprocess_all(dev);
+  dt_control_queue_redraw_center();
+  return G_SOURCE_REMOVE;
+}
+
+// one finalisation at a time; the job resets this when it completes
+static volatile gint _finalize_running = 0;
+
+// TRUE while that job is in flight. the proactive missing-file recompute
+// of iop/rasterfile.c reads it as a second gate: the edit-session gate
+// falls the moment the session data is freed, which is the moment the
+// finalisation job STARTS -- for the seconds it then spends rendering and
+// inferring, the mask file is still legitimately absent and an ungated
+// gui_update would schedule a headless recompute of the OLD recipe
+// against it. covers plain finalisations too, which have no session gate
+gboolean dt_object_mask_finalize_running(void)
+{
+  return g_atomic_int_get(&_finalize_running) != 0;
+}
+
+// runs on every outcome the job system takes charge of -- finished,
+// cancelled, replaced, discarded. a job the queue discarded before running
+// never reached the reset at the end of _finalize_job_run, and the token
+// it claimed at launch would then pin dt_object_mask_finalize_running for
+// the rest of the session: no further finalisation, no headless replay
+// (both take the same token), and the proactive recompute gated forever.
+// same shape as _recompute_job_destroy and its `ran` field
+static void _finalize_job_destroy(void *p)
+{
+  _finalize_job_t *j = p;
+  if(!j) return;
+  if(!j->ran)
+    g_atomic_int_set(&_finalize_running, 0);
+  g_free(j->hint);
+  g_free(j->outpath);
+  g_free(j);
+}
+
+// bilinear sample of a single-channel plane, pixel-centre convention
+static inline float _sample_plane(const float *const restrict src,
+                                  const int sw,
+                                  const int sh,
+                                  const float fx,
+                                  const float fy)
+{
+  const float x = CLAMP(fx, 0.0f, (float)(sw - 1));
+  const float y = CLAMP(fy, 0.0f, (float)(sh - 1));
+  const int x0 = (int)x, y0 = (int)y;
+  const int x1 = MIN(x0 + 1, sw - 1), y1 = MIN(y0 + 1, sh - 1);
+  const float ax = x - (float)x0, ay = y - (float)y0;
+  return src[(size_t)y0 * sw + x0] * (1.0f - ax) * (1.0f - ay)
+       + src[(size_t)y0 * sw + x1] * ax * (1.0f - ay)
+       + src[(size_t)y1 * sw + x0] * (1.0f - ax) * ay
+       + src[(size_t)y1 * sw + x1] * ax * ay;
+}
+
+// the step hook of the two long AI mask jobs. both compute paths poll a
+// keep_going between their expensive steps and nowhere else, which makes
+// this the one thing that runs regularly for the whole job without the
+// compute having to report anything -- so it carries the feedback as well
+// as the cancellation:
+//  - the toast: a dt_control_log expires after DT_CTL_LOG_TIMEOUT (5 s)
+//    while these jobs run for tens of seconds, and control.c dedups a
+//    repeated message, so re-emitting it here is what keeps the darkroom
+//    saying that something IS computing. it is thread-safe;
+//  - the progress bar of the background jobs module: created by
+//    dt_control_job_add_progress, it would otherwise sit at 0 for the
+//    whole job, which is indistinguishable from a hung one.
+// the bar carries no fraction on purpose. these jobs poll between steps of
+// wildly unequal cost (a tiled network pass dwarfs a render), so any
+// fraction derived from the poll count reads as stalled on the long step
+// and as almost-done a third of the way in -- worse than no number. what
+// the job does know is WHICH step it is on, and dt_control_job_set_progress
+// with a negative value keeps the bar in its indeterminate state
+static gboolean _job_step(dt_job_t *job, const char *msg)
+{
+  // the cancellation test comes FIRST and returns without emitting: a
+  // cancelled job must not leave its "computing..." toast alive for
+  // another five seconds, nor nudge a bar nobody will finish. also bails
+  // out when the whole job system goes down -- a multi-minute compute
+  // must not hold the application's exit hostage
+  if(!dt_control_running()
+     || dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED)
+    return FALSE;
+
+  if(msg)
+  {
+    // the step name goes to the progress entry (which lives as long as the
+    // job) and the same string is kept alive as a toast: a dt_control_log
+    // expires after five seconds, and control.c deduplicates a repeat
+    dt_control_job_set_progress_message(job, "%s", msg);
+    dt_control_log("%s", msg);
+  }
+  return TRUE;
+}
+
+// the interactive finalisation. the message is the very string its launch
+// toast used, taken from the job's own params: the user reads one message
+// that simply stays alive, not two alternating ones
+static gboolean _finalize_keep_going(void *p)
+{
+  dt_job_t *job = p;
+  const _finalize_job_t *j = job ? dt_control_job_get_params(job) : NULL;
+  return _job_step(job, (j && j->vectorize)
+                        ? _("computing precise paths...")
+                        : _("computing precise raster mask..."));
+}
+
+// request of the native render core below, grouped so the two call sites
+// name every field instead of threading fifteen positional arguments (an
+// inverted bbox would compile without a sound)
+typedef struct _finalize_render_req_t
+{
+  const float *hint;    // working-grid mask the finalisation works from
+  int hint_w, hint_h;
+  int bx, by, bw, bh;   // subject bounding box on the hint grid
+  float threshold;
+  int render_target;    // encode-render size cap the hint was made under
+  gboolean interactive; // FALSE suppresses every dt_control_log
+} _finalize_render_req_t;
+
+// the shared render core of the native finalisation: from a working-grid
+// hint (and its subject bbox) to the alpha plane of the full
+// post-rawprepare frame. renders the bbox at scale 1.0 through an export
+// pipe on the ALREADY LOADED dev, re-runs the refinement network tiled at
+// native scale, re-derives sub-pixel coverage with a guided filter inside
+// a band around the contour, and maps the result back through the
+// geometry chain. shared by the interactive finalisation job and the
+// headless recipe replay: req->interactive=FALSE suppresses every
+// dt_control_log (the replay may run outside any GUI). req->render_target
+// is the encode-render size cap the hint was made under, used to recover
+// the exact hint->native scale factor; keep_going (nullable) is polled at
+// the expensive steps. returns the (*out_pw x *out_ph) alpha plane, freed
+// by the caller with g_free, or NULL on failure/cancellation
+static float *_finalize_render_alpha(dt_develop_t *dev,
+                                     const _finalize_render_req_t *req,
+                                     gboolean (*keep_going)(void *),
+                                     void *user,
+                                     int *out_pw,
+                                     int *out_ph)
+{
+  const float *const hint = req->hint;
+  const int hint_w = req->hint_w, hint_h = req->hint_h;
+  const int bx = req->bx, by = req->by, bw = req->bw, bh = req->bh;
+  const float threshold = req->threshold;
+  const int render_target = req->render_target;
+  const gboolean interactive = req->interactive;
+  gboolean ok = FALSE;
+  float *hint_soft = NULL, *hint_bin = NULL, *alpha_gf = NULL;
+  float *alpha_full = NULL, *grid = NULL;
+  double *sat = NULL;
+  gboolean pipe_ready = FALSE;
+  int rx = 0, ry = 0, gw = 0, gh = 0;
+
+  // pipe-input dimensions (sensor incl. borders) and the post-rawprepare
+  // frame. the external raster mask module sits after rawprepare (iop order
+  // 3.1 vs 1.0) and interprets its file in the post-rawprepare frame, so
+  // that is the space the file must be written in; rawprepare's crop offset
+  // is added back when entering the full forward transform, which includes
+  // rawprepare's own distort_transform.
+  const int iw = dev->image_storage.width;
+  const int ih = dev->image_storage.height;
+  const int pw = dev->image_storage.p_width > 0 ? dev->image_storage.p_width : iw;
+  const int ph = dev->image_storage.p_height > 0 ? dev->image_storage.p_height : ih;
+  *out_pw = pw;
+  *out_ph = ph;
+  // rawprepare's default sensor crop, from the image metadata. a hand-edited
+  // rawprepare margin is not reflected here -- accepted limitation: the
+  // raster file module reads its file against the same metadata geometry,
+  // so both sides drift together for that (rare) case
+  const int cropx = dev->image_storage.crop_x;
+  const int cropy = dev->image_storage.crop_y;
+
+  dt_dev_pixelpipe_t pipe;
+  dt_mipmap_buffer_t buf;
+  dt_mipmap_cache_get(&buf, dev->image_storage.id, DT_MIPMAP_FULL,
+                      DT_MIPMAP_BLOCKING, 'r');
+  if(!buf.buf || !buf.width || !buf.height)
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] finalise: cannot get the image buffer");
+    if(interactive)
+      dt_control_log(_("precise mask: cannot get the image buffer"));
+    goto cleanup;
+  }
+
+  if(!dt_dev_pixelpipe_init_export(&pipe, iw, ih, IMAGEIO_RGB | IMAGEIO_INT8,
+                                   FALSE))
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] finalise: cannot init the render pipe");
+    if(interactive)
+      dt_control_log(_("precise mask: cannot init the render pipe"));
+    goto cleanup;
+  }
+  pipe_ready = TRUE;
+
+  dt_dev_pixelpipe_set_icc(&pipe, DT_COLORSPACE_SRGB, NULL,
+                           DT_INTENT_PERCEPTUAL);
+  dt_dev_pixelpipe_set_input(&pipe, dev, (float *)buf.buf,
+                             buf.width, buf.height, buf.iscale);
+  dt_dev_pixelpipe_create_nodes(&pipe, dev);
+  dt_dev_pixelpipe_synch_all(&pipe, dev);
+  dt_dev_pixelpipe_get_dimensions(&pipe, dev, pipe.iwidth, pipe.iheight,
+                                  &pipe.processed_width,
+                                  &pipe.processed_height);
+
+  {
+    // the encode render maps by pure scale (out = trunc(final_scale * proc)),
+    // so the exact hint->native factor is 1/final_scale, isotropic. deriving
+    // it from the truncated integer sizes would introduce an anisotropic
+    // drift of several native pixels at the far corner. recompute final_scale
+    // with the same formula as _encode_thread_func.
+    const double e_scale
+      = fmin((double)render_target / (double)pipe.processed_width,
+             (double)render_target / (double)pipe.processed_height);
+    const double final_scale = fmin(e_scale, 1.0);
+    double fx = 1.0 / final_scale;
+    double fy = fx;
+    // the render-size setting may have changed since the mask was encoded
+    // (or, on a replay, the recorded dims may come from a reused .seg
+    // cache); fall back to the integer ratio when the grids do not match
+    if((int)(final_scale * pipe.processed_width) != hint_w
+       || (int)(final_scale * pipe.processed_height) != hint_h)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] finalise: hint grid %dx%d does not match "
+               "current render scale, falling back to integer ratios",
+               hint_w, hint_h);
+      fx = (double)pipe.processed_width / (double)hint_w;
+      fy = (double)pipe.processed_height / (double)hint_h;
+    }
+
+    // the hint carries several native pixels of position error (one working
+    // pixel spans ~fx native ones), so both the correction band and the
+    // filter radius must scale with the resolution ratio
+    const int R = MAX(8, (int)ceil(2.5 * fx));
+    const int w_gf = MAX(4, R / 2);
+
+    rx = (int)floor(bx * fx) - R;
+    ry = (int)floor(by * fy) - R;
+    int rw = (int)ceil((bx + bw) * fx) + R - rx;
+    int rh = (int)ceil((by + bh) * fy) + R - ry;
+    rx = CLAMP(rx, 0, pipe.processed_width - 8);
+    ry = CLAMP(ry, 0, pipe.processed_height - 8);
+    rw = CLAMP(rw, 8, pipe.processed_width - rx);
+    rh = CLAMP(rh, 8, pipe.processed_height - ry);
+
+    dt_print(DT_DEBUG_AI,
+             "[object mask] finalise: native region %dx%d at (%d,%d) of %dx%d"
+             " (R=%d, w=%d)",
+             rw, rh, rx, ry, pipe.processed_width, pipe.processed_height,
+             R, w_gf);
+
+    // only the region goes through the pipe: demosaic's modify_roi_in
+    // restricts the sensor read to what the ROI needs
+    dt_dev_pixelpipe_process_no_gamma(&pipe, dev, rx, ry, rw, rh, 1.0);
+
+    if(keep_going && !keep_going(user)) goto cleanup;
+
+    // for a non-display pipe these are the requested dimensions echoed back;
+    // kept as the single source of truth for the buffer we read
+    const float *const guide = (const float *)pipe.backbuf;
+    gw = pipe.backbuf_width;
+    gh = pipe.backbuf_height;
+    if(!guide || gw < 8 || gh < 8)
+    {
+      dt_print(DT_DEBUG_AI, "[object mask] finalise: native render failed");
+      if(interactive)
+        dt_control_log(_("precise mask: native render failed"));
+      goto cleanup;
+    }
+
+    const size_t npix = (size_t)gw * gh;
+    hint_soft = dt_alloc_align_float(npix);
+    hint_bin = dt_alloc_align_float(npix);
+    alpha_gf = dt_alloc_align_float(npix);
+    sat = g_try_malloc((size_t)(gw + 1) * (gh + 1) * sizeof(double));
+    if(!hint_soft || !hint_bin || !alpha_gf || !sat)
+    {
+      dt_print(DT_DEBUG_AI, "[object mask] finalise: out of memory");
+      if(interactive)
+        dt_control_log(_("precise mask: out of memory"));
+      goto cleanup;
+    }
+
+    // hint on the native grid, pixel-centre mapping. the soft values are kept:
+    // away from the contour they carry genuine partial coverage (defocused
+    // edges, veils) that a hard threshold would destroy. the binarised copy
+    // drives the band logic and the filter, which want a clean step
+    for(int y = 0; y < gh; y++)
+    {
+      const float hy = ((float)(ry + y) + 0.5f) / (float)fy - 0.5f;
+      for(int x = 0; x < gw; x++)
+      {
+        const float hx = ((float)(rx + x) + 0.5f) / (float)fx - 0.5f;
+        const float v = _sample_plane(hint, hint_w, hint_h, hx, hy);
+        hint_soft[(size_t)y * gw + x] = CLAMPF(v, 0.0f, 1.0f);
+        hint_bin[(size_t)y * gw + x] = (v > threshold) ? 1.0f : 0.0f;
+      }
+    }
+
+    // ---- tiled network pass at native scale ----
+    // the interactive loop's refinement worked at ~3 native px per network
+    // sample; here the same network re-derives the contour at 1:1, one
+    // inference per overlapping tile. this is what actually moves the
+    // contour onto the true edge; the guided filter afterwards only shapes
+    // sub-pixel coverage inside the band. degradation is graceful: without
+    // a usable model (missing, CPU provider, OOM) the hint stays as it is.
+    {
+      dt_ai_environment_t *net_env = dt_ai_env_init(NULL);
+      dt_refine_context_t *net = net_env ? dt_refine_load(net_env) : NULL;
+      if(net)
+      {
+        uint8_t *rgb8 = g_try_malloc((size_t)gw * gh * 3);
+        float *mask_net = dt_alloc_align_float(npix);
+        if(rgb8 && mask_net)
+        {
+          DT_OMP_FOR()
+          for(size_t k = 0; k < npix; k++)
+          {
+            for(int c = 0; c < 3; c++)
+              rgb8[k * 3 + c]
+                = (uint8_t)lrintf(CLAMPF(guide[k * 4 + c], 0.0f, 1.0f) * 255.0f);
+            mask_net[k] = hint_soft[k];
+          }
+
+          const double t_net = dt_get_wtime();
+          if(dt_refine_run_tiled(net, rgb8, gw, gh, mask_net, threshold,
+                                 keep_going, user))
+          {
+            dt_print(DT_DEBUG_AI,
+                     "[object mask] finalise: tiled network pass (%.1fs)",
+                     dt_get_wtime() - t_net);
+            for(size_t k = 0; k < npix; k++)
+            {
+              hint_soft[k] = mask_net[k];
+              hint_bin[k] = (mask_net[k] > threshold) ? 1.0f : 0.0f;
+            }
+          }
+        }
+        g_free(rgb8);
+        dt_free_align(mask_net);
+      }
+      else
+        dt_print(DT_DEBUG_AI,
+                 "[object mask] finalise: refine model unavailable, "
+                 "keeping the interactive hint");
+      if(net) dt_refine_free(net);
+      if(net_env) dt_ai_env_destroy(net_env);
+      if(keep_going && !keep_going(user)) goto cleanup;
+    }
+
+    // summed-area table of the binary hint, for the band weight below
+    for(int x = 0; x <= gw; x++) sat[x] = 0.0;
+    for(int y = 1; y <= gh; y++)
+    {
+      double rowsum = 0.0;
+      sat[(size_t)y * (gw + 1)] = 0.0;
+      for(int x = 1; x <= gw; x++)
+      {
+        rowsum += hint_bin[(size_t)(y - 1) * gw + (x - 1)];
+        sat[(size_t)y * (gw + 1) + x]
+          = sat[(size_t)(y - 1) * (gw + 1) + x] + rowsum;
+      }
+    }
+
+    // guided filter: local affine model in RGB -- the inversion of
+    // I = a*F + (1-a)*B that a segmentation confidence lacks. the effective
+    // regularisation comes from guide_weight scaling the covariances; these
+    // values measure as a genuine edge snap on real sRGB contrasts, not a
+    // box blur. high-ISO noise in the guide does transfer into the alpha
+    // inside the band; that is the accepted trade
+    guided_filter(guide, hint_bin, alpha_gf, gw, gh, 4, w_gf,
+                  1.0f, 100.0f, 0.0f, 1.0f);
+
+    if(keep_going && !keep_going(user)) goto cleanup;
+
+    // composition with a continuous band weight: 1 on the binary edge,
+    // fading to 0 with Chebyshev distance R. a hard band boundary would
+    // truncate the filter's ramp and leave a visible alpha step on guides
+    // with no local edge (plain sky)
+    for(int y = 0; y < gh; y++)
+    {
+      for(int x = 0; x < gw; x++)
+      {
+        const int x0 = MAX(x - R, 0), x1 = MIN(x + R + 1, gw);
+        const int y0 = MAX(y - R, 0), y1 = MIN(y + R + 1, gh);
+        const double area = (double)(x1 - x0) * (y1 - y0);
+        const double inside
+          = sat[(size_t)y1 * (gw + 1) + x1] - sat[(size_t)y0 * (gw + 1) + x1]
+          - sat[(size_t)y1 * (gw + 1) + x0] + sat[(size_t)y0 * (gw + 1) + x0];
+        const double f = inside / area;
+        const float wband = (float)(2.0 * MIN(f, 1.0 - f));
+        const size_t k = (size_t)y * gw + x;
+        const float refined = CLAMPF(alpha_gf[k], 0.0f, 1.0f);
+        alpha_gf[k] = wband * refined + (1.0f - wband) * hint_soft[k];
+      }
+    }
+
+    // map back to the full post-rawprepare frame through the geometry chain,
+    // on a coarse grid of forward-transformed nodes. grid nodes are indexed
+    // in the post-rawprepare frame (the file's space), shifted by
+    // rawprepare's crop to enter the full DIR_ALL transform, which includes
+    // rawprepare's own distort_transform. a crop module added or changed
+    // later keeps working; pixels outside the *current* crop stay 0 in the
+    // file, so relaxing an existing crop reveals a hard edge -- accepted
+    const int G = 8;
+    const int gnx = pw / G + 2, gny = ph / G + 2;
+    grid = g_try_malloc((size_t)gnx * gny * 2 * sizeof(float));
+    alpha_full = g_try_malloc0((size_t)pw * ph * sizeof(float));
+    if(!grid || !alpha_full)
+    {
+      dt_print(DT_DEBUG_AI, "[object mask] finalise: out of memory");
+      if(interactive)
+        dt_control_log(_("precise mask: out of memory"));
+      goto cleanup;
+    }
+    for(int y = 0; y < gny; y++)
+      for(int x = 0; x < gnx; x++)
+      {
+        grid[((size_t)y * gnx + x) * 2 + 0] = (float)(x * G + cropx);
+        grid[((size_t)y * gnx + x) * 2 + 1] = (float)(y * G + cropy);
+      }
+    dt_dev_distort_transform_plus(dev, &pipe, 0.0, DT_DEV_TRANSFORM_DIR_ALL,
+                                  grid, (size_t)gnx * gny);
+
+    for(int y = 0; y < ph; y++)
+    {
+      const int cy = y / G;
+      const float wy = (float)(y - cy * G) / (float)G;
+      for(int x = 0; x < pw; x++)
+      {
+        const int cx = x / G;
+        const float wx = (float)(x - cx * G) / (float)G;
+        const float *n00 = grid + ((size_t)cy * gnx + cx) * 2;
+        const float *n01 = grid + ((size_t)cy * gnx + cx + 1) * 2;
+        const float *n10 = grid + ((size_t)(cy + 1) * gnx + cx) * 2;
+        const float *n11 = grid + ((size_t)(cy + 1) * gnx + cx + 1) * 2;
+        const float px = n00[0] * (1.0f - wx) * (1.0f - wy)
+                       + n01[0] * wx * (1.0f - wy)
+                       + n10[0] * (1.0f - wx) * wy + n11[0] * wx * wy;
+        const float py = n00[1] * (1.0f - wx) * (1.0f - wy)
+                       + n01[1] * wx * (1.0f - wy)
+                       + n10[1] * (1.0f - wx) * wy + n11[1] * wx * wy;
+        const float lx = px - (float)rx;
+        const float ly = py - (float)ry;
+        if(lx > -1.0f && ly > -1.0f && lx < (float)gw && ly < (float)gh)
+          alpha_full[(size_t)y * pw + x]
+            = _sample_plane(alpha_gf, gw, gh, lx, ly);
+      }
+    }
+  }
+
+  ok = TRUE;
+
+cleanup:
+  g_free(grid);
+  g_free(sat);
+  dt_free_align(alpha_gf);
+  dt_free_align(hint_bin);
+  dt_free_align(hint_soft);
+  if(pipe_ready) dt_dev_pixelpipe_cleanup(&pipe);
+  dt_mipmap_cache_release(&buf);
+  if(!ok)
+  {
+    g_free(alpha_full);
+    alpha_full = NULL;
+  }
+  return alpha_full;
+}
+
+static int32_t _finalize_job_run(dt_job_t *job)
+{
+  _finalize_job_t *const j = dt_control_job_get_params(job);
+  // from here the reset of the serialisation token is ours, on every exit
+  j->ran = TRUE;
+  gboolean ok = FALSE;
+  float *alpha_full = NULL;
+  gchar *outpath = NULL;
+  int pw = 0, ph = 0;
+
+  const double t_start = dt_get_wtime();
+
+  dt_develop_t dev;
+  dt_dev_init(&dev, FALSE);
+  dt_dev_load_image(&dev, j->imgid);
+  if(j->history_end > 0 && j->history_end > dev.history_end)
+    dev.history_end = j->history_end;
+
+  // geometry drift while the job runs is checked at APPLY time, on the GUI
+  // thread, against the hash captured at launch -- both sides then compute
+  // on the same develop. comparing the launch hash against this headless
+  // dev's hash looked equivalent but is not: the two contexts disagree on
+  // the hash even for an unchanged history (systematic false positive that
+  // cancelled every finalisation), and the apply-time check covers the
+  // whole job lifetime anyway, which this early check never did
+
+  const _finalize_render_req_t req = {
+    .hint = j->hint,
+    .hint_w = j->hint_w,
+    .hint_h = j->hint_h,
+    .bx = j->bx, .by = j->by, .bw = j->bw, .bh = j->bh,
+    .threshold = j->threshold,
+    .render_target = j->render_target,
+    .interactive = TRUE,
+  };
+  alpha_full = _finalize_render_alpha(&dev, &req,
+                                      _finalize_keep_going, job, &pw, &ph);
+  if(!alpha_full)
+    goto cleanup;
+
+  if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) goto cleanup;
+
+  if(j->vectorize)
+  {
+    // native-frame geometry, same derivation as the render core above
+    const int iw = dev.image_storage.width;
+    const int ih = dev.image_storage.height;
+    const int cropx = dev.image_storage.crop_x;
+    const int cropy = dev.image_storage.crop_y;
+
+    // trace the native alpha instead of writing a raster file. tolerance and
+    // cleanup are expressed in native pixels here: one traced pixel is one
+    // sensor pixel, so a ~1 px tolerance keeps the drift invisible while
+    // keeping the anchor count manageable
+    float *inv = g_try_malloc((size_t)pw * ph * sizeof(float));
+    if(!inv)
+    {
+      dt_control_log(_("precise mask: out of memory"));
+      goto cleanup;
+    }
+    for(size_t k = 0; k < (size_t)pw * ph; k++)
+      inv[k] = 1.0f - alpha_full[k];
+
+    // cleanup is expressed in working-grid area; scale it by the real
+    // surface ratio between the native frame and the working grid
+    const double area_ratio
+      = ((double)iw * ih) / MAX(1.0, (double)j->hint_w * j->hint_h);
+    GList *signs = NULL;
+    GList *forms = ras2forms(inv, pw, ph, NULL, 1.0f - j->threshold,
+                             MAX(2, (int)(j->cleanup * area_ratio)),
+                             (double)j->smoothing, 1.2, &signs);
+    g_free(inv);
+
+    // normalize points straight into input space: the native grid is the
+    // post-rawprepare frame, so input coord = native coord + rawprepare crop
+    float wd_, ht_, iwidth_, iheight_;
+    (void)wd_;
+    (void)ht_;
+    iwidth_ = (float)iw;
+    iheight_ = (float)ih;
+    for(GList *l = forms; l; l = g_list_next(l))
+    {
+      dt_masks_form_t *f = l->data;
+      for(GList *p = f->points; p; p = g_list_next(p))
+      {
+        dt_masks_point_path_t *pt = p->data;
+        pt->corner[0] = (pt->corner[0] + cropx) / iwidth_;
+        pt->corner[1] = (pt->corner[1] + cropy) / iheight_;
+        pt->ctrl1[0] = (pt->ctrl1[0] + cropx) / iwidth_;
+        pt->ctrl1[1] = (pt->ctrl1[1] + cropy) / iheight_;
+        pt->ctrl2[0] = (pt->ctrl2[0] + cropx) / iwidth_;
+        pt->ctrl2[1] = (pt->ctrl2[1] + cropy) / iheight_;
+        // a precise contour needs no imposed falloff: below the legacy
+        // floor, collapse the border to a sub-pixel sliver -- visually a
+        // hard edge, structurally still a valid border for the path editor
+        const float fb = (j->feather < 0.0005f) ? 0.00002f : j->feather;
+        pt->border[0] = fb;
+        pt->border[1] = fb;
+      }
+    }
+
+    _finalize_apply_t *a = g_malloc0(sizeof(_finalize_apply_t));
+    a->imgid = j->imgid;
+    a->vectorize = TRUE;
+    a->forms = forms;
+    a->signs = signs;
+    a->has_target = j->has_target;
+    memcpy(a->target_op, j->target_op, sizeof(a->target_op));
+    a->target_multi_priority = j->target_multi_priority;
+    // the recipe becomes the produced group's provenance trailer, stamped
+    // by the apply idle once the group exists
+    a->has_recipe = j->has_recipe;
+    if(j->has_recipe)
+      a->recipe = j->recipe;
+    a->distort_hash = j->distort_hash;
+    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, _finalize_apply_idle, a,
+                    _finalize_apply_free);
+    dt_print(DT_DEBUG_AI,
+             "[object mask] precise paths: %d form(s) traced at %dx%d (%.1fs)",
+             g_list_length(forms), pw, ph, dt_get_wtime() - t_start);
+    ok = TRUE;
+    goto cleanup;
+  }
+
+  gboolean written = FALSE;
+  if(j->has_recipe && j->outpath)
+  {
+    // content-addressed target: atomic write, and an existing file under
+    // the same fingerprint already is this content
+    outpath = g_strdup(j->outpath);
+    written = _write_mask_png16_atomic(outpath, alpha_full, pw, ph);
+  }
+  else
+  {
+    outpath = _build_mask_path(j->imgid);
+    written = outpath && _write_mask_png16(outpath, alpha_full, pw, ph);
+  }
+
+  if(written)
+  {
+    size_t soft = 0;
+    for(size_t k = 0; k < (size_t)pw * ph; k++)
+      if(alpha_full[k] > 0.05f && alpha_full[k] < 0.95f) soft++;
+    GStatBuf st;
+    const double mo = (g_stat(outpath, &st) == 0) ? st.st_size / 1048576.0 : 0.0;
+    dt_print(DT_DEBUG_AI,
+             "[object mask] precise mask saved: %s (%dx%d, %.1f MB, "
+             "%.3f%% soft, %.1fs)",
+             outpath, pw, ph, mo, 100.0 * soft / ((double)pw * ph),
+             dt_get_wtime() - t_start);
+    dt_control_log(_("precise raster mask saved (%.1f MB, %.1fs)"),
+                   mo, dt_get_wtime() - t_start);
+
+    // hand over to the GUI thread to wire the mask into the pipeline
+    _finalize_apply_t *a = g_malloc0(sizeof(_finalize_apply_t));
+    a->imgid = j->imgid;
+    a->outpath = g_strdup(outpath);
+    a->has_target = j->has_target;
+    memcpy(a->target_op, j->target_op, sizeof(a->target_op));
+    a->target_multi_priority = j->target_multi_priority;
+    a->has_recipe = j->has_recipe;
+    if(j->has_recipe)
+      a->recipe = j->recipe;
+    a->distort_hash = j->distort_hash;
+    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, _finalize_apply_idle, a,
+                    _finalize_apply_free);
+    ok = TRUE;
+  }
+  else
+    dt_control_log(_("failed to save the precise raster mask"));
+
+cleanup:
   g_free(outpath);
+  g_free(alpha_full);
+  dt_dev_cleanup(&dev);
+  g_atomic_int_set(&_finalize_running, 0);
+  return ok ? 0 : 1;
+}
+
+// GUI thread: snapshot the working mask and hand it to a worker job
+static gboolean _launch_native_finalize(_object_data_t *d,
+                                        dt_masks_form_gui_t *gui,
+                                        dt_iop_module_t *target,
+                                        const gboolean vectorize)
+{
+  if(!g_atomic_int_compare_and_exchange(&_finalize_running, 0, 1))
+  {
+    dt_control_log(_("precise mask finalisation already running"));
+    return FALSE;
+  }
+
+  // the job re-reads the history from the database; unflushed edits
+  // (exposure, crop, ...) would silently be missing from the render
+  dt_dev_write_history(darktable.develop);
+  // distortion state the hint was made on; the job revalidates it after
+  // loading, since the history can move while the job waits in the queue
+  const dt_hash_t launch_distort_hash
+    = _compute_distort_hash(darktable.develop);
+
+  // session accessors: an edit session finalises at its recorded threshold
+  // and its recorded margin, the values the recipe records
+  const float thresh = _session_threshold(d);
+  const float margin = _session_refine_margin(d);
+
+  dt_seg_point_t tl, br;
+  if(!_compute_bbox(d->mask, d->mask_w, d->mask_h, thresh, margin, &tl, &br))
+  {
+    dt_control_log(_("empty mask, nothing to finalise"));
+    g_atomic_int_set(&_finalize_running, 0);
+    return FALSE;
+  }
+
+  _finalize_job_t *j = g_malloc0(sizeof(_finalize_job_t));
+  j->imgid = darktable.develop->image_storage.id;
+  j->history_end = darktable.develop->history_end;
+  j->hint_w = d->mask_w;
+  j->hint_h = d->mask_h;
+  j->hint = g_malloc((size_t)d->mask_w * d->mask_h * sizeof(float));
+  memcpy(j->hint, d->mask, (size_t)d->mask_w * d->mask_h * sizeof(float));
+  j->bx = CLAMP((int)tl.x, 0, d->mask_w - 1);
+  j->by = CLAMP((int)tl.y, 0, d->mask_h - 1);
+  j->bw = CLAMP((int)br.x - j->bx + 1, 1, d->mask_w - j->bx);
+  j->bh = CLAMP((int)br.y - j->by + 1, 1, d->mask_h - j->by);
+  j->threshold = thresh;
+  j->vectorize = vectorize;
+  j->cleanup = d->preview_cleanup;
+  j->smoothing = d->preview_smoothing;
+  j->feather = d->preview_feather;
+  // the cap the encoding ran under, through the same MAX every use point
+  // applies: identical to the recipe captured below, so a later headless
+  // regeneration renders exactly what this job renders
+  j->render_target = MAX(d->encoded_render_size, 1024);
+  j->distort_hash = launch_distort_hash;
+
+  // both finalisation routes capture the provenance recipe. the raster
+  // route additionally derives the content-addressed file name from it
+  // (an outpath failure then falls back to a plain sequential file, and
+  // the recipe is dropped with it); the vector route stores the recipe
+  // with the produced group of paths instead -- its capture is decoupled
+  // from any output path on purpose, a recipe without a file is exactly
+  // what the group trailer needs. sessions the recipe cannot hold (too
+  // many clicks) proceed without provenance on either route
+  j->has_recipe = _capture_recipe(d, gui, &j->recipe);
+  if(!vectorize && j->has_recipe)
+  {
+    j->outpath = _recipe_outpath(&j->recipe);
+    if(!j->outpath)
+      j->has_recipe = FALSE;
+  }
+  if(!j->has_recipe)
+    memset(&j->recipe, 0, sizeof(j->recipe));
+
+  if(target)
+  {
+    g_strlcpy(j->target_op, target->op, sizeof(j->target_op));
+    j->target_multi_priority = target->multi_priority;
+    j->has_target = TRUE;
+  }
+
+  dt_job_t *job = dt_control_job_create(_finalize_job_run,
+                                        "precise mask finalisation");
+  if(!job)
+  {
+    // the destroy releases the token itself (j->ran is FALSE): the one
+    // path that frees these params, whether the job system calls it or we
+    // do, is also the one path that gives the token back
+    _finalize_job_destroy(j);
+    return FALSE;
+  }
+  dt_control_job_set_params(job, j, _finalize_job_destroy);
+  dt_control_job_add_progress(job, _("precise mask finalisation"), TRUE);
+  // announce before queueing: a worker may pick the job up at once and
+  // report a failure, and that report must not be overwritten by this
+  dt_control_log(vectorize ? _("computing precise paths...")
+                           : _("computing precise raster mask..."));
+  dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
+  return TRUE;
+}
+
+/* ------------------------ headless recipe replay ------------------------
+ *
+ * Regenerate the finalised mask PNG from its provenance recipe alone: the
+ * same render at the recorded encode dimensions, the recorded segmentation
+ * model pinned to its recorded version, the decodes replayed at the
+ * recorded boundaries, the same native finalisation, the same
+ * content-addressed file name. Runs on a worker job or inline in a CLI
+ * context: this code itself calls no GTK and no dt_control_log -- dt_print
+ * only -- but the replayed pipes run every module of the history (see the
+ * self-reference note below). The replay never produces path forms; those
+ * stay a GUI-session gesture.
+ *
+ * Documented limitations, all confined to the guide render and accepted as
+ * ONNX-variance-class (T2) deviations:
+ *  - self-reference: both replay pipes synch the full history, including
+ *    the rasterfile instance whose file is the very one being regenerated.
+ *    That instance resolves to a missing file, blend falls back to a
+ *    zeroed mask, and the RGB guide through the target module may differ
+ *    from the original run (where an earlier file could be present).
+ *    rasterfile.c stays silent about the missing file when a recipe is
+ *    present -- the recompute is the answer, not a toast.
+ *  - divergent distortion history: when the current history no longer
+ *    matches the recorded distort_hash the replay still proceeds (see the
+ *    comment at the check below); the regenerated bytes then depend on the
+ *    CURRENT history, which the fingerprint does not cover.
+ *  - the recipe does not record whether the original run's native tiled
+ *    refinement pass succeeded; the replay's own attempt may degrade
+ *    differently (model pinning above only guarantees the same weights). */
+
+dt_object_recipe_status_t
+dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
+                         const dt_imgid_t imgid,
+                         gboolean (*keep_going)(void *),
+                         void *user)
+{
+  if(!dt_rf_recipe_valid(recipe) || !dt_is_valid_imgid(imgid))
+    return DT_OBJECT_RECIPE_FAILED;
+
+  // the recorded decode boundaries drive the replay; the last one produced
+  // the mask the finalisation worked from. a recipe without any boundary
+  // defines no refinement chain and cannot be replayed
+  int last_decode = -1;
+  for(int i = 0; i < recipe->n_points; i++)
+    if(recipe->points[i].decode_after)
+      last_decode = i;
+  if(last_decode < 0)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: recipe records no decode boundary");
+    return DT_OBJECT_RECIPE_FAILED;
+  }
+
+  // pin the models to the recorded versions. the fingerprint names the
+  // exact weights; replaying with anything else would write different
+  // content under the same name and poison a shared store forever. hard
+  // failure on any deviation: it is retryable once the right models are
+  // installed, and a mask-to-0 in the meantime beats silent divergence
+  const char *seg_ver = dt_ai_model_get_version(recipe->seg_model);
+  if(g_strcmp0(seg_ver, recipe->seg_model_version) != 0)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: segmentation model '%s' is version '%s',"
+             " the recipe records '%s' -- not replaying",
+             recipe->seg_model, seg_ver ? seg_ver : "?",
+             recipe->seg_model_version);
+    return DT_OBJECT_RECIPE_FAILED;
+  }
+  if(recipe->ai_refine)
+  {
+    // dt_refine_load offers no per-id loading: the replay can only use the
+    // ACTIVE refine model, so that one must be the recorded one
+    char *refine_id = dt_ai_models_get_active_for_task("refine");
+    const char *refine_ver
+      = refine_id ? dt_ai_model_get_version(refine_id) : NULL;
+    const gboolean pinned = refine_id
+      && strcmp(refine_id, recipe->refine_model) == 0
+      && g_strcmp0(refine_ver, recipe->refine_model_version) == 0;
+    if(!pinned)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: active refine model '%s' (version"
+               " '%s') does not match the recorded '%s' (version '%s') --"
+               " not replaying",
+               refine_id ? refine_id : "(none)",
+               refine_ver ? refine_ver : "?",
+               recipe->refine_model, recipe->refine_model_version);
+      g_free(refine_id);
+      return DT_OBJECT_RECIPE_FAILED;
+    }
+    g_free(refine_id);
+  }
+
+  dt_object_recipe_status_t status = DT_OBJECT_RECIPE_FAILED;
+  gchar *outpath = NULL;
+  float *enc_pts = NULL;
+  uint8_t *rgb = NULL;
+  float *hint = NULL;
+  float *alpha_full = NULL;
+  int hint_w = 0, hint_h = 0;
+  dt_ai_environment_t *env = NULL;
+  dt_seg_context_t *seg = NULL;
+  dt_dev_pixelpipe_t pipe;
+  dt_mipmap_buffer_t buf;
+  gboolean pipe_ready = FALSE, buf_ready = FALSE;
+  // minimal stand-in for the session data _decode_thread_func works on: the
+  // compute only touches seg/refine/refine_failed/env, plus a final atomic
+  // store to decode_state that nobody polls here
+  _object_data_t od = { 0 };
+
+  const double t_start = dt_get_wtime();
+
+  dt_develop_t dev;
+  dt_dev_init(&dev, FALSE);
+  dt_dev_load_image(&dev, imgid);
+  // no history_end override here: headless, the database is the source of
+  // truth (the interactive threads only override it because the darkroom
+  // can be ahead of the database)
+
+  // the recipe describes the distortion state the prompts were clicked on.
+  // if the history moved since, the replay still renders the CURRENT state
+  // -- the closest available to what the recipe names -- and says so; a
+  // stale mask is repaired by a manual re-finalisation. proceeding (where
+  // the interactive job cancels) is deliberate: cancelling would leave a
+  // permanent mask-to-0 on the common cross-machine case (crop added after
+  // finalisation), and the input-space-normalised points make the replay
+  // largely self-correcting. accepted deviation from the content-addressed
+  // promise: the regenerated bytes then depend on the CURRENT history,
+  // which the fingerprint does not cover -- divergence is confined to the
+  // guide render (the mask lives in input space) and is treated as
+  // ONNX-variance-class (T2), see the block comment above
+  // NOTE: the recorded hash was computed on the GUI develop and this one on
+  // a headless develop; the two contexts have been observed to disagree for
+  // an unchanged history, so this trace can be a false positive. purely
+  // informational (the replay proceeds either way) -- root cause of the
+  // cross-context divergence still to be established
+  const dt_hash_t cur_hash = _compute_distort_hash(&dev);
+  if((dt_hash_t)recipe->distort_hash != cur_hash)
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: distortion state differs from capture"
+             " (may be a cross-context artefact), proceeding");
+
+  // reproduce the FIRST capture's state: the original encoding was made
+  // before this very mask existed, but the loaded history contains the
+  // rasterfile instance carrying our recipe -- during the replay's renders
+  // it would resolve to the missing file and its consumers would render a
+  // zeroed mask, making the regenerated bytes depend on which files happen
+  // to exist. disable the instances that carry OUR recipe (verbatim
+  // compare); other raster masks of the image keep their effect
+  for(GList *l = dev.iop; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *m = l->data;
+    if(!strcmp(m->op, "rasterfile") && m->enabled && m->params
+       && memcmp(&((dt_iop_rasterfile_params_t *)m->params)->recipe,
+                 recipe, sizeof(*recipe)) == 0)
+      m->enabled = FALSE;
+  }
+
+  // content-addressed target under the LOCAL mask root, derived from the
+  // loaded dev -- never darktable.develop. must mirror what _recipe_outpath
+  // and rasterfile.c's commit_params resolve
+  {
+    const dt_image_t *img = &dev.image_storage;
+    gchar *base = g_path_get_basename(img->filename);
+    char *dot = g_strrstr(base, ".");
+    if(dot) *dot = '\0';
+    gchar *fname = dt_rasterfile_recipe_filename(recipe, base,
+                                                 img->width, img->height,
+                                                 img->exif_datetime_taken);
+    gchar *root = dt_rasterfile_mask_root();
+    if(g_mkdir_with_parents(root, 0755) == 0)
+      outpath = g_build_filename(root, fname, NULL);
+    else
+      dt_print(DT_DEBUG_AI, "[object mask] replay: cannot create folder: %s",
+               root);
+    g_free(root);
+    g_free(fname);
+    g_free(base);
+  }
+  if(!outpath)
+    goto cleanup;
+
+  // an existing file under this fingerprint was produced from this very
+  // recipe: it already is the requested content -- but only when it is an
+  // actual PNG. a zero-byte or truncated leftover would otherwise be
+  // trusted forever and the pipe would loop on an unreadable file
+  if(g_file_test(outpath, G_FILE_TEST_EXISTS))
+  {
+    if(_mask_png_valid(outpath))
+    {
+      dt_print(DT_DEBUG_AI, "[object mask] replay: %s already exists",
+               outpath);
+      status = DT_OBJECT_RECIPE_OK;
+      goto cleanup;
+    }
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: %s exists but is not a valid PNG,"
+             " regenerating", outpath);
+    g_unlink(outpath);
+  }
+
+  // load the RECORDED segmentation model, not the currently active one: the
+  // replay reproduces the original session. a missing model is a clean
+  // failure -- the caller may retry once it is installed
+  env = dt_ai_env_init(NULL);
+  seg = env ? dt_seg_load(env, recipe->seg_model) : NULL;
+  if(!seg)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: segmentation model '%s' unavailable",
+             recipe->seg_model);
+    goto cleanup;
+  }
+  od.env = env;
+  od.seg = seg;
+
+  const int enc_w = recipe->encode_w;
+  const int enc_h = recipe->encode_h;
+  if(enc_w <= 0 || enc_h <= 0)
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: invalid encode dimensions");
+    goto cleanup;
+  }
+
+  // export render pipe at full input dimensions, as _encode_thread_func
+  // builds it. it serves both the encode render and the prompt mapping
+  dt_mipmap_cache_get(&buf, imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
+  buf_ready = TRUE;
+  if(!buf.buf || !buf.width || !buf.height)
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: cannot get the image buffer");
+    goto cleanup;
+  }
+  const int iw = dev.image_storage.width;
+  const int ih = dev.image_storage.height;
+  if(!dt_dev_pixelpipe_init_export(&pipe, iw, ih, IMAGEIO_RGB | IMAGEIO_INT8,
+                                   FALSE))
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: cannot init the render pipe");
+    goto cleanup;
+  }
+  pipe_ready = TRUE;
+  dt_dev_pixelpipe_set_icc(&pipe, DT_COLORSPACE_SRGB, NULL,
+                           DT_INTENT_PERCEPTUAL);
+  dt_dev_pixelpipe_set_input(&pipe, &dev, (float *)buf.buf,
+                             buf.width, buf.height, buf.iscale);
+  dt_dev_pixelpipe_create_nodes(&pipe, &dev);
+  dt_dev_pixelpipe_synch_all(&pipe, &dev);
+  dt_dev_pixelpipe_get_dimensions(&pipe, &dev, pipe.iwidth, pipe.iheight,
+                                  &pipe.processed_width,
+                                  &pipe.processed_height);
+  if(pipe.processed_width <= 0 || pipe.processed_height <= 0)
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: empty processed dimensions");
+    goto cleanup;
+  }
+
+  // the recipe travels in the XMP and is untrusted input: the encode
+  // render never upscales, so recorded dims above the processed frame are
+  // necessarily corrupt -- reject them before they size any allocation
+  if(enc_w > pipe.processed_width || enc_h > pipe.processed_height)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: recorded encode dims %dx%d exceed the"
+             " processed frame %dx%d, rejecting",
+             enc_w, enc_h, pipe.processed_width, pipe.processed_height);
+    goto cleanup;
+  }
+
+  // prompt points back to encode-render pixels, the exact inverse of the
+  // capture convention (backtransform through the pipe, divided by its
+  // input dims): scale by THIS pipe's input dims, forward through the full
+  // distortion chain -- the same transform_plus/DIR_ALL the finalisation
+  // grid uses -- then the plain processed->encode factor of _launch_decode
+  // (which uses no pixel-centre offset either). the normalised coordinates
+  // are scale-invariant, so the preview pipe of the capture and this export
+  // pipe agree by the same convention every stored mask form relies on
+  const int n = recipe->n_points;
+  enc_pts = g_new(float, (size_t)n * 2);
+  for(int k = 0; k < n; k++)
+  {
+    enc_pts[k * 2 + 0] = recipe->points[k].x * (float)pipe.iwidth;
+    enc_pts[k * 2 + 1] = recipe->points[k].y * (float)pipe.iheight;
+  }
+  dt_dev_distort_transform_plus(&dev, &pipe, 0.0, DT_DEV_TRANSFORM_DIR_ALL,
+                                enc_pts, n);
+  const float psx = (float)enc_w / (float)pipe.processed_width;
+  const float psy = (float)enc_h / (float)pipe.processed_height;
+  for(int k = 0; k < n; k++)
+  {
+    enc_pts[k * 2 + 0] *= psx;
+    enc_pts[k * 2 + 1] *= psy;
+  }
+
+  // encoder embeddings: the disk cache first, keyed exactly like the
+  // interactive session (imgid + current distortion state + model). the
+  // cache is validated without dimensions, so a hit at other dims than the
+  // recipe records would put the prompts on the wrong grid -- re-encode then
+  gboolean encoded = FALSE;
+  if(dt_seg_disk_cache_load(seg, imgid, cur_hash))
+  {
+    int cw = 0, ch = 0;
+    dt_seg_get_encoded_rgb(seg, &cw, &ch);
+    if(cw == enc_w && ch == enc_h)
+      encoded = TRUE;
+    else
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: cached encoding is %dx%d, recipe "
+               "records %dx%d, re-encoding", cw, ch, enc_w, enc_h);
+      dt_seg_reset_encoding(seg);
+    }
+  }
+
+  if(!encoded)
+  {
+    // render at EXACTLY the recorded dims -- never re-read the render-size
+    // conf for this render, a changed preference would shift the prompt
+    // grid. the sampling scale is recovered with the encode-thread formula
+    // from the recorded cap; when the recorded dims come from a .seg made
+    // under another cap the formula cannot land on them, fall back to the
+    // dim ratio (sub-pixel sampling difference, accepted for that rare case)
+    const int render_cap = MAX(recipe->render_size, 1024);
+    const double e_scale
+      = fmin((double)render_cap / (double)pipe.processed_width,
+             (double)render_cap / (double)pipe.processed_height);
+    double final_scale = fmin(e_scale, 1.0);
+    if((int)(final_scale * pipe.processed_width) != enc_w
+       || (int)(final_scale * pipe.processed_height) != enc_h)
+    {
+      final_scale = fmin((double)enc_w / (double)pipe.processed_width,
+                         (double)enc_h / (double)pipe.processed_height);
+      // bound the requested ROI to the scaled extent of the processed
+      // frame: the ratio truncates, so allow the accepted one-pixel slack,
+      // but reject a recipe whose dims the render cannot reach -- the
+      // prompts would land on the wrong grid anyway
+      if((int)(final_scale * pipe.processed_width) + 1 < enc_w
+         || (int)(final_scale * pipe.processed_height) + 1 < enc_h)
+      {
+        dt_print(DT_DEBUG_AI,
+                 "[object mask] replay: recorded dims %dx%d not reachable"
+                 " from the processed frame, rejecting", enc_w, enc_h);
+        goto cleanup;
+      }
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: recorded dims %dx%d do not match the "
+               "recorded render cap, using the dim ratio", enc_w, enc_h);
+    }
+
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: rendering %dx%d for encoding...",
+             enc_w, enc_h);
+    // the return value signals "pipe altered mid-flight", not success --
+    // the backbuf and its dimensions are the check that matters
+    dt_dev_pixelpipe_process_no_gamma(&pipe, &dev, 0, 0, enc_w, enc_h,
+                                      final_scale);
+    if(!pipe.backbuf
+       || pipe.backbuf_width != enc_w || pipe.backbuf_height != enc_h)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: render for encoding returned %dx%d,"
+               " expected %dx%d",
+               pipe.backbuf_width, pipe.backbuf_height, enc_w, enc_h);
+      goto cleanup;
+    }
+
+    // backbuf is float RGBA, convert to uint8 RGB -- same as the encode
+    // thread
+    rgb = _backbuf_to_rgb8(&pipe, enc_w, enc_h);
+    if(!rgb)
+    {
+      dt_print(DT_DEBUG_AI, "[object mask] replay: render for encoding failed");
+      goto cleanup;
+    }
+
+    // same CPU fallback as the interactive encode thread, pinned to the
+    // recorded model
+    encoded = _seg_encode_cpu_fallback(&seg, env, recipe->seg_model,
+                                       rgb, enc_w, enc_h);
+    od.seg = seg;
+    // populate the disk cache for repeated replays -- but never clobber a
+    // file the interactive session wrote: a single slot exists per image,
+    // and overwriting it with the recipe dims would silently degrade the
+    // session's working resolution on its next cache hit
+    if(encoded && !dt_seg_disk_cache_exists(imgid))
+      dt_seg_disk_cache_save(seg, imgid, cur_hash, rgb, enc_w, enc_h);
+    g_free(rgb);
+    rgb = NULL;
+    if(!encoded)
+    {
+      dt_print(DT_DEBUG_AI, "[object mask] replay: encoding failed");
+      goto cleanup;
+    }
+  }
+
+  // this pipe served the encode render and the prompt mapping; the
+  // finalisation core below builds its own
+  dt_dev_pixelpipe_cleanup(&pipe);
+  pipe_ready = FALSE;
+  dt_mipmap_cache_release(&buf);
+  buf_ready = FALSE;
+
+  if(keep_going && !keep_going(user))
+  {
+    status = DT_OBJECT_RECIPE_RETRY;   // cancelled, not broken
+    goto cleanup;
+  }
+
+  // replay the decodes at the recorded boundaries: decode i covers points
+  // 0..i, with the threshold recorded when that decode really ran. the
+  // whole per-decode sequence (multi-pass refinement with peak points and
+  // box prompt, IoU convergence, seed-component filter, CRF and CascadePSP
+  // when they were active) IS _decode_thread_func, called synchronously on
+  // a per-boundary job -- zero duplicated logic, zero divergence. prev_mask
+  // is never reset between decodes, as in the interactive session; the
+  // context is freshly loaded, so the first decode starts clean anyway
+  for(int i = 0; i <= last_decode; i++)
+  {
+    if(!recipe->points[i].decode_after)
+      continue;
+    if(keep_going && !keep_going(user))
+    {
+      status = DT_OBJECT_RECIPE_RETRY;
+      goto cleanup;
+    }
+
+    const int n_prompt = i + 1;
+    _decode_job_t *djob = g_malloc0(sizeof(_decode_job_t));
+    djob->d = &od;
+    djob->n_prompt_points = n_prompt;
+    // always FALSE, like every launch of the interactive path (see
+    // _launch_decode); do not attach first-click semantics to it
+    djob->reset_prev_mask = FALSE;
+    // the clamps mirror the conf reads of _launch_decode that recorded
+    // these values, and shield against a hand-edited recipe
+    djob->n_passes = CLAMP(recipe->refine_passes, 1, 3);
+    // headroom: one peak point per pass + 2 box corners (SAM only)
+    djob->points = g_new(dt_seg_point_t, n_prompt + djob->n_passes + 2);
+    for(int k = 0; k < n_prompt; k++)
+    {
+      djob->points[k].x = enc_pts[k * 2 + 0];
+      djob->points[k].y = enc_pts[k * 2 + 1];
+      djob->points[k].label = (int)recipe->points[k].label;
+    }
+    // seed for the connected-component filter: last positive point, as in
+    // _launch_decode
+    djob->seed_x = -1;
+    djob->seed_y = -1;
+    for(int k = n_prompt - 1; k >= 0; k--)
+      if(recipe->points[k].label == 1)
+      {
+        djob->seed_x = (int)enc_pts[k * 2 + 0];
+        djob->seed_y = (int)enc_pts[k * 2 + 1];
+        break;
+      }
+    djob->threshold = CLAMP(recipe->points[i].threshold, 0.3f, 0.9f);
+    djob->do_crf = recipe->crf_enabled != 0;
+    djob->crf_iter = CLAMP(recipe->crf_iterations, 1, 10);
+    djob->crf_sigma_color = CLAMP(recipe->crf_sigma_color, 1.0f, 50.0f);
+    djob->crf_w_bilateral = CLAMP(recipe->crf_w_bilateral, 0.5f, 30.0f);
+    djob->do_refine = recipe->ai_refine != 0 && !od.refine_failed;
+    djob->refine_margin = CLAMPF(recipe->ai_refine_margin, 0.0f, 0.5f);
+
+    _decode_thread_func(djob);
+
+    // the interactive session absorbs a refine load failure gracefully
+    // (refine_failed, decode proceeds unrefined) -- the replay must not:
+    // it would write an unrefined mask under a fingerprint that promises
+    // refinement. hard failure, retryable once the model loads again
+    if(recipe->ai_refine && od.refine_failed)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: refine model failed to load,"
+               " cannot reproduce the recorded refinement");
+      _decode_job_free(djob);
+      goto cleanup;
+    }
+
+    if(i == last_decode && djob->out_mask)
+    {
+      hint = djob->out_mask;
+      hint_w = djob->out_w;
+      hint_h = djob->out_h;
+      djob->out_mask = NULL;   // ownership moved
+    }
+    const gboolean decode_ok = (i == last_decode) ? (hint != NULL)
+                                                  : (djob->out_mask != NULL);
+    _decode_job_free(djob);
+    if(!decode_ok)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: decode at point %d failed", i + 1);
+      goto cleanup;
+    }
+  }
+
+  // the segmentation stack is done; release it before the heavy native pass
+  // (which loads its own refinement context, as the interactive job does)
+  if(od.refine)
+  {
+    dt_refine_free(od.refine);
+    od.refine = NULL;
+  }
+  dt_seg_free(seg);
+  seg = NULL;
+  od.seg = NULL;
+  dt_ai_env_destroy(env);
+  env = NULL;
+  od.env = NULL;
+
+  // subject bbox on the working grid, exactly as _launch_native_finalize
+  // derives it: final threshold, CascadePSP margin as padding
+  const float thresh = CLAMP(recipe->threshold, 0.3f, 0.9f);
+  const float margin = CLAMPF(recipe->ai_refine_margin, 0.0f, 0.5f);
+  dt_seg_point_t tl, br;
+  if(!_compute_bbox(hint, hint_w, hint_h, thresh, margin, &tl, &br))
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: empty mask, nothing to write");
+    goto cleanup;
+  }
+  const int bx = CLAMP((int)tl.x, 0, hint_w - 1);
+  const int by = CLAMP((int)tl.y, 0, hint_h - 1);
+  const int bw = CLAMP((int)br.x - bx + 1, 1, hint_w - bx);
+  const int bh = CLAMP((int)br.y - by + 1, 1, hint_h - by);
+
+  // the native pass is the peak of VRAM use and shares its serialisation
+  // token with the interactive finalisation job: never run both at once.
+  // busy means a finalisation (or another replay) is in flight -- fail
+  // cleanly, the caller may retry later
+  if(!g_atomic_int_compare_and_exchange(&_finalize_running, 0, 1))
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: a finalisation is already running,"
+             " try again later");
+    status = DT_OBJECT_RECIPE_RETRY;
+    goto cleanup;
+  }
+  int pw = 0, ph = 0;
+  const _finalize_render_req_t req = {
+    .hint = hint,
+    .hint_w = hint_w,
+    .hint_h = hint_h,
+    .bx = bx, .by = by, .bw = bw, .bh = bh,
+    .threshold = thresh,
+    .render_target = MAX(recipe->render_size, 1024),
+    .interactive = FALSE,
+  };
+  alpha_full = _finalize_render_alpha(&dev, &req, keep_going, user, &pw, &ph);
+  g_atomic_int_set(&_finalize_running, 0);
+  if(!alpha_full)
+  {
+    // the render core reports failure and cancellation alike; recover the
+    // distinction here so a cancelled replay frees its anti-respawn slot
+    if(keep_going && !keep_going(user))
+      status = DT_OBJECT_RECIPE_RETRY;
+    goto cleanup;
+  }
+
+  if(!_write_mask_png16_atomic(outpath, alpha_full, pw, ph))
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: cannot write %s", outpath);
+    goto cleanup;
+  }
+
+  dt_print(DT_DEBUG_AI,
+           "[object mask] replay: %s regenerated (%dx%d, %.1fs)",
+           outpath, pw, ph, dt_get_wtime() - t_start);
+  status = DT_OBJECT_RECIPE_OK;
+
+cleanup:
+  g_free(rgb);
+  g_free(enc_pts);
+  g_free(hint);
+  g_free(alpha_full);
+  g_free(outpath);
+  if(pipe_ready) dt_dev_pixelpipe_cleanup(&pipe);
+  if(buf_ready) dt_mipmap_cache_release(&buf);
+  if(od.refine) dt_refine_free(od.refine);
+  if(seg) dt_seg_free(seg);
+  if(env) dt_ai_env_destroy(env);
+  dt_dev_cleanup(&dev);
+  // a deterministic failure deserves a visible trace even without -d ai:
+  // the user otherwise faces a silent zeroed mask with no clue
+  if(status == DT_OBJECT_RECIPE_FAILED)
+    dt_print(DT_DEBUG_ALWAYS,
+             "[object mask] could not regenerate the mask of image %d from"
+             " its recipe (run with -d ai for details)", imgid);
+  return status;
+}
+
+// --------------------------- model gap diagnostic ---------------------------
+//
+// the queryable mirror of the replay gates above: OK means exactly "a
+// replay would pass its model checks" -- same version lookup, same string
+// comparison, refinement examined only when the recipe enables it, and
+// the active == recorded rule for the refinement model. a diagnostic
+// that disagreed with the replay would promise repairs that change
+// nothing, so any change to the gates in dt_object_recipe_compute must
+// land here too. anything but OK is refined into the cause an UX surface
+// can act on; the verdict is cheap and never cached (installs, rebinds
+// and edits all change it)
+
+// the priority when the recipe's two models disagree: the verdict
+// needing the heaviest user action wins. NOT the enum order --
+// INSTALLABLE outranks both drifts
+static int _model_gap_rank(const dt_object_recipe_model_gap_t gap)
+{
+  switch(gap)
+  {
+    case DT_OBJECT_RECIPE_MODELS_AI_OFF:       return 5;
+    case DT_OBJECT_RECIPE_MODELS_UNKNOWN:      return 4;
+    case DT_OBJECT_RECIPE_MODELS_INSTALLABLE:  return 3;
+    case DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND: return 2;
+    case DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD:  return 1;
+    default:                                   return 0;
+  }
+}
+
+static const char *_model_gap_name(const dt_object_recipe_model_gap_t gap)
+{
+  switch(gap)
+  {
+    case DT_OBJECT_RECIPE_MODELS_OK:           return "ok";
+    case DT_OBJECT_RECIPE_MODELS_INSTALLABLE:  return "installable";
+    case DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND: return "drift-behind";
+    case DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD:  return "drift-ahead";
+    case DT_OBJECT_RECIPE_MODELS_UNKNOWN:      return "unknown";
+    case DT_OBJECT_RECIPE_MODELS_AI_OFF:       return "ai-off";
+    default:                                   return "?";
+  }
+}
+
+// verdict for one recorded (id, version) pair against the registry.
+// `missing` collects the ids a download could move toward the recorded
+// state (the INSTALLABLE and DRIFT_BEHIND ones)
+static dt_object_recipe_model_gap_t
+_model_gap_one(const char *model_id,
+               const char *recorded_version,
+               GPtrArray *missing)
+{
+  dt_ai_model_t *model = dt_ai_models_get_by_id(model_id);
+  if(!model)
+    // not even the registry knows the id: no download can produce it,
+    // only a local .dtmodel install can
+    return DT_OBJECT_RECIPE_MODELS_UNKNOWN;
+
+  dt_object_recipe_model_gap_t gap = DT_OBJECT_RECIPE_MODELS_OK;
+
+  if(model->status == DT_AI_MODEL_NOT_DOWNLOADED
+     || model->status == DT_AI_MODEL_DOWNLOADING
+     || model->status == DT_AI_MODEL_ERROR)
+    // known deviation from a literal gate mirror: a recipe recording the
+    // "0.0" placeholder version would slip past the replay's version
+    // comparison only to fail at model load time; "install it" is the
+    // truthful verdict either way
+    gap = DT_OBJECT_RECIPE_MODELS_INSTALLABLE;
+  else
+  {
+    // the exact comparison the replay gate refuses on. when it would
+    // refuse, split the drift by direction: only a lagging install is
+    // repairable by a download -- an UPDATE_* status marks the remote as
+    // ahead of the install, so downloading can still move the version
+    // even when the plain "X.Y" comparison cannot order the two strings.
+    // when the versions MATCH the replay passes whatever the update
+    // status says: an available update must not grow a repair button for
+    // a mask that is not broken
+    const char *installed = dt_ai_model_get_version(model_id);
+    if(g_strcmp0(installed, recorded_version) != 0)
+      gap = (dt_ai_models_version_compare(installed, recorded_version) < 0
+             || model->status == DT_AI_MODEL_UPDATE_AVAILABLE
+             || model->status == DT_AI_MODEL_UPDATE_REQUIRED)
+        ? DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND
+        : DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD;
+  }
+  dt_ai_model_free(model);
+
+  if(missing
+     && (gap == DT_OBJECT_RECIPE_MODELS_INSTALLABLE
+         || gap == DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND))
+    g_ptr_array_add(missing, g_strdup(model_id));
+
+  return gap;
+}
+
+// full diagnostic: the combined verdict plus the per-model ones (the
+// failure toast needs to name the model at fault). the public wrapper
+// below discards the details
+static dt_object_recipe_model_gap_t
+_recipe_model_gap(const dt_rf_recipe_t *recipe,
+                  gchar ***missing,
+                  dt_object_recipe_model_gap_t *seg_gap_out,
+                  dt_object_recipe_model_gap_t *refine_gap_out)
+{
+  dt_object_recipe_model_gap_t seg_gap = DT_OBJECT_RECIPE_MODELS_OK;
+  dt_object_recipe_model_gap_t refine_gap = DT_OBJECT_RECIPE_MODELS_OK;
+
+  if(missing) *missing = NULL;
+
+  // an invalid recipe names no models: nothing to diagnose. callers gate
+  // their surfaces on dt_rf_recipe_valid, not on this verdict
+  const gboolean valid = dt_rf_recipe_valid(recipe);
+  if(valid)
+  {
+    if(!dt_ai_registry_is_enabled())
+      // distinct from UNKNOWN: with AI off the registry holds no models,
+      // and every lookup below would misdiagnose the recipe as recording
+      // ids nobody has heard of
+      seg_gap = refine_gap = DT_OBJECT_RECIPE_MODELS_AI_OFF;
+    else
+    {
+      // a registry created while AI was disabled at startup answers NULL
+      // to every lookup: complete the deferred init first, or every
+      // verdict would be a false UNKNOWN. no-op when already initialized
+      dt_ai_models_init_lazy();
+
+      GPtrArray *ids = missing ? g_ptr_array_new() : NULL;
+
+      seg_gap = _model_gap_one(recipe->seg_model,
+                               recipe->seg_model_version, ids);
+
+      if(recipe->ai_refine)
+      {
+        refine_gap = _model_gap_one(recipe->refine_model,
+                                    recipe->refine_model_version, ids);
+        if(refine_gap == DT_OBJECT_RECIPE_MODELS_OK)
+        {
+          // dt_refine_load offers no per-id loading, so the replay gate
+          // additionally demands that the recorded model be the ACTIVE
+          // one (see dt_object_recipe_compute). installed right but not
+          // active is not repairable by any download: report it as
+          // DRIFT_AHEAD, whose UX offer -- redo with the current models
+          // -- is the only repair that exists for it
+          char *active = dt_ai_models_get_active_for_task("refine");
+          if(g_strcmp0(active, recipe->refine_model) != 0)
+            refine_gap = DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD;
+          g_free(active);
+        }
+      }
+
+      if(ids)
+      {
+        if(ids->len)
+        {
+          g_ptr_array_add(ids, NULL);
+          *missing = (gchar **)g_ptr_array_free(ids, FALSE);
+        }
+        else
+          g_ptr_array_free(ids, TRUE);
+      }
+    }
+  }
+
+  const dt_object_recipe_model_gap_t verdict
+    = _model_gap_rank(refine_gap) > _model_gap_rank(seg_gap)
+      ? refine_gap : seg_gap;
+
+  if(valid)
+  {
+    // the headless test surface: every diagnostic states its verdict and
+    // both causes under -d ai
+    gchar *refine_part = !recipe->ai_refine ? NULL
+      : g_strdup_printf(", refine '%s' recorded v%s installed v%s (%s)",
+                        recipe->refine_model,
+                        recipe->refine_model_version,
+                        dt_ai_model_get_version(recipe->refine_model),
+                        _model_gap_name(refine_gap));
+    dt_print(DT_DEBUG_AI,
+             "[object mask] model gap: %s -- seg '%s' recorded v%s"
+             " installed v%s (%s)%s",
+             _model_gap_name(verdict),
+             recipe->seg_model,
+             recipe->seg_model_version,
+             dt_ai_model_get_version(recipe->seg_model),
+             _model_gap_name(seg_gap),
+             refine_part ? refine_part : "");
+    g_free(refine_part);
+  }
+
+  if(seg_gap_out) *seg_gap_out = seg_gap;
+  if(refine_gap_out) *refine_gap_out = refine_gap;
+  return verdict;
+}
+
+dt_object_recipe_model_gap_t
+dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing)
+{
+  return _recipe_model_gap(recipe, missing, NULL, NULL);
+}
+
+// ----------------------------- edit session gate ----------------------------
+//
+// while an interactive AI edit session is open on a rasterfile instance,
+// the proactive missing-file branch of iop/rasterfile.c gui_changed must
+// not schedule a headless recompute of the very mask the session is
+// preparing to replace: in the nominal repair flow the file IS missing
+// for the whole session, so every gui_update (signal, focus change,
+// w == NULL refresh) would otherwise race a second inference stack
+// against the session -- and pin a fresh FAILED slot when the recorded
+// model is still absent. a single (op, multi_priority) slot suffices:
+// edit sessions are modal, at most one per process
+
+static GMutex _edit_active_mutex;
+static gboolean _edit_active = FALSE;
+static char _edit_active_op[32] = { 0 };
+static int32_t _edit_active_priority = -1;
+
+gboolean dt_object_mask_edit_active(const char *op,
+                                    const int32_t multi_priority)
+{
+  g_mutex_lock(&_edit_active_mutex);
+  const gboolean active = _edit_active
+    && op
+    && !g_strcmp0(op, _edit_active_op)
+    && multi_priority == _edit_active_priority;
+  g_mutex_unlock(&_edit_active_mutex);
+  return active;
+}
+
+void dt_object_mask_edit_set_active(const char *op,
+                                    const int32_t multi_priority)
+{
+  g_mutex_lock(&_edit_active_mutex);
+  _edit_active = TRUE;
+  g_strlcpy(_edit_active_op, op ? op : "", sizeof(_edit_active_op));
+  _edit_active_priority = multi_priority;
+  g_mutex_unlock(&_edit_active_mutex);
+}
+
+void dt_object_mask_edit_clear_active(void)
+{
+  g_mutex_lock(&_edit_active_mutex);
+  _edit_active = FALSE;
+  _edit_active_op[0] = '\0';
+  _edit_active_priority = -1;
+  g_mutex_unlock(&_edit_active_mutex);
+}
+
+// edit sessions are modal: at most one per process, whatever instance.
+// the flag is BOOKKEEPING, not thread ownership: _free_data drops it as
+// soon as the session ends, while a replay thread torn down mid-flight
+// keeps running until its deferred join. a new session may therefore start
+// alongside an orphaned replay -- no shared data (separate stand-in, own
+// ONNX contexts, per-thread temp files with atomic rename, the persistent
+// slot protected by edit_model_pinned), only two resident models and two
+// inferences for the time it takes. same class as the pre-existing
+// deferred encode, and accepted for the same reason
+static gboolean _edit_any_active(void)
+{
+  g_mutex_lock(&_edit_active_mutex);
+  const gboolean active = _edit_active;
+  g_mutex_unlock(&_edit_active_mutex);
+  return active;
+}
+
+// ------------------------- ai edit session: opening -------------------------
+//
+// see the machine's contract at the _edit_pending_t definition. the code
+// below implements the three GUI-thread legs: the opening
+// (dt_object_mask_edit_begin), the WAIT_ENCODE -> REPLAYING transition
+// (_edit_replay_start) and the REPLAYING -> ACTIVE transition
+// (_edit_replay_finish), both driven from post_expose. the replay itself
+// (_edit_replay_thread_func) is the recorded per-boundary decode chain of
+// the headless replay, executed against the LIVE session's encoded
+// context so the interactive flow continues natively afterwards
+
+// worker thread: replay the recorded decodes at their recorded boundaries.
+// this mirrors the boundary loop of dt_object_recipe_compute -- the
+// fidelity reference -- with two justified deviations: (a) the prompts
+// were mapped to encode space on the GUI thread with the SESSION's own
+// preview-to-encode scale (the mapping a later re-capture inverts; it
+// agrees with the replay's export-pipe mapping because the normalised
+// coordinates are scale-invariant), and (b) the decodes run on the
+// session's already-encoded context through the stand-in, not on a
+// context of their own
+static gpointer _edit_replay_thread_func(gpointer data)
+{
+  _edit_replay_job_t *rj = data;
+  const dt_rf_recipe_t *recipe = &rj->recipe;
+  gboolean ok = TRUE;
+
+  // decode i covers points 0..i with the threshold recorded when that
+  // decode really ran; prev_mask is never reset between decodes, exactly
+  // like the interactive session (the encode reset it, so the first
+  // decode starts clean) and the headless replay
+  for(int i = 0; i <= rj->last_decode && ok; i++)
+  {
+    if(!recipe->points[i].decode_after)
+      continue;
+
+    const int n_prompt = i + 1;
+    _decode_job_t *djob = g_malloc0(sizeof(_decode_job_t));
+    djob->d = &rj->od;
+    djob->n_prompt_points = n_prompt;
+    // always FALSE, like every launch of the interactive path (see
+    // _launch_decode); do not attach first-click semantics to it
+    djob->reset_prev_mask = FALSE;
+    // the clamps mirror the conf reads of _launch_decode that recorded
+    // these values, and shield against a hand-edited recipe
+    djob->n_passes = CLAMP(recipe->refine_passes, 1, 3);
+    // headroom: one peak point per pass + 2 box corners (SAM only)
+    djob->points = g_new(dt_seg_point_t, n_prompt + djob->n_passes + 2);
+    for(int k = 0; k < n_prompt; k++)
+    {
+      djob->points[k].x = rj->enc_pts[k * 2 + 0];
+      djob->points[k].y = rj->enc_pts[k * 2 + 1];
+      djob->points[k].label = (int)recipe->points[k].label;
+    }
+    // seed for the connected-component filter: last positive point, as in
+    // _launch_decode
+    djob->seed_x = -1;
+    djob->seed_y = -1;
+    for(int k = n_prompt - 1; k >= 0; k--)
+      if(recipe->points[k].label == 1)
+      {
+        djob->seed_x = (int)rj->enc_pts[k * 2 + 0];
+        djob->seed_y = (int)rj->enc_pts[k * 2 + 1];
+        break;
+      }
+    djob->threshold = CLAMP(recipe->points[i].threshold, 0.3f, 0.9f);
+    djob->do_crf = recipe->crf_enabled != 0;
+    djob->crf_iter = CLAMP(recipe->crf_iterations, 1, 10);
+    djob->crf_sigma_color = CLAMP(recipe->crf_sigma_color, 1.0f, 50.0f);
+    djob->crf_w_bilateral = CLAMP(recipe->crf_w_bilateral, 0.5f, 30.0f);
+    djob->do_refine = recipe->ai_refine != 0 && !rj->od.refine_failed;
+    djob->refine_margin = CLAMPF(recipe->ai_refine_margin, 0.0f, 0.5f);
+
+    _decode_thread_func(djob);
+
+    // the interactive session absorbs a refine load failure gracefully --
+    // the replay must not: the reopened working state would silently lack
+    // the refinement every recorded decode had (headless replay rule)
+    if(recipe->ai_refine && rj->od.refine_failed)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] edit: refine model failed to load, cannot"
+               " reproduce the recorded refinement");
+      _decode_job_free(djob);
+      ok = FALSE;
+      break;
+    }
+
+    if(i == rj->last_decode && djob->out_mask)
+    {
+      rj->out_mask = djob->out_mask;
+      rj->out_w = djob->out_w;
+      rj->out_h = djob->out_h;
+      djob->out_mask = NULL;   // ownership moved
+    }
+    const gboolean decode_ok = (i == rj->last_decode)
+      ? (rj->out_mask != NULL)
+      : (djob->out_mask != NULL);
+    _decode_job_free(djob);
+    if(!decode_ok)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] edit: replayed decode at point %d failed",
+               i + 1);
+      ok = FALSE;
+    }
+  }
+
+  rj->ok = ok && rj->out_mask != NULL;
+  // last instruction: hand the result to the GUI side. the 100 ms poll
+  // timer keeps post_expose ticking; the edit machine is the ONLY joiner
+  // of this thread on the live path (_destroy_data joins on teardown)
+  g_atomic_int_set(&rj->done, 1);
+  return NULL;
+}
+
+// GUI thread, from post_expose at ENCODE_READY: the WAIT_ENCODE ->
+// REPLAYING transition. injects the recorded session into the live gui
+// state and starts the replay thread; any failure ends the edit
+// bookkeeping (EDIT_FAILED) and leaves the tool as a plain session
+static void _edit_replay_start(dt_masks_form_gui_t *gui, _object_data_t *d)
+{
+  // ENCODE_READY is signalled BEFORE the decoder warmup running on the
+  // same thread ends (see _encode_thread_func): starting the replay now
+  // would race the warmup on the shared segmentation context. join on the
+  // GUI side -- the warmup is bounded -- exactly like _launch_decode
+  // protects the first interactive decode. in practice the encode machine
+  // above already joined; this keeps the transition self-sufficient
+  if(d->encode_thread)
+  {
+    g_thread_join(d->encode_thread);
+    d->encode_thread = NULL;
+  }
+
+  // the replay validates its own precondition instead of trusting the
+  // invalidation branch, which is DEFERRED while the session is frozen: a
+  // geometry change during the encode (a ctrl+Z of a crop, seconds are
+  // available) leaves the encoding on the old state while the injection
+  // below maps the recorded points through the CURRENT distortion. every
+  // prompt would land on the wrong grid -- a systematic offset, not the
+  // sub-pixel variance the comment further down accepts -- and the whole
+  // replay would burn on false prompts before publishing a wrong mask the
+  // user can click for a frame
+  if(_compute_distort_hash(darktable.develop) != d->encoded_distort_hash)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] edit: the geometry moved while the session was"
+             " frozen, the encoding no longer reflects the live state");
+    dt_control_log(_("could not reload the recorded mask:"
+                     " the geometry changed"));
+    _edit_session_end(d, EDIT_FAILED);
+    _edit_drop_pinned_encode(d);
+    return;
+  }
+
+  const dt_rf_recipe_t *recipe = &d->edit_recipe;
+  const int n = recipe->n_points;
+
+  // the recorded decode boundaries drive the replay; a recipe without any
+  // defines no refinement chain (mirror of the headless replay's gate)
+  int last_decode = -1;
+  for(int i = 0; i < n; i++)
+    if(recipe->points[i].decode_after)
+      last_decode = i;
+
+  float wd, ht, iwidth, iheight;
+  dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
+
+  // the pinned encode guarantees the recorded dims; belt and braces, a
+  // mismatch here would put every replayed prompt on the wrong grid
+  if(last_decode < 0 || wd <= 0 || ht <= 0 || iwidth <= 0 || iheight <= 0
+     || d->encode_w != recipe->encode_w || d->encode_h != recipe->encode_h)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] edit: cannot start the replay (boundaries %d,"
+             " encode %dx%d vs recorded %dx%d)",
+             last_decode, d->encode_w, d->encode_h,
+             recipe->encode_w, recipe->encode_h);
+    dt_control_log(_("could not reload the recorded mask"));
+    _edit_session_end(d, EDIT_FAILED);
+    _edit_drop_pinned_encode(d);
+    return;
+  }
+
+  // the recipe describes the distortion state the prompts were clicked
+  // on; when the history moved since, the session -- like the headless
+  // replay -- proceeds on the CURRENT state: the input-space-normalised
+  // points make the injection largely self-correcting. divergence is
+  // confined to the render the decodes see, ONNX-variance class
+  if((dt_hash_t)recipe->distort_hash != d->encoded_distort_hash)
+    dt_print(DT_DEBUG_AI,
+             "[object mask] edit: distortion state differs from capture,"
+             " proceeding on the current state");
+
+  if(!gui->guipoints)
+    gui->guipoints = dt_masks_dynbuf_init(200000, "object guipoints");
+  if(!gui->guipoints_payload)
+    gui->guipoints_payload = dt_masks_dynbuf_init(100000,
+                                                  "object guipoints_payload");
+  if(!gui->guipoints || !gui->guipoints_payload)
+  {
+    dt_control_log(_("could not reload the recorded mask"));
+    _edit_session_end(d, EDIT_FAILED);
+    _edit_drop_pinned_encode(d);
+    return;
+  }
+
+  // inject the recorded clicks into the live gui state, in preview-pipe
+  // pixel space: the exact inverse of _capture_recipe's mapping
+  // (backtransform through the pipe, divided by the input dimensions).
+  // points a later crop pushed off-frame stay unclamped, like live clicks
+  // (only the decode seed clamps) -- accepted ONNX-variance-class case
+  float *pts = g_new(float, (size_t)n * 2);
+  for(int i = 0; i < n; i++)
+  {
+    pts[i * 2 + 0] = recipe->points[i].x * iwidth;
+    pts[i * 2 + 1] = recipe->points[i].y * iheight;
+  }
+  dt_dev_distort_transform(darktable.develop, pts, n);
+
+  dt_masks_dynbuf_reset(gui->guipoints);
+  dt_masks_dynbuf_reset(gui->guipoints_payload);
+  for(int i = 0; i < n; i++)
+  {
+    dt_masks_dynbuf_add_2(gui->guipoints, pts[i * 2 + 0], pts[i * 2 + 1]);
+    dt_masks_dynbuf_add(gui->guipoints_payload,
+                        (float)recipe->points[i].label);
+  }
+  gui->guipoints_count = n;
+  d->has_selection = TRUE;
+
+  // ... AND the decode marks (launched + per-boundary threshold): without
+  // them a later re-capture would record no boundary for the replayed
+  // prefix, and the gen-2 recipe's own headless replay would regenerate
+  // different bytes under the new fingerprint -- a silent store poisoning
+  // invisible to any visual check
+  _marks_resize(d, n);
+  for(int i = 0; i < n; i++)
+  {
+    _decode_mark_t *mark = &g_array_index(d->decode_marks, _decode_mark_t, i);
+    mark->launched = recipe->points[i].decode_after != 0;
+    mark->threshold = mark->launched ? recipe->points[i].threshold : 0.0f;
+  }
+
+  // prompts to session encode space with the session's own mapping -- the
+  // very scale _launch_decode applies to live clicks and _capture_recipe
+  // inverts at re-capture, keeping the round-trip stable. snapshotted on
+  // this thread: the replay never reads the live dynbufs
+  _edit_replay_job_t *rj = g_malloc0(sizeof(_edit_replay_job_t));
+  const float sx = (wd > 0) ? (float)d->encode_w / wd : 1.0f;
+  const float sy = (ht > 0) ? (float)d->encode_h / ht : 1.0f;
+  rj->enc_pts = g_new(float, (size_t)n * 2);
+  for(int i = 0; i < n; i++)
+  {
+    rj->enc_pts[i * 2 + 0] = pts[i * 2 + 0] * sx;
+    rj->enc_pts[i * 2 + 1] = pts[i * 2 + 1] * sy;
+  }
+  g_free(pts);
+  rj->recipe = *recipe;
+  rj->n_points = n;
+  rj->last_decode = last_decode;
+  // the stand-in: seg/env/refine ALIAS the session's -- the replay needs
+  // the session's encoded context, and the session gets the lazily loaded
+  // refinement context back at the join. the session data itself stays
+  // FROZEN (publication and clicks gated) until then
+  rj->od.env = d->env;
+  rj->od.seg = d->seg;
+  rj->od.refine = d->refine;
+  rj->od.refine_failed = d->refine_failed;
+
+  // non-modal busy indicator, the decode machine's own pattern; no decode
+  // can run while frozen, so no enter/leave interleaving is possible
+  if(!d->decode_busy_shown)
+  {
+    dt_control_busy_enter();
+    d->decode_busy_shown = TRUE;
+  }
+  dt_control_log(_("reloading the recorded mask..."));
+
+  d->edit_replay_job = rj;
+  g_atomic_int_set(&d->edit_pending, EDIT_REPLAYING);
+  d->edit_replay_thread
+    = g_thread_new("ai-mask-edit-replay", _edit_replay_thread_func, rj);
+}
+
+// GUI thread, from post_expose while REPLAYING: poll the replay, and on
+// completion perform the REPLAYING -> ACTIVE transition (or EDIT_FAILED)
+static void _edit_replay_finish(dt_masks_form_gui_t *gui, _object_data_t *d)
+{
+  _edit_replay_job_t *rj = d->edit_replay_job;
+  if(!rj)
+  {
+    // cannot happen on the live path; recover instead of freezing forever
+    _edit_session_end(d, EDIT_FAILED);
+    _edit_drop_pinned_encode(d);
+    return;
+  }
+  if(!g_atomic_int_get(&rj->done))
+  {
+    // keep the toast alive; control.c dedups the repeated message
+    dt_control_log(_("reloading the recorded mask..."));
+    return;
+  }
+
+  // join by the edit machine EXCLUSIVELY: _decode_finish never sees this
+  // thread, and the publication machine is gated while REPLAYING
+  if(d->edit_replay_thread)
+  {
+    g_thread_join(d->edit_replay_thread);
+    d->edit_replay_thread = NULL;
+  }
+  d->edit_replay_job = NULL;
+
+  // report the stand-in's refinement context back into the session: the
+  // CascadePSP lazy-load during the replay landed in the stand-in, on
+  // which the compute had exclusive rights
+  d->refine = rj->od.refine;
+  d->refine_failed = rj->od.refine_failed;
+
+  // the same precondition _edit_replay_start checked, re-checked before
+  // PUBLISHING: the geometry can also move while the replay runs (the
+  // invalidation branch is deferred for the whole freeze). publishing then
+  // would put a mask computed on the old grid on screen, clickable and
+  // finalisable for the frame that separates us from the next expose
+  const gboolean geometry_moved
+    = _compute_distort_hash(darktable.develop) != d->encoded_distort_hash;
+  if(geometry_moved)
+    dt_print(DT_DEBUG_AI,
+             "[object mask] edit: the geometry moved during the replay,"
+             " dropping its result");
+
+  if(rj->ok && !geometry_moved)
+  {
+    const dt_rf_recipe_t *recipe = &d->edit_recipe;
+
+    g_free(d->mask);
+    d->mask = rj->out_mask;
+    d->mask_w = rj->out_w;
+    d->mask_h = rj->out_h;
+    rj->out_mask = NULL;   // ownership moved
+
+    // restore the provenance scalars of the last replayed decode: the
+    // boundary loop above ran from the recipe, not through _launch_decode,
+    // so nothing recorded them -- without this a re-capture with no new
+    // click would read stale zeros and the gen-2 recipe would diverge.
+    // same clamps as the replay applied
+    d->last_do_crf = recipe->crf_enabled != 0;
+    d->last_crf_iter = CLAMP(recipe->crf_iterations, 1, 10);
+    d->last_crf_sigma_color = CLAMP(recipe->crf_sigma_color, 1.0f, 50.0f);
+    d->last_crf_w_bilateral = CLAMP(recipe->crf_w_bilateral, 0.5f, 30.0f);
+    d->last_do_refine = recipe->ai_refine != 0;
+    d->last_refine_margin = CLAMPF(recipe->ai_refine_margin, 0.0f, 0.5f);
+    d->last_n_passes = CLAMP(recipe->refine_passes, 1, 3);
+
+    // the decode marks were injected before the replay started; verify
+    // they are still coherent with the session state (nothing may touch
+    // them while frozen -- a mismatch here is a machine bug)
+    if(!d->decode_marks || (int)d->decode_marks->len != rj->n_points
+       || gui->guipoints_count != rj->n_points)
+      dt_print(DT_DEBUG_ALWAYS,
+               "[object mask] edit: injected state drifted during the"
+               " replay (marks %d, points %d, expected %d)",
+               d->decode_marks ? (int)d->decode_marks->len : -1,
+               gui->guipoints_count, rj->n_points);
+
+    // no-op baseline: the recipe this session would capture RIGHT NOW,
+    // before the user touched anything. closing on a byte-identical
+    // re-capture means the session produced nothing -- commit nothing
+    // then. snapshotting the recipe rather than a point count is what
+    // makes the criterion exhaustive: the recipe is by construction
+    // everything that reaches the mask, so a parameter the user changes
+    // without clicking (smoothing, cleanup, feather, refinement) is
+    // covered, and so is any field a later version adds
+    d->edit_baseline_valid = _capture_recipe(d, gui, &d->edit_baseline_recipe);
+    d->edit_dirty = FALSE;
+
+    _update_preview(d);
+    if(darktable.develop->proxy.masks.module)
+      darktable.develop->proxy.masks.list_change(
+        darktable.develop->proxy.masks.module);
+
+    g_atomic_int_set(&d->edit_pending, EDIT_ACTIVE);
+    dt_control_log_ack_all();
+    dt_control_log(_("recorded mask reloaded, refine with clicks or apply"));
+  }
+  else
+  {
+    dt_control_log_ack_all();
+    dt_control_log(geometry_moved
+                   ? _("could not reload the recorded mask:"
+                       " the geometry changed")
+                   : _("could not reload the recorded mask"));
+    _edit_session_end(d, EDIT_FAILED);
+    // drop the injected half-state: decode marks left alive would flow
+    // into the next capture as boundaries this session never produced
+    _clear_selection(gui);
+    // ... and the pinned encoding with it (recorded model, recorded dims,
+    // recorded cap): only then is the surviving tool really the "plain,
+    // empty session" the toast promises, and only then will its own
+    // captures describe the render they came from
+    _edit_drop_pinned_encode(d);
+  }
+
+  g_free(rj->enc_pts);
+  g_free(rj->out_mask);
+  g_free(rj);
+
+  if(d->decode_busy_shown)
+  {
+    dt_control_busy_leave();
+    d->decode_busy_shown = FALSE;
+  }
+  dt_control_queue_redraw_center();
+}
+
+gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
+                                   const dt_object_edit_target_t *target)
+{
+  // reserved for the in-place re-finalisation payload (C3); the C2 session
+  // closes through the existing gestures, which create a NEW mask
+  (void)target_module;
+
+  dt_develop_t *dev = darktable.develop;
+  if(!target || !target->has_recipe || !dt_rf_recipe_valid(&target->recipe))
+    return FALSE;
+  // opening a session goes through dt_masks_change_form_gui, which tears
+  // down whatever session is in flight -- same guard as every other
+  // creation entry point
+  if(dt_masks_shapes_locked())
+  {
+    dt_control_log(_("mask still computing, try again in a moment"));
+    return FALSE;
+  }
+  // C2 delivers family 1 (raster masks, recipe in the rasterfile params);
+  // the paths and context families arrive with C4/C5 on this same entry
+  if(target->kind != DT_OBJECT_EDIT_RASTER)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] edit: family %d not implemented yet",
+             target->kind);
+    return FALSE;
+  }
+  if(!dev || dt_view_get_current() != DT_VIEW_DARKROOM || !dev->form_gui
+     || !dt_is_valid_imgid(dev->image_storage.id))
+    return FALSE;
+  if(!dt_masks_object_available())
+  {
+    dt_control_log(_("AI model is not available. Check preferences > AI"));
+    return FALSE;
+  }
+  if(_edit_any_active())
+  {
+    dt_control_log(_("an AI mask edit session is already open"));
+    return FALSE;
+  }
+
+  // the model-gap verdict is taken AT OPENING and never stored: installs,
+  // rebinds and edits all change it under our feet. provisional C2 policy:
+  // only OK opens -- the recorded models must be installed identically for
+  // the session replay to be faithful. the INSTALLABLE dialogue of the
+  // plan ("install the model" / "edit with the current model, approximate
+  // starting point") lands with C6 once the download modal (D2) exists
+  {
+    dt_object_recipe_model_gap_t seg_gap;
+    const dt_object_recipe_model_gap_t gap
+      = _recipe_model_gap(&target->recipe, NULL, &seg_gap, NULL);
+    if(gap != DT_OBJECT_RECIPE_MODELS_OK)
+    {
+      if(gap == DT_OBJECT_RECIPE_MODELS_AI_OFF)
+        dt_control_log(_("cannot edit this mask: AI processing is disabled"));
+      else
+        dt_control_log(_("cannot edit this mask: model '%s' does not match"
+                         " the recorded state (see the AI models"
+                         " preferences, or use 'recompute mask')"),
+                       seg_gap == gap ? target->recipe.seg_model
+                                      : target->recipe.refine_model);
+      return FALSE;
+    }
+  }
+
+  // in the nominal repair flow the mask file is missing for the whole
+  // session: gate the proactive recompute of rasterfile.c gui_changed
+  // before anything can trigger it, or every gui_update would race a
+  // second inference stack against this session. cleared on EVERY session
+  // exit by _edit_session_end
+  dt_object_mask_edit_set_active("rasterfile", target->raster_multi_priority);
+
+  // drop the module focus BEFORE entering the session: request_focus tears
+  // the mask view down when a module loses focus, which would destroy the
+  // session created below. side effect wanted for C2: with no focused
+  // module the closing gesture wires the produced mask to no sink instead
+  // of blending it into the rasterfile instance that happened to hold
+  // focus (C3 carries the real target through the payload instead)
+  dt_iop_request_focus(NULL);
+
+  // enter the session by the masks panel's own add-shape pattern
+  dt_masks_form_t *spot = dt_masks_create(DT_MASKS_OBJECT);
+  dt_masks_change_form_gui(spot);
+  dt_masks_form_gui_t *gui = dev->form_gui;
+  gui->creation_module = NULL;
+  gui->group_selected = 0;
+  gui->edit_mode = DT_MASKS_EDIT_FULL;
+
+  // pre-seed the session data the first post_expose would otherwise
+  // create: the encode must start PINNED (recorded model, recorded dims),
+  // and the preview parameters must restore the recipe's recorded values
+  // -- a re-capture with no new click must reproduce them. deliberately
+  // no persistent-model restore: the slot holds the ACTIVE model, the
+  // session needs the recorded one loaded by id
+  _object_data_t *d = g_new0(_object_data_t, 1);
+  d->preview_cleanup = CLAMP(target->recipe.cleanup, 0, 100);
+  d->preview_smoothing = CLAMPF(target->recipe.smoothing, 0.0f, 1.3f);
+  d->preview_feather = CLAMPF(target->recipe.feather, 0.0f, 1.0f);
+  d->preview_refine = target->recipe.crf_enabled != 0;
+  d->edit_recipe = target->recipe;
+  // the session's parameters, all of them, from the recipe: read back
+  // through the _session_* accessors, which are the only readers of the
+  // corresponding preferences. the clamps are the ones _launch_decode
+  // applied when these values were recorded, and shield a hand-edited
+  // recipe; the accessors re-apply them, so a raw copy would do too
+  d->edit_threshold = CLAMP(target->recipe.threshold, 0.3f, 0.9f);
+  d->edit_n_passes = CLAMP(target->recipe.refine_passes, 1, 3);
+  d->edit_crf_iter = CLAMP(target->recipe.crf_iterations, 1, 10);
+  d->edit_crf_sigma_color = CLAMP(target->recipe.crf_sigma_color, 1.0f, 50.0f);
+  d->edit_crf_w_bilateral
+    = CLAMP(target->recipe.crf_w_bilateral, 0.5f, 30.0f);
+  d->edit_do_refine = target->recipe.ai_refine != 0;
+  d->edit_refine_margin = CLAMPF(target->recipe.ai_refine_margin, 0.0f, 0.5f);
+  // raw, like the recipe stores it: the MAX belongs to the use points
+  d->edit_render_size = target->recipe.render_size;
+  d->edit_model_pinned = TRUE;
+  // the focus was dropped just above, so this session has no sink. carried
+  // by the session because dev->gui_module can change under it: unfolding
+  // a module mid-session refocuses from NULL, which skips the focus-loss
+  // teardown and leaves the session alive with a module in hand
+  d->edit_no_sink = TRUE;
+  d->edit_valid = TRUE;
+  g_atomic_int_set(&d->edit_pending, EDIT_WAIT_ENCODE);
+  gui->scratchpad = d;
+  gui->scratchpad_cleanup = _free_data;
+
+  dt_print(DT_DEBUG_AI,
+           "[object mask] edit: session opened on rasterfile instance %d"
+           " (%d recorded points)",
+           target->raster_multi_priority, target->recipe.n_points);
+  dt_control_queue_redraw_center();
+  return TRUE;
+}
+
+// ---------------------------- recompute scheduling --------------------------
+//
+// the anti-respawn table: one entry per (recipe, image) currently being
+// recomputed, or having failed deterministically this session. its key is a
+// local hash of the recipe blob and the image id -- cheaper than the file
+// fingerprint (no image-cache access) and just as unique for this purpose.
+// entries are claimed BEFORE any compute starts, so the pipes the replay
+// itself runs (which traverse the very rasterfile instance being
+// regenerated) cannot re-enter
+
+typedef enum _recompute_state_t
+{
+  _RECOMPUTE_RUNNING = 1,
+  _RECOMPUTE_FAILED = 2,   // deterministic: no automatic retry this session
+} _recompute_state_t;
+
+static GMutex _recompute_mutex;
+static GHashTable *_recompute_table = NULL;   // gint64* key -> state
+
+static gint64 _recompute_key(const dt_rf_recipe_t *recipe,
+                             const dt_imgid_t imgid)
+{
+  dt_hash_t key = dt_hash(DT_INITHASH, recipe, sizeof(*recipe));
+  key = dt_hash(key, &imgid, sizeof(imgid));
+  return (gint64)key;
+}
+
+// claim the slot; FALSE when a recompute is running or has failed for good
+static gboolean _recompute_claim(const gint64 key)
+{
+  g_mutex_lock(&_recompute_mutex);
+  if(!_recompute_table)
+    _recompute_table
+      = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+  if(g_hash_table_lookup(_recompute_table, &key))
+  {
+    g_mutex_unlock(&_recompute_mutex);
+    return FALSE;
+  }
+  gint64 *k = g_new(gint64, 1);
+  *k = key;
+  g_hash_table_insert(_recompute_table, k,
+                      GINT_TO_POINTER(_RECOMPUTE_RUNNING));
+  g_mutex_unlock(&_recompute_mutex);
+  return TRUE;
+}
+
+// settle a claimed slot: only a deterministic failure pins it -- success
+// (the file exists) and transient outcomes (busy, cancelled, never ran)
+// free it for a later attempt
+static void _recompute_settle(const gint64 key,
+                              const dt_object_recipe_status_t status)
+{
+  g_mutex_lock(&_recompute_mutex);
+  if(_recompute_table)
+  {
+    if(status == DT_OBJECT_RECIPE_FAILED)
+    {
+      gint64 *k = g_new(gint64, 1);
+      *k = key;
+      g_hash_table_replace(_recompute_table, k,
+                           GINT_TO_POINTER(_RECOMPUTE_FAILED));
+    }
+    else
+      g_hash_table_remove(_recompute_table, &key);
+  }
+  g_mutex_unlock(&_recompute_mutex);
+}
+
+static gboolean _recompute_entry_failed(gpointer key,
+                                        gpointer value,
+                                        gpointer user_data)
+{
+  (void)key;
+  (void)user_data;
+  return GPOINTER_TO_INT(value) == _RECOMPUTE_FAILED;
+}
+
+void dt_object_recipe_reset_failed(void)
+{
+  guint cleared = 0;
+  g_mutex_lock(&_recompute_mutex);
+  if(_recompute_table)
+    cleared = g_hash_table_foreach_remove(_recompute_table,
+                                          _recompute_entry_failed, NULL);
+  g_mutex_unlock(&_recompute_mutex);
+  if(cleared)
+    dt_print(DT_DEBUG_AI,
+             "[object mask] recompute table: %u pinned failure%s cleared",
+             cleared, cleared > 1 ? "s" : "");
+}
+
+typedef struct _recompute_job_t
+{
+  dt_rf_recipe_t recipe;
+  dt_imgid_t imgid;
+  gint64 key;
+  gboolean ran;
+  dt_object_recipe_status_t status;
+} _recompute_job_t;
+
+// GUI thread: a recompute landed for the displayed image. the failed reads
+// left the raster module's caches unhashed (auto-repair), so fresh pipe
+// runs reread the file; the thumbnails rendered with a zeroed mask in the
+// meantime are dropped from the mipmap cache
+static gboolean _recompute_landed_idle(gpointer data)
+{
+  const dt_imgid_t imgid = GPOINTER_TO_INT(data);
+
+  dt_mipmap_cache_remove(imgid);
+
+  // test the view before touching dev: leaving the darkroom can free the
+  // develop while this idle is already queued
+  dt_develop_t *dev = darktable.develop;
+  if(dt_view_get_current() != DT_VIEW_DARKROOM
+     || !dev || dev->image_storage.id != imgid)
+    return G_SOURCE_REMOVE;
+
+  // the image is about to change under the user's eyes, and he did not ask
+  // for it: say what happened. emitted HERE and not from the job thread on
+  // purpose -- past the two tests above, this is exactly the moment the
+  // visible image is replaced. symmetric with the failure toasts below,
+  // which say why it did NOT change
+  dt_control_log_ack_all();
+  dt_control_log(_("AI mask recomputed"));
+
+  // all pipes, not only the center: the preview rendered a zeroed mask too
+  dt_dev_reprocess_all(dev);
+  return G_SOURCE_REMOVE;
+}
+
+// the headless recompute. see _job_step: the message is the very one the
+// scheduling emitted, so the toast the user already reads stays alive for
+// the whole job instead of expiring after five seconds
+static gboolean _recompute_keep_going(void *p)
+{
+  return _job_step((dt_job_t *)p, _("recomputing the AI mask..."));
+}
+
+static int32_t _recompute_job_run(dt_job_t *job)
+{
+  _recompute_job_t *p = dt_control_job_get_params(job);
+  p->ran = TRUE;
+  p->status = dt_object_recipe_compute(&p->recipe, p->imgid,
+                                       _recompute_keep_going, job);
+  if(p->status == DT_OBJECT_RECIPE_OK && dt_control_running())
+    g_idle_add(_recompute_landed_idle, GINT_TO_POINTER(p->imgid));
+  else if(p->status == DT_OBJECT_RECIPE_FAILED && dt_control_running())
+  {
+    // the mask stays zeroed and the user needs to know WHY, and the way
+    // out: diagnose the model gap the replay refused on and name both
+    // the cause and the actionable place. 'recompute mask' in the raster
+    // masks module rebinds the recipe to the models installed NOW
+    dt_object_recipe_model_gap_t seg_gap;
+    const dt_object_recipe_model_gap_t gap
+      = _recipe_model_gap(&p->recipe, NULL, &seg_gap, NULL);
+    // the model the combined verdict came from; the segmentation model
+    // wins ties, being the one every recipe records
+    const gboolean seg_at_fault = seg_gap == gap;
+    const char *id = seg_at_fault ? p->recipe.seg_model
+                                  : p->recipe.refine_model;
+    const char *recorded = seg_at_fault
+      ? p->recipe.seg_model_version
+      : p->recipe.refine_model_version;
+    const char *installed = dt_ai_model_get_version(id);
+    switch(gap)
+    {
+      case DT_OBJECT_RECIPE_MODELS_INSTALLABLE:
+        dt_control_log(_("AI mask not regenerated: model '%s' (v%s) is"
+                         " not installed.\ninstall it in the AI models"
+                         " preferences, or use 'recompute mask' in the"
+                         " raster masks module to redo it with the"
+                         " current model"),
+                       id, recorded);
+        break;
+      case DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND:
+        dt_control_log(_("AI mask not regenerated: it records model '%s'"
+                         " v%s, v%s is installed.\nupdating the model may"
+                         " restore the exact mask; 'recompute mask' in"
+                         " the raster masks module redoes it with the"
+                         " current model"),
+                       id, recorded, installed);
+        break;
+      case DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD:
+        if(!g_strcmp0(installed, recorded))
+          // the refine edge case: the recorded model is installed at the
+          // recorded version but another model is the active one
+          dt_control_log(_("AI mask not regenerated: model '%s' is"
+                           " installed but not active.\nactivate it in"
+                           " the AI models preferences, or use 'recompute"
+                           " mask' in the raster masks module to redo it"
+                           " with the current model"),
+                         id);
+        else
+          dt_control_log(_("AI mask not regenerated: it records model"
+                           " '%s' v%s, the newer v%s is installed.\nuse"
+                           " 'recompute mask' in the raster masks module"
+                           " to redo it with the installed model"),
+                         id, recorded, installed);
+        break;
+      case DT_OBJECT_RECIPE_MODELS_UNKNOWN:
+        dt_control_log(_("AI mask not regenerated: model '%s' is not"
+                         " known to this darktable.\ninstall its .dtmodel"
+                         " file, or use 'recompute mask' in the raster"
+                         " masks module to redo it with the current"
+                         " model"),
+                       id);
+        break;
+      case DT_OBJECT_RECIPE_MODELS_AI_OFF:
+        dt_control_log(_("AI mask not regenerated: AI processing is"
+                         " disabled.\nenable it in the processing"
+                         " preferences"));
+        break;
+      default:
+        // models check out: the failure has another, rarer cause
+        // (unusable recipe, render failure) -- point at the trace
+        dt_control_log(_("AI mask not regenerated (run with -d ai for"
+                         " details).\nuse 'recompute mask' in the raster"
+                         " masks module to redo it"));
+        break;
+    }
+  }
+  return p->status == DT_OBJECT_RECIPE_OK ? 0 : 1;
+}
+
+// runs on every outcome the job system takes charge of -- finished,
+// cancelled, replaced, discarded. a job still sitting in the queue when
+// the process exits never reaches it: its params and table entry leak
+// once, harmlessly, with the process
+static void _recompute_job_destroy(void *data)
+{
+  _recompute_job_t *p = data;
+  // a job cancelled before running keeps status FAILED from init: treat
+  // not-ran as transient so a later trigger may claim the slot again
+  _recompute_settle(p->key, p->ran ? p->status : DT_OBJECT_RECIPE_RETRY);
+  g_free(p);
+}
+
+gboolean dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
+                                             const dt_imgid_t imgid)
+{
+  if(!dt_rf_recipe_valid(recipe) || !dt_is_valid_imgid(imgid))
+    return FALSE;
+  // asynchronous by contract: without a running job system (darktable-cli,
+  // GUI teardown) there is nobody to run the job -- callers needing the
+  // file synchronously use dt_object_recipe_recompute_now instead
+  if(!dt_control_running())
+    return FALSE;
+
+  const gint64 key = _recompute_key(recipe, imgid);
+  if(!_recompute_claim(key))
+    return FALSE;
+
+  _recompute_job_t *p = g_new0(_recompute_job_t, 1);
+  p->recipe = *recipe;
+  p->imgid = imgid;
+  p->key = key;
+  p->status = DT_OBJECT_RECIPE_FAILED;
+
+  dt_job_t *job = dt_control_job_create(_recompute_job_run,
+                                        "AI mask recompute");
+  if(!job)
+  {
+    _recompute_settle(key, DT_OBJECT_RECIPE_RETRY);
+    g_free(p);
+    return FALSE;
+  }
+  dt_control_job_set_params(job, p, _recompute_job_destroy);
+  dt_control_job_add_progress(job, _("recomputing AI mask"), TRUE);
+  // announce BEFORE queueing: a worker can pick the job up immediately and
+  // fail with a diagnosis, and that diagnosis must not be overwritten by
+  // this announcement arriving late.
+  // announce it HERE, at the single point the three triggers funnel
+  // through (the pixelpipe safety net and the proactive gui_update of
+  // iop/rasterfile.c, plus its explicit button): a recompute the user
+  // never asked for takes tens of seconds and used to be completely
+  // silent, its only trace an entry at the bottom of the LEFT panel --
+  // out of the darkroom's field of work and often folded away.
+  // dt_control_log is thread-safe, so the pixelpipe trigger may use it
+  dt_control_log(_("recomputing the AI mask..."));
+  return TRUE;
+}
+
+gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe)
+{
+  if(!dt_rf_recipe_valid(recipe))
+    return FALSE;
+
+  char *seg_id = dt_ai_models_get_active_for_task("mask");
+  if(!seg_id || !*seg_id)
+  {
+    g_free(seg_id);
+    return FALSE;
+  }
+  memset(recipe->seg_model, 0, sizeof(recipe->seg_model));
+  memset(recipe->seg_model_version, 0, sizeof(recipe->seg_model_version));
+  g_strlcpy(recipe->seg_model, seg_id, sizeof(recipe->seg_model));
+  const char *seg_ver = dt_ai_model_get_version(seg_id);
+  if(seg_ver)
+    g_strlcpy(recipe->seg_model_version, seg_ver,
+              sizeof(recipe->seg_model_version));
+  g_free(seg_id);
+
+  if(recipe->ai_refine)
+  {
+    char *refine_id = dt_ai_models_get_active_for_task("refine");
+    if(!refine_id || !*refine_id)
+    {
+      // the recipe promises contour refinement and no refine model is
+      // active: rebinding would drop a recorded processing step
+      g_free(refine_id);
+      return FALSE;
+    }
+    memset(recipe->refine_model, 0, sizeof(recipe->refine_model));
+    memset(recipe->refine_model_version, 0,
+           sizeof(recipe->refine_model_version));
+    g_strlcpy(recipe->refine_model, refine_id, sizeof(recipe->refine_model));
+    const char *refine_ver = dt_ai_model_get_version(refine_id);
+    if(refine_ver)
+      g_strlcpy(recipe->refine_model_version, refine_ver,
+                sizeof(recipe->refine_model_version));
+    g_free(refine_id);
+  }
+  return TRUE;
+}
+
+gboolean dt_object_recipe_recompute_now(const dt_rf_recipe_t *recipe,
+                                        const dt_imgid_t imgid)
+{
+  if(!dt_rf_recipe_valid(recipe) || !dt_is_valid_imgid(imgid))
+    return FALSE;
+
+  const gint64 key = _recompute_key(recipe, imgid);
+  if(!_recompute_claim(key))
+    return FALSE;
+
+  const dt_object_recipe_status_t status
+    = dt_object_recipe_compute(recipe, imgid, NULL, NULL);
+  _recompute_settle(key, status);
+  return status == DT_OBJECT_RECIPE_OK;
 }
 
 // transform mask-space forms to input-normalized coords and register them,
-// takes ownership of `forms` and `signs` lists (forms are appended to dev->forms)
+// takes ownership of `forms` and `signs` lists (forms are appended to dev->forms).
+// `gui` carries the live session whose provenance recipe is captured into
+// the produced group's trailer; NULL skips the capture
 static dt_masks_form_t *
 _register_vectorized_forms(dt_iop_module_t *module,
+                           dt_masks_form_gui_t *gui,
                            GList *forms,
                            GList *signs,
                            const int mask_w,
@@ -1039,6 +4998,23 @@ _register_vectorized_forms(dt_iop_module_t *module,
   dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
   snprintf(grp->name, sizeof(grp->name), "%s #%d", group_prefix, (int)grp_nb);
 
+  // form ids come from a session counter reset at startup: collisions with
+  // loaded forms (or between siblings) are possible, and the provenance
+  // trailer resolves children BY id -- ensure unicity before registration,
+  // like the native route does
+  for(GList *l = forms; l; l = g_list_next(l))
+  {
+    dt_masks_form_t *f = l->data;
+    gboolean clash = TRUE;
+    while(clash)
+    {
+      clash = dt_masks_get_from_id(dev, f->formid) != NULL;
+      for(GList *k = forms; !clash && k != l; k = g_list_next(k))
+        clash = ((dt_masks_form_t *)k->data)->formid == f->formid;
+      if(clash) f->formid++;
+    }
+  }
+
   // register all path forms so they exist in dev->forms
   for(GList *l = forms; l; l = g_list_next(l))
   {
@@ -1063,6 +5039,15 @@ _register_vectorized_forms(dt_iop_module_t *module,
   // assignment)
   dev->forms = g_list_append(dev->forms, grp);
 
+  // stamp the provenance trailer on the fully assembled group: this
+  // classic route finalises a prompt session too, so its group is made
+  // re-editable by ai exactly like the native route's groups. a session
+  // the recipe cannot describe simply leaves the trailer zeroed
+  _object_data_t *sd = gui ? _get_data(gui) : NULL;
+  dt_rf_recipe_t recipe;
+  if(sd && _capture_recipe(sd, gui, &recipe))
+    _ai_trailer_stamp(dev->forms, grp, &recipe);
+
   g_list_free(forms);
   g_list_free(signs);
 
@@ -1085,7 +5070,7 @@ _finalize_from_preview(dt_iop_module_t *module, dt_masks_form_gui_t *gui)
   d->preview_forms = NULL;
   d->preview_signs = NULL;
 
-  return _register_vectorized_forms(module, forms, signs, mw, mh);
+  return _register_vectorized_forms(module, gui, forms, signs, mw, mh);
 }
 
 // finalize: vectorize the mask and register as a group of path forms,
@@ -1107,16 +5092,20 @@ static dt_masks_form_t *_finalize_mask(dt_iop_module_t *module,
   for(size_t i = 0; i < n; i++)
     inv_mask[i] = 1.0f - d->mask[i];
 
-  const int cleanup = dt_conf_get_int(CONF_OBJECT_CLEANUP_KEY);
-  const float smoothing = dt_conf_get_float(CONF_OBJECT_SMOOTHING_KEY);
-  const float thresh = 1.0f - CLAMP(dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY),
-                                    0.3f, 0.9f);
+  // the session's own vectorisation parameters, not the conf: they are
+  // what the preview showed and what _capture_recipe records, and in an
+  // edit session they come from the recipe. outside a session the two
+  // agree anyway (the mutators keep preview_* and conf in step)
+  const int cleanup = d->preview_cleanup;
+  const float smoothing = d->preview_smoothing;
+  const float thresh = 1.0f - _session_threshold(d);
   GList *signs = NULL;
   GList *forms = ras2forms(inv_mask, d->mask_w, d->mask_h, NULL,
-                           thresh, cleanup, (double)smoothing, &signs);
+                           thresh, cleanup, (double)smoothing, 0.3, &signs);
   g_free(inv_mask);
 
-  return _register_vectorized_forms(module, forms, signs, d->mask_w, d->mask_h);
+  return _register_vectorized_forms(module, gui, forms, signs,
+                                    d->mask_w, d->mask_h);
 }
 
 // --- mask event handlers ---
@@ -1133,15 +5122,21 @@ static int _object_events_mouse_scrolled(dt_iop_module_t *module,
 {
   _object_data_t *d = _get_data(gui);
 
-  // vectorization parameter adjustment (after first click)
-  if(gui->creation && d && d->has_selection && d->mask)
+  // vectorization parameter adjustment (after first click). the explicit
+  // freeze test is the contract, not the d->mask NULL that happens to
+  // stand in for it while the machine replays
+  if(gui->creation && d && d->has_selection && d->mask && !_edit_frozen(d))
   {
     if(dt_modifier_is(state, 0))
     {
       // plain scroll: adjust smoothing (potrace alphamax)
       d->preview_smoothing = CLAMP(d->preview_smoothing + (up ? 0.05f : -0.05f),
                                    0.0f, 1.3f);
-      dt_conf_set_float(CONF_OBJECT_SMOOTHING_KEY, d->preview_smoothing);
+      // an edit session works on the RECIPE's parameters: writing them
+      // back would destroy the user's global preference, the rule
+      // _session_threshold states for the threshold
+      if(!d->edit_valid)
+        dt_conf_set_float(CONF_OBJECT_SMOOTHING_KEY, d->preview_smoothing);
       _update_preview(d);
       dt_toast_log(_("smoothing: %3.2f"), d->preview_smoothing);
       dt_dev_masks_list_change(darktable.develop);
@@ -1152,7 +5147,8 @@ static int _object_events_mouse_scrolled(dt_iop_module_t *module,
     {
       // shift+scroll: adjust cleanup (potrace turdsize)
       d->preview_cleanup = CLAMP(d->preview_cleanup + (up ? 5 : -5), 0, 100);
-      dt_conf_set_int(CONF_OBJECT_CLEANUP_KEY, d->preview_cleanup);
+      if(!d->edit_valid)
+        dt_conf_set_int(CONF_OBJECT_CLEANUP_KEY, d->preview_cleanup);
       _update_preview(d);
       dt_toast_log(_("cleanup: %d"), d->preview_cleanup);
       dt_dev_masks_list_change(darktable.develop);
@@ -1161,7 +5157,10 @@ static int _object_events_mouse_scrolled(dt_iop_module_t *module,
     }
   }
 
-  // opacity control (ctrl+scroll)
+  // opacity control (ctrl+scroll). deliberately outside the session
+  // boundary: opacity is not part of the recipe, it belongs to the group
+  // entry the commit creates -- so it cannot make a session dirty, and a
+  // no-op close (which creates no group) has nothing to apply it to
   if(gui->creation && dt_modifier_is(state, GDK_CONTROL_MASK))
   {
     float opacity = dt_conf_get_float("plugins/darkroom/masks/opacity");
@@ -1175,18 +5174,30 @@ static int _object_events_mouse_scrolled(dt_iop_module_t *module,
   return 0;
 }
 
-// clear accumulated points, mask preview, and iterative refinement state
+// clear accumulated points, mask preview, and iterative refinement state.
+// must not be called while a decode is RUNNING (the caller's guard ensures
+// that); a finished-but-unpublished result is drained here so a posthumous
+// publication cannot resurrect the mask we are about to clear
 static void _clear_selection(dt_masks_form_gui_t *gui)
 {
   _object_data_t *d = _get_data(gui);
   if(!d)
     return;
 
+  // an edit session that cleared its points can never report a no-op
+  // again, even if the user clicks back to the same count: the replayed
+  // chain is gone
+  if(d->edit_valid)
+    d->edit_dirty = TRUE;
+
+  _decode_drain(gui);
+
   if(gui->guipoints)
     dt_masks_dynbuf_reset(gui->guipoints);
   if(gui->guipoints_payload)
     dt_masks_dynbuf_reset(gui->guipoints_payload);
   gui->guipoints_count = 0;
+  _marks_resize(d, 0);
 
   g_free(d->mask);
   d->mask = NULL;
@@ -1200,6 +5211,32 @@ static void _clear_selection(dt_masks_form_gui_t *gui)
   _free_preview_forms(d);
 
   dt_control_queue_redraw_center();
+}
+
+// the no-op criterion of an edit session: re-capturing the session right
+// now would yield the very recipe snapshotted at the end of the replay,
+// byte for byte. same recipe = same fingerprint = same file = nothing to
+// commit, so the session closes without creating a duplicate mask, a
+// duplicate file and a history item on every open/close.
+//
+// a memcmp of the blob, deliberately: the recipe IS the description of
+// what the session produces, so anything that would change the produced
+// mask changes it -- points, decode boundaries, thresholds, vectorisation
+// parameters, models, encode geometry -- and any field a later version
+// adds is covered without touching this code. enumerating the mutators
+// instead (the point count this replaced) leaves every parameter changed
+// without a click silently discarded
+static gboolean _edit_recipe_unchanged(_object_data_t *d,
+                                       dt_masks_form_gui_t *gui)
+{
+  if(!d->edit_baseline_valid)
+    return FALSE;
+  dt_rf_recipe_t now;
+  // a session the recipe cannot describe is never a no-op: it has no
+  // stable identity to compare, so let it commit
+  if(!_capture_recipe(d, gui, &now))
+    return FALSE;
+  return memcmp(&now, &d->edit_baseline_recipe, sizeof(now)) == 0;
 }
 
 static int _object_events_button_pressed(dt_iop_module_t *module,
@@ -1224,17 +5261,41 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
 
   _object_data_t *d = _get_data(gui);
 
+  // the edit machine holds the session frozen between its opening and the
+  // end of the replay: every pointer gesture is refused with a discreet
+  // message, the machine in post_expose is the only actor. structural: a
+  // clear would tear down the very state the replay computes on, a click
+  // would start a decode on the replay's ONNX context. the parameter
+  // mutators (scroll, panel sliders) carry the same test.
+  //
+  // there is NO cancel gesture during the freeze -- the masks flow has no
+  // Escape handler. the exits are the generic ones (module refocus, image
+  // change, view change), all of which reach dt_masks_clear_form_gui ->
+  // _free_data, which ends the bookkeeping at once and defers the
+  // destruction until the replay thread joins. bounded by encode + replay
+  if(gui->creation && d && _edit_frozen(d))
+  {
+    dt_control_log(_("reloading the recorded mask..."));
+    return 1;
+  }
+
   if(gui->creation && which == 1
      && dt_modifier_is(state, GDK_CONTROL_MASK | GDK_SHIFT_MASK))
   {
-    // ctrl+shift+click: clear selection (only after first selection)
-    if(d && d->has_selection && d->encode_state == ENCODE_READY)
+    // ctrl+shift+click: clear selection (only after first selection),
+    // blocked while a compute runs
+    if(d && d->has_selection
+       && g_atomic_int_get(&d->encode_state) == ENCODE_READY
+       && g_atomic_int_get(&d->decode_state) != DECODE_RUNNING)
     {
       _clear_selection(gui);
       if(darktable.develop->proxy.masks.module)
         darktable.develop->proxy.masks.list_change(
           darktable.develop->proxy.masks.module);
     }
+    else if(d && d->has_selection
+            && g_atomic_int_get(&d->decode_state) == DECODE_RUNNING)
+      dt_control_log(_("mask still computing, try again in a moment"));
     return 1;
   }
   else if(gui->creation && which == 1)
@@ -1257,20 +5318,104 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
   }
   else if(gui->creation && which == 3)
   {
-    // don't exit while background threads are running
-    if(d && g_atomic_int_get(&d->encode_state) == ENCODE_RUNNING)
-      return 1;
+    // a session opened with no sink closes into no sink, whatever the
+    // darkroom did since: unfolding a module mid-session refocuses from
+    // NULL, which skips the focus-loss teardown, so dev->gui_module (the
+    // module this handler is called with) may now be a module the user
+    // never asked to receive the mask. the decision belongs to the
+    // session, taken once at its opening -- never re-derived here.
+    // covers the four closing paths below in one place
+    if(d && d->edit_no_sink)
+      module = NULL;
 
-    // shift+right-click: save raster mask before vectorization
+    // don't exit while background threads are running, and never
+    // finalise/vectorise while a decode is in flight or unpublished: the
+    // result would silently ignore the user's latest clicks
+    if(d && (g_atomic_int_get(&d->encode_state) == ENCODE_RUNNING
+             || g_atomic_int_get(&d->decode_state) != DECODE_IDLE
+             || d->decode_pending))
+    {
+      dt_control_log(_("mask still computing, try again in a moment"));
+      return 1;
+    }
+
+    // an edit session closed with no change commits NOTHING: the float
+    // round-trip of the re-captured coordinates would otherwise produce a
+    // recipe differing in the last bits -- a fake new mask, a new file and
+    // a new history item on every open/close. covers both closing
+    // gestures; a clear set edit_dirty, so "clicked back to the same
+    // state" never passes as unchanged even if the recipe matched
+    if(d && d->edit_valid
+       && g_atomic_int_get(&d->edit_pending) == EDIT_ACTIVE
+       && !d->edit_dirty
+       && _edit_recipe_unchanged(d, gui))
+    {
+      dt_control_log(_("mask unchanged, nothing to apply"));
+      gui->creation = FALSE;
+      gui->creation_continuous = FALSE;
+      gui->creation_continuous_module = NULL;
+      _free_data(gui);   // ends the edit bookkeeping too
+      dt_masks_dynbuf_free(gui->guipoints);
+      dt_masks_dynbuf_free(gui->guipoints_payload);
+      gui->guipoints = NULL;
+      gui->guipoints_payload = NULL;
+      gui->guipoints_count = 0;
+      dt_control_hinter_message("");
+      dt_masks_change_form_gui(NULL);
+      dt_control_queue_redraw_center();
+      return 1;
+    }
+
+    // shift+right-click: finalise a precise raster mask at native
+    // resolution, on a worker job. separate from the vector path on purpose:
+    // this one has no editable points, and says so by being a distinct gesture
     if(d && d->has_selection && d->mask
        && dt_modifier_is(state, GDK_SHIFT_MASK))
     {
-      const float thresh = CLAMP(
-        dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY), 0.3f, 0.9f);
-      _save_raster_mask(d->mask, d->mask_w, d->mask_h, thresh);
+      if(!_launch_native_finalize(d, gui, module, FALSE))
+        return 1;   // busy: keep the session, the user can retry
+
+      // leave creation mode right away: the mask will be wired into the
+      // module automatically when the job lands, there is nothing left to
+      // do here. mirrors the vector path's exit sequence below.
+      gui->creation = FALSE;
+      gui->creation_continuous = FALSE;
+      gui->creation_continuous_module = NULL;
+      _free_data(gui);
+      dt_masks_dynbuf_free(gui->guipoints);
+      dt_masks_dynbuf_free(gui->guipoints_payload);
+      gui->guipoints = NULL;
+      gui->guipoints_payload = NULL;
+      gui->guipoints_count = 0;
+      dt_control_hinter_message("");
+      dt_masks_change_form_gui(NULL);
+      dt_control_queue_redraw_center();
+      return 1;
     }
 
-    // right-click: finalize mask (prefer cached preview forms)
+    // right-click: precise paths -- same native finalisation as the raster
+    // gesture, traced by potrace at 1:1 instead of written to a file. falls
+    // back to the classic working-grid vectorisation when the job is busy
+    // or when there is no refined mask to work from
+    if(d && d->has_selection && d->mask
+       && _launch_native_finalize(d, gui, module, TRUE))
+    {
+      gui->creation = FALSE;
+      gui->creation_continuous = FALSE;
+      gui->creation_continuous_module = NULL;
+      _free_data(gui);
+      dt_masks_dynbuf_free(gui->guipoints);
+      dt_masks_dynbuf_free(gui->guipoints_payload);
+      gui->guipoints = NULL;
+      gui->guipoints_payload = NULL;
+      gui->guipoints_count = 0;
+      dt_control_hinter_message("");
+      dt_masks_change_form_gui(NULL);
+      dt_control_queue_redraw_center();
+      return 1;
+    }
+
+    // classic fallback: vectorize the working-grid mask immediately
     dt_masks_form_t *new_grp = NULL;
     if(d && d->preview_forms)
       new_grp = _finalize_from_preview(module, gui);
@@ -1373,6 +5518,19 @@ static int _object_events_button_released(dt_iop_module_t *module,
   if(!gui->guipoints_payload)
     return 1;
 
+  // the provenance recipe describes at most DT_RF_RECIPE_MAX_POINTS clicks;
+  // one more and the session could never be regenerated from its recipe.
+  // refuse the point outright -- a hard, explained limit beats a mask that
+  // silently lost its provenance (and 32 prompts is far beyond any real
+  // refinement session; ctrl+shift+click restarts from zero)
+  if(gui->guipoints_count >= DT_RF_RECIPE_MAX_POINTS)
+  {
+    dt_control_log(_("maximum of %d points reached, "
+                     "ctrl+shift+click to start over"),
+                   DT_RF_RECIPE_MAX_POINTS);
+    return 1;
+  }
+
   // click: foreground point, shift+click: background point (only
   // after first selection)
   const float label = (d->has_selection && dt_modifier_is(state, GDK_SHIFT_MASK))
@@ -1380,13 +5538,12 @@ static int _object_events_button_released(dt_iop_module_t *module,
   dt_masks_dynbuf_add_2(gui->guipoints, d->drag_start_x, d->drag_start_y);
   dt_masks_dynbuf_add(gui->guipoints_payload, label);
   gui->guipoints_count++;
+  _marks_resize(d, gui->guipoints_count);   // new click: no decode yet
   d->has_selection = TRUE;
 
-  _run_decoder(gui);
-
-  // auto-update vectorization preview after each decode
-  if(d->mask)
-    _update_preview(d);
+  // coalescing decided inside _launch_decode (single source of truth); the
+  // vectorization preview updates at publication time (_decode_finish)
+  _launch_decode(gui);
 
   // refresh mask properties panel so sliders update for
   // the current creation step (size vs cleanup/smoothing)
@@ -1437,6 +5594,14 @@ static int _object_events_mouse_moved(dt_iop_module_t *module,
 static gboolean _modifier_poll(gpointer data)
 {
   (void)data;
+  // the same 100 ms tick carries the shape-button lock. this timer is
+  // created with the encode (and with any decode that outlives it) and
+  // removed with the session data, so it ticks over every instant a
+  // compute can own the session. re-deriving the sensitivity here instead
+  // of pairing it with an inverse call is what makes a stuck button
+  // impossible: a module whose blend gui is built or rebuilt in the middle
+  // of a compute is caught by the next tick, without anybody knowing
+  dt_masks_update_shapes_sensitivity();
   dt_control_queue_redraw_center();
   return G_SOURCE_CONTINUE;
 }
@@ -1464,6 +5629,10 @@ static void _object_events_post_expose(cairo_t *cr,
     d->preview_feather = dt_conf_get_float(CONF_OBJECT_FEATHER_KEY);
     d->preview_refine = dt_conf_key_exists(CONF_OBJECT_REFINE_BOUNDARY_KEY)
                         && dt_conf_get_bool(CONF_OBJECT_REFINE_BOUNDARY_KEY);
+    // no edit session on this data (edit sessions pre-seed their own
+    // scratchpad in dt_object_mask_edit_begin); NAN marks the threshold
+    // override as absent
+    d->edit_threshold = NAN;
 
     // restore persistent model (stays loaded across mask sessions)
     // if the active model changed in preferences, discard the old one
@@ -1510,15 +5679,38 @@ static void _object_events_post_expose(cairo_t *cr,
   const dt_imgid_t cur_imgid = darktable.develop->image_storage.id;
   const int cur_state = g_atomic_int_get(&d->encode_state);
   if((cur_state == ENCODE_READY || cur_state == ENCODE_ERROR)
+     // deferred while a decode runs: it computes on the old geometry and
+     // must land (and be drained) before the teardown. clicks during the
+     // deferral are transiently misaligned and repaired by this reset
+     && g_atomic_int_get(&d->decode_state) != DECODE_RUNNING
+     // likewise deferred while the edit machine holds the session frozen:
+     // the replay thread computes on d->seg, this reset would race it.
+     // the machine's exit (ACTIVE or FAILED) re-runs this check
+     && !_edit_frozen(d)
      && (d->encoded_imgid != cur_imgid
          || d->encoded_distort_hash != _compute_distort_hash(darktable.develop)))
   {
+    // an edit session whose image or geometry just moved has lost its
+    // replayed state: say so -- the reset below is otherwise completely
+    // silent, the points simply vanish -- and end the edit bookkeeping.
+    // called UNCONDITIONALLY: past this branch the tool IS a plain
+    // creation session on the new state, so a remanent EDIT_FAILED left by
+    // an earlier failure must not survive to describe it
+    if(d->edit_valid)
+      dt_control_log(_("edit session dropped: the geometry changed"));
+    _edit_session_end(d, EDIT_NONE);
+    // no result computed on the old geometry may be published past this
+    _decode_drain(gui);
     if(d->encode_thread)
     {
       g_thread_join(d->encode_thread);
       d->encode_thread = NULL;
     }
-    if(d->seg)
+    // a model loaded BY ID served the edit session that just ended: drop
+    // it through the one function that knows how (safe here, the encode
+    // thread is joined and no decode runs) so the fresh encode below
+    // reloads the ACTIVE model at the current cap, like any plain session
+    if(!_edit_drop_pinned_encode(d) && d->seg)
       dt_seg_reset_encoding(d->seg);
     g_free(d->mask);
     d->mask = NULL;
@@ -1533,12 +5725,15 @@ static void _object_events_post_expose(cairo_t *cr,
     if(gui->guipoints_payload)
       dt_masks_dynbuf_reset(gui->guipoints_payload);
     gui->guipoints_count = 0;
+    _marks_resize(d, 0);
   }
 
   // eager encoding: load model and encode image as soon as tool opens
   if(d->encode_state == ENCODE_IDLE)
   {
-    dt_control_log(_("object mask: analyzing image..."));
+    dt_control_log(g_atomic_int_get(&d->edit_pending) == EDIT_WAIT_ENCODE
+                   ? _("reloading the recorded mask...")
+                   : _("object mask: analyzing image..."));
     d->encode_state = ENCODE_MSG_SHOWN;
     dt_control_queue_redraw_center();
     return;
@@ -1555,14 +5750,33 @@ static void _object_events_post_expose(cairo_t *cr,
 
     const dt_hash_t cur_hash = _compute_distort_hash(darktable.develop);
 
-    _encode_thread_data_t *td = g_new(_encode_thread_data_t, 1);
+    _encode_thread_data_t *td = g_new0(_encode_thread_data_t, 1);
     td->d = d;
     td->imgid = cur_imgid;
     td->history_end = darktable.develop->history_end;
     td->distort_hash = cur_hash;
+    // the render cap this encoding runs under, decided HERE and nowhere
+    // else: the thread never re-reads the preference, and the capture
+    // records what the encoding really used
+    td->render_size = _conf_render_size();
+    // an edit session encodes PINNED: the recorded model by id, the
+    // recorded dimensions, the recorded cap -- snapshotted here, the
+    // thread never reads the live session fields
+    if(d->edit_valid
+       && g_atomic_int_get(&d->edit_pending) == EDIT_WAIT_ENCODE)
+    {
+      td->pinned = TRUE;
+      g_strlcpy(td->pin_model, d->edit_recipe.seg_model,
+                sizeof(td->pin_model));
+      td->pin_w = d->edit_recipe.encode_w;
+      td->pin_h = d->edit_recipe.encode_h;
+      td->render_size = d->edit_render_size;
+      td->pin_recipe = d->edit_recipe;
+    }
 
     d->encoded_imgid = cur_imgid;
     d->encoded_distort_hash = cur_hash;
+    d->encoded_render_size = td->render_size;
     d->encode_state = ENCODE_RUNNING;
     // start poll timer BEFORE the thread, it will detect completion
     // and also tracks modifier keys once encoding is ready
@@ -1574,8 +5788,13 @@ static void _object_events_post_expose(cairo_t *cr,
 
   if(g_atomic_int_get(&d->encode_state) == ENCODE_RUNNING)
   {
-    // keep the message visible while the thread is working
-    dt_control_log(_("object mask: analyzing image..."));
+    // keep the message visible while the thread is working. the pinned
+    // encode is the longest phase of an edit session: say what it is, or
+    // the user who clicked "edit mask" believes he started a creation
+    if(g_atomic_int_get(&d->edit_pending) == EDIT_WAIT_ENCODE)
+      dt_control_log(_("reloading the recorded mask..."));
+    else
+      dt_control_log(_("object mask: analyzing image..."));
     return;
   }
 
@@ -1585,7 +5804,10 @@ static void _object_events_post_expose(cairo_t *cr,
     g_thread_join(d->encode_thread);
     d->encode_thread = NULL;
     dt_control_log_ack_all();
-    dt_control_log(_("click on object to create mask"));
+    if(g_atomic_int_get(&d->edit_pending) == EDIT_WAIT_ENCODE)
+      dt_control_log(_("reloading the recorded mask..."));
+    else
+      dt_control_log(_("click on object to create mask"));
   }
 
   if(g_atomic_int_get(&d->encode_state) == ENCODE_ERROR)
@@ -1596,12 +5818,71 @@ static void _object_events_post_expose(cairo_t *cr,
       d->encode_thread = NULL;
       // log only once when the thread is first joined
       dt_control_log(_("object mask preparation failed"));
+      // an edit session cannot start without its encode: end the edit
+      // bookkeeping on the spot -- the tool session stays, dead, exactly
+      // as the plain path leaves it. the purge call is the rule (every
+      // EDIT_FAILED exit calls it) and a no-op here by design: nothing was
+      // pinned successfully, and resetting a DEAD encode would only spin a
+      // relaunch loop
+      if(g_atomic_int_get(&d->edit_pending) == EDIT_WAIT_ENCODE)
+      {
+        _edit_session_end(d, EDIT_FAILED);
+        _edit_drop_pinned_encode(d);
+      }
     }
     return;
   }
 
   if(d->encode_state != ENCODE_READY)
     return;
+
+  // --- ai edit session machine: WAIT_ENCODE -> REPLAYING -> ACTIVE ---
+  // runs BEFORE the publication machine, and returns early while the
+  // session is frozen: no decode can be in flight then and none may be
+  // consumed, no overlay may draw a half-injected state
+  {
+    const int ep = g_atomic_int_get(&d->edit_pending);
+    if(ep == EDIT_WAIT_ENCODE)
+    {
+      _edit_replay_start(gui, d);
+      return;
+    }
+    if(ep == EDIT_REPLAYING)
+    {
+      _edit_replay_finish(gui, d);
+      if(g_atomic_int_get(&d->edit_pending) == EDIT_REPLAYING)
+        return;   // still replaying: keep the session frozen
+    }
+  }
+
+  // --- asynchronous decode: publication machine ---
+  // placed after the encode machine and after the invalidation branch, so a
+  // publication can never see a state the invalidation just tore down in
+  // the same expose. the edit machine's early returns above are the gate
+  // demanded by its freeze contract: while WAIT_ENCODE or REPLAYING this
+  // point is never reached, so no DECODE_READY can be consumed here
+  {
+    const int dst = g_atomic_int_get(&d->decode_state);
+    if(dst == DECODE_READY || dst == DECODE_ERROR)
+    {
+      // the invalidation branch above may have deferred its teardown while
+      // this compute ran, and the compute may have landed since it looked:
+      // its result was made on the torn-down geometry, drain it -- the next
+      // expose performs the teardown
+      const gboolean stale
+        = d->encoded_imgid != cur_imgid
+          || d->encoded_distort_hash != _compute_distort_hash(darktable.develop);
+      if(stale)
+        _decode_drain(gui);
+      else
+        _decode_publish(gui);
+    }
+    else if(dst == DECODE_RUNNING)
+      // deliberately a toast rather than the mouse-move hint: it stays
+      // visible while the pointer is idle, and control.c dedups the
+      // repeated message
+      dt_control_log(_("computing mask..."));
+  }
 
   float wd, ht, iwidth, iheight;
   dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
@@ -1615,7 +5896,7 @@ static void _object_events_post_expose(cairo_t *cr,
     unsigned char *buf = g_try_malloc0((size_t)stride * mh);
     if(buf)
     {
-      const float mask_thresh = CLAMP(dt_conf_get_float(CONF_OBJECT_THRESHOLD_KEY), 0.3f, 0.9f);
+      const float mask_thresh = _session_threshold(d);
       for(int y = 0; y < mh; y++)
       {
         unsigned char *row = buf + y * stride;
@@ -1852,6 +6133,13 @@ static void _object_set_hint_message(const dt_masks_form_gui_t *const gui,
     const _object_data_t *d = _get_data((dt_masks_form_gui_t *)gui);
     if(!d || d->encode_state != ENCODE_READY)
       return;  // no hints while encoding
+    if(_edit_frozen(d))
+    {
+      // the machine is replaying the recorded session: gestures are
+      // refused, say what is happening instead of promising clicks
+      g_snprintf(msgbuf, msgbuf_len, _("reloading the recorded mask..."));
+      return;
+    }
     if(d->has_selection)
       g_snprintf(msgbuf,
                  msgbuf_len,
@@ -1888,6 +6176,21 @@ static void _object_modify_property(dt_masks_form_t *const form,
 
   if(!gui || !gui->creation) return;
 
+  // the edit machine holds the session frozen between its opening and the
+  // end of the replay: the sliders keep REPORTING the parameters seeded
+  // from the recipe (the framework hides them at *count == 0) but may not
+  // move them -- a drag would clobber the seeded values behind a preview
+  // that cannot even redraw, breaking the promise of edit_begin that a
+  // re-capture with no new click reproduces them. no toast: a slider drag
+  // emits dozens of these calls
+  const gboolean frozen = _edit_frozen(d);
+  // an edit session owns its parameters: they came from the recipe, so the
+  // increment starts from the SESSION value and never from the global
+  // preference (which would make the first touch JUMP from the recorded
+  // value to the preference), and the preference is never written (it is
+  // the user's persistent choice -- the rule _session_threshold states)
+  const gboolean in_session = d && d->edit_valid;
+
   // always increment *count - the framework hides the slider when
   // count==0 (see libs/masks.c gtk_widget_set_visible)
   switch(prop)
@@ -1896,13 +6199,18 @@ static void _object_modify_property(dt_masks_form_t *const form,
       break; // no size slider for click-based interaction
     case DT_MASKS_PROPERTY_CLEANUP:
     {
-      int cleanup = dt_conf_get_int(CONF_OBJECT_CLEANUP_KEY);
-      cleanup = CLAMP(cleanup + (int)(new_val - old_val), 0, 100);
-      dt_conf_set_int(CONF_OBJECT_CLEANUP_KEY, cleanup);
-      if(d)
+      int cleanup = in_session ? d->preview_cleanup
+                               : dt_conf_get_int(CONF_OBJECT_CLEANUP_KEY);
+      if(!frozen)
       {
-        d->preview_cleanup = cleanup;
-        _update_preview(d);
+        cleanup = CLAMP(cleanup + (int)(new_val - old_val), 0, 100);
+        if(!in_session)
+          dt_conf_set_int(CONF_OBJECT_CLEANUP_KEY, cleanup);
+        if(d)
+        {
+          d->preview_cleanup = cleanup;
+          _update_preview(d);
+        }
       }
       *sum += cleanup;
       ++*count;
@@ -1910,13 +6218,19 @@ static void _object_modify_property(dt_masks_form_t *const form,
     }
     case DT_MASKS_PROPERTY_SMOOTHING:
     {
-      float smoothing = dt_conf_get_float(CONF_OBJECT_SMOOTHING_KEY);
-      smoothing = CLAMP(smoothing + (new_val - old_val), 0.0f, 1.3f);
-      dt_conf_set_float(CONF_OBJECT_SMOOTHING_KEY, smoothing);
-      if(d)
+      float smoothing = in_session
+        ? d->preview_smoothing
+        : dt_conf_get_float(CONF_OBJECT_SMOOTHING_KEY);
+      if(!frozen)
       {
-        d->preview_smoothing = smoothing;
-        _update_preview(d);
+        smoothing = CLAMP(smoothing + (new_val - old_val), 0.0f, 1.3f);
+        if(!in_session)
+          dt_conf_set_float(CONF_OBJECT_SMOOTHING_KEY, smoothing);
+        if(d)
+        {
+          d->preview_smoothing = smoothing;
+          _update_preview(d);
+        }
       }
       *sum += smoothing;
       ++*count;
@@ -1925,15 +6239,21 @@ static void _object_modify_property(dt_masks_form_t *const form,
     case DT_MASKS_PROPERTY_FEATHER:
     {
       const float ratio = (!old_val || !new_val) ? 1.0f : new_val / old_val;
-      float feather = dt_conf_get_float(CONF_OBJECT_FEATHER_KEY);
-      if(feather < 0.0005f && ratio > 1.0f)
-        feather = 0.001f; // bootstrap from zero on increase
-      feather = CLAMP(feather * ratio, 0.0005f, 1.0f);
-      dt_conf_set_float(CONF_OBJECT_FEATHER_KEY, feather);
-      if(d)
+      float feather = in_session ? d->preview_feather
+                                 : dt_conf_get_float(CONF_OBJECT_FEATHER_KEY);
+      if(!frozen)
       {
-        d->preview_feather = feather;
-        _update_preview(d);
+        if(feather < 0.0005f && ratio > 1.0f)
+          feather = 0.001f; // bootstrap from zero on increase
+        feather = CLAMP(feather * ratio, 0.0f, 1.0f);
+        if(feather < 0.0002f) feather = 0.0f; // snap to a hard edge
+        if(!in_session)
+          dt_conf_set_float(CONF_OBJECT_FEATHER_KEY, feather);
+        if(d)
+        {
+          d->preview_feather = feather;
+          _update_preview(d);
+        }
       }
       *sum += feather + feather; // both borders (same as path)
       *max = fminf(*max, 1.0f / feather);
@@ -1943,12 +6263,17 @@ static void _object_modify_property(dt_masks_form_t *const form,
     }
     case DT_MASKS_PROPERTY_REFINE:
     {
-      // toggle applies on the next decoder run, not immediately
-      if(new_val != old_val)
-        dt_conf_set_bool(CONF_OBJECT_REFINE_BOUNDARY_KEY, new_val > 0.5f);
-      const gboolean enabled
-        = dt_conf_get_bool(CONF_OBJECT_REFINE_BOUNDARY_KEY);
-      if(d) d->preview_refine = enabled;
+      gboolean enabled = in_session
+        ? d->preview_refine
+        : dt_conf_get_bool(CONF_OBJECT_REFINE_BOUNDARY_KEY);
+      if(!frozen && new_val != old_val)
+      {
+        // toggle applies on the next decoder run, not immediately
+        enabled = new_val > 0.5f;
+        if(!in_session)
+          dt_conf_set_bool(CONF_OBJECT_REFINE_BOUNDARY_KEY, enabled);
+        if(d) d->preview_refine = enabled;
+      }
       *sum += enabled ? 1.0f : 0.0f;
       ++*count;
       break;

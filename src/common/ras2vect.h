@@ -23,9 +23,17 @@
    or if image is set (not NULL) on image spaces making the masks directly
    usable on the corresponding image.
 
-   turdsize  – potrace turdsize: area of largest speckle to suppress (0 = use default 50).
+   turdsize  – potrace turdsize: area of largest speckle to suppress.
+               negative = historical default (50), suited to full-resolution
+               masks; values >= 0 are honoured but floored at 2 px^2 to drop
+               single-pixel thresholding noise.
    alphamax  – potrace alphamax: corner threshold (0 = all sharp, 1.0 = balanced,
                1.3 = maximum smoothing). Higher = fewer control points.
+   opttolerance – potrace curve simplification tolerance, in pixels of the
+               traced grid: tight (~0.3) on a coarse working grid, looser
+               (~0.8) on a native-resolution mask.
+
+   Returns NULL (and *out_signs set to NULL) if an allocation fails.
 
    If out_signs is not NULL, a parallel GList of GINT_TO_POINTER is
    returned: '+' for outer boundaries, '-' for holes.
@@ -39,6 +47,7 @@ GList *ras2forms(const float *mask,
                  const float threshold,
                  const int turdsize,
                  const double alphamax,
+                 const double opttolerance,
                  GList **out_signs);
 
 // clang-format off

@@ -1,0 +1,314 @@
+/*
+    This file is part of darktable,
+    Copyright (C) 2026 darktable developers.
+
+    darktable is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    darktable is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#pragma once
+
+#include "common/darktable.h"
+#include "common/rasterfile_recipe.h"
+
+#include <glib.h>
+
+struct dt_iop_module_t;
+
+G_BEGIN_DECLS
+
+// outcome of a recipe replay. the distinction matters to the anti-respawn
+// table: a RETRY outcome frees its slot for a later attempt, a FAILED one
+// pins the failure for the session so triggers stop hammering a
+// deterministic dead end (missing or mismatched model, unusable recipe)
+typedef enum dt_object_recipe_status_t
+{
+  DT_OBJECT_RECIPE_OK = 0,
+  DT_OBJECT_RECIPE_RETRY,    // transient: busy, cancelled -- try again later
+  DT_OBJECT_RECIPE_FAILED,   // deterministic: will fail again this session
+} dt_object_recipe_status_t;
+
+// verdict of the model gap diagnostic: how the machine's installed models
+// relate to the ones a recipe records. this is the queryable mirror of the
+// replay gates in dt_object_recipe_compute -- OK if and only if a replay
+// would pass its model checks -- refined, when it would not, into the
+// cause an UX surface can act on. DRIFT is split by direction: only a
+// lagging install is repairable by a download; an ahead one is not and
+// must never grow an install button
+typedef enum dt_object_recipe_model_gap_t
+{
+  DT_OBJECT_RECIPE_MODELS_OK = 0,        // recorded models installed identically
+  DT_OBJECT_RECIPE_MODELS_INSTALLABLE,   // absent, but the registry can install it
+  DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND,  // installed < recorded or update pending: a download may repair
+  DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD,   // installed > recorded: a download would change nothing
+  DT_OBJECT_RECIPE_MODELS_UNKNOWN,       // the registry does not know the recorded id
+  DT_OBJECT_RECIPE_MODELS_AI_OFF,        // AI processing disabled: no lookup possible
+} dt_object_recipe_model_gap_t;
+
+// the three sources an ai edit session can reopen from. C2 delivers the
+// RASTER family (recipe stored in the rasterfile params); PATHS (recipe in
+// the group trailer) and CONTEXT (no usable recipe, synthetic prev_mask)
+// arrive with C4/C5 on the same entry point
+typedef enum dt_object_edit_kind_t
+{
+  DT_OBJECT_EDIT_RASTER = 0,
+  DT_OBJECT_EDIT_PATHS = 1,
+  DT_OBJECT_EDIT_CONTEXT = 2,
+} dt_object_edit_kind_t;
+
+// a stable description of WHAT is being edited, decoupled from any UI
+// surface. identities are values, never pointers: the raster instance by
+// its multi_priority, the group by its formid (int32_t mirrors
+// dt_mask_id_t without pulling develop/masks.h in) -- the session outlives
+// any widget guarantee and the re-finalisation re-resolves its target
+typedef struct dt_object_edit_target_t
+{
+  dt_object_edit_kind_t kind;
+  int32_t raster_multi_priority;  // RASTER: identity of the edited instance
+  int32_t group_formid;           // PATHS / CONTEXT
+  gboolean has_recipe;
+  dt_rf_recipe_t recipe;          // copy owned by the callee
+} dt_object_edit_target_t;
+
+#ifdef HAVE_AI
+
+// headless replay of an AI mask provenance recipe: regenerate the finalised
+// mask PNG for `imgid` exactly as the original session produced it -- same
+// render at the recorded encode dimensions, same recorded segmentation and
+// refinement models pinned to their recorded versions (any mismatch is a
+// clean failure), decodes replayed at the recorded boundaries with their
+// recorded thresholds, same native-resolution finalisation, and the same
+// content-addressed file name derived from the recipe fingerprint. when a
+// valid file already exists under that name it is kept as-is (same
+// fingerprint = same content) and the call succeeds immediately.
+//
+// safe to call from a worker job or from a CLI context: the function's own
+// code never touches darktable.develop, GTK or dt_control_log (dt_print
+// only) -- but its render pipes run every module of the current history,
+// which may emit their own traces; the embedded rasterfile instance in
+// particular resolves to the very file being regenerated and renders with
+// a zeroed mask (silently -- rasterfile.c suppresses the missing-file
+// toast when a recipe is present). accepted deviation, documented at the
+// implementation: when the current distortion history no longer matches
+// the recorded distort_hash the replay proceeds on the CURRENT state, so
+// the regenerated bytes can then differ from the original under the same
+// fingerprint -- confined to the guide render, ONNX-variance class.
+//
+// contract for the caller:
+//  - at most ONE call in flight per fingerprint (A4's anti-respawn table
+//    guarantees it); concurrent calls on the same fingerprint would race
+//    on the temp files and waste the whole compute;
+//  - never call from a pixelpipe thread: a replay costs tens of seconds
+//    (two full-resolution renders plus inferences);
+//  - the call may run alongside an interactive session at the price of
+//    additional ORT sessions in VRAM; its native pass is serialised
+//    against the interactive finalisation job and fails cleanly (retry
+//    later) when one is running; the shared per-image .seg cache is only
+//    written when absent, never overwritten.
+//
+// `keep_going` (nullable) is polled between the expensive steps; return
+// FALSE from it to abort. returns TRUE when the file exists on return.
+//
+// the implementation lives in object.c, next to the interactive session
+// code it shares its compute path with.
+dt_object_recipe_status_t
+dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
+                         const dt_imgid_t imgid,
+                         gboolean (*keep_going)(void *),
+                         void *user);
+
+// schedule an ASYNCHRONOUS recompute of a recipe's mask file, guarded by an
+// anti-respawn table (one recompute in flight per recipe+image; a
+// deterministic failure is not retried within the session, a transient one
+// frees its slot). safe to call from a pixelpipe thread: it marks the table
+// and enqueues a job, nothing more. requires a running job system -- with
+// none (darktable-cli, GUI shutdown) it declines and returns FALSE; use
+// dt_object_recipe_recompute_now for synchronous contexts. GUI callers are
+// notified by a darkroom reprocess when the recompute lands.
+gboolean dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
+                                             const dt_imgid_t imgid);
+
+// SYNCHRONOUS recompute through the same anti-respawn table: marks the
+// slot, runs the replay in the calling thread (tens of seconds!), settles
+// the slot, returns TRUE when the file exists on return. for contexts that
+// need the file NOW and have no job system or no landing to wait for: a
+// darktable-cli pipe, a GUI export worker. never call from the GUI thread
+gboolean dt_object_recipe_recompute_now(const dt_rf_recipe_t *recipe,
+                                        const dt_imgid_t imgid);
+
+// rewrite a recipe's recorded models to the ones installed NOW -- the
+// user-consented way out when the recorded model is gone and the pinned
+// replay rightly refuses. changing the blob changes the fingerprint, so
+// the redone mask lives under a NEW name and never corrupts the content-
+// addressed store; the caller persists the rebound recipe in the module's
+// params before scheduling. FALSE when no active model can stand in
+gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe);
+
+// diagnose the gap between a recipe's recorded models and the installed
+// state: one combined verdict covering the segmentation model plus, when
+// the recipe enables refinement, the refinement model -- exactly the
+// scope of the replay gates. when the two models disagree the verdict
+// needing the heaviest user action wins: AI_OFF > UNKNOWN > INSTALLABLE
+// > DRIFT_BEHIND > DRIFT_AHEAD > OK. `missing` (nullable) receives a
+// NULL-terminated vector of the model ids a download could move toward
+// the recorded state (the INSTALLABLE and DRIFT_BEHIND ones), NULL when
+// there is nothing to download; free with g_strfreev. never cache the
+// verdict: installs, rebinds and edits all change it under your feet
+dt_object_recipe_model_gap_t
+dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing);
+
+// the situation changed (a model was installed, activated or removed):
+// clear the deterministic failures pinned in the anti-respawn table so
+// the next trigger may attempt those recomputes again. RUNNING slots are
+// preserved -- a recompute in flight owns its slot until its destroy
+// callback settles it; removing it here would let a concurrent duplicate
+// replay race on the same temp files
+void dt_object_recipe_reset_failed(void);
+
+// TRUE while an interactive AI edit session is open on the rasterfile
+// instance identified by (op, multi_priority). gate for the proactive
+// missing-file recompute of iop/rasterfile.c gui_changed: in the nominal
+// repair flow the mask file IS missing for the whole session, so an
+// ungated gui_update would schedule a headless recompute concurrent with
+// the session's own inference stack
+gboolean dt_object_mask_edit_active(const char *op,
+                                    const int32_t multi_priority);
+
+// TRUE while the interactive precise-mask finalisation job is in flight.
+// second gate for the same proactive recompute: the edit gate falls when
+// the session data is freed, which is exactly when the finalisation job
+// starts -- the file it prepares does not exist yet, so without this the
+// recompute of the OLD recipe would race the job that replaces it. covers
+// plain (non-edit) finalisations, which never raised the edit gate
+gboolean dt_object_mask_finalize_running(void);
+
+// session bookkeeping for the flag above, called by the edit session
+// only: set on a successful edit begin, cleared on EVERY session exit
+// (finalise, no-op, cancel, failure, image change)
+void dt_object_mask_edit_set_active(const char *op,
+                                    const int32_t multi_priority);
+void dt_object_mask_edit_clear_active(void);
+
+// reopen an interactive object-mask session from a saved provenance
+// recipe: the session encodes with the RECORDED model at the recorded
+// dimensions, replays the recorded decodes at their recorded boundaries
+// with their recorded thresholds, and hands the user the exact working
+// state the original session finalised from. GUI thread only, darkroom
+// only; at most one edit session per process. `target_module` is reserved
+// for the re-finalisation payload (C3) and may be NULL.
+//
+// this entry point is the part of the edit UX that survives any surface
+// redesign (revisable-dressing hypothesis, plan §6): buttons, dialogs and
+// menu items all funnel here. C2 limitation, by design: the reopened
+// session ends through the existing gestures (right-click / shift+right-
+// click), which create a NEW mask -- C3 wires the in-place replacement
+gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
+                                   const dt_object_edit_target_t *target);
+
+#else
+
+// without AI support a recipe can never be recomputed on this machine; the
+// inline stub keeps future call sites free of conditional compilation
+static inline dt_object_recipe_status_t
+dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
+                         const dt_imgid_t imgid,
+                         gboolean (*keep_going)(void *),
+                         void *user)
+{
+  (void)recipe;
+  (void)imgid;
+  (void)keep_going;
+  (void)user;
+  return DT_OBJECT_RECIPE_FAILED;
+}
+
+static inline gboolean
+dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
+                                    const dt_imgid_t imgid)
+{
+  (void)recipe;
+  (void)imgid;
+  return FALSE;
+}
+
+static inline gboolean
+dt_object_recipe_recompute_now(const dt_rf_recipe_t *recipe,
+                               const dt_imgid_t imgid)
+{
+  (void)recipe;
+  (void)imgid;
+  return FALSE;
+}
+
+static inline gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe)
+{
+  (void)recipe;
+  return FALSE;
+}
+
+static inline dt_object_recipe_model_gap_t
+dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing)
+{
+  (void)recipe;
+  if(missing) *missing = NULL;
+  // without AI support there is no registry to interrogate; AI_OFF is
+  // the one verdict that promises no repair on this machine
+  return DT_OBJECT_RECIPE_MODELS_AI_OFF;
+}
+
+static inline void dt_object_recipe_reset_failed(void)
+{
+}
+
+static inline gboolean dt_object_mask_edit_active(const char *op,
+                                                  const int32_t multi_priority)
+{
+  (void)op;
+  (void)multi_priority;
+  return FALSE;
+}
+
+static inline gboolean dt_object_mask_finalize_running(void)
+{
+  return FALSE;
+}
+
+static inline void dt_object_mask_edit_set_active(const char *op,
+                                                  const int32_t multi_priority)
+{
+  (void)op;
+  (void)multi_priority;
+}
+
+static inline void dt_object_mask_edit_clear_active(void)
+{
+}
+
+static inline gboolean
+dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
+                          const dt_object_edit_target_t *target)
+{
+  (void)target_module;
+  (void)target;
+  return FALSE;
+}
+
+#endif // HAVE_AI
+
+G_END_DECLS
+
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// vim: shiftwidth=2 expandtab tabstop=2 cindent
+// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

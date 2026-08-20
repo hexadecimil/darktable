@@ -951,7 +951,10 @@ int dt_masks_legacy_params(dt_develop_t *dev,
   return res;
 }
 
-static dt_mask_id_t form_id = 0;
+// atomic: forms may be created from a worker job (the native mask
+// finalisation traces paths off the GUI thread), two concurrent creations
+// must never share an id
+static gint form_id = 0;
 
 dt_masks_form_t *dt_masks_create(const dt_masks_type_t type)
 {
@@ -960,7 +963,7 @@ dt_masks_form_t *dt_masks_create(const dt_masks_type_t type)
 
   form->type = type;
   form->version = dt_masks_version();
-  form->formid = time(NULL) + form_id++;
+  form->formid = time(NULL) + g_atomic_int_add(&form_id, 1);
 
   if(type & DT_MASKS_CIRCLE)
     form->functions = &dt_masks_functions_circle;
@@ -1110,6 +1113,31 @@ void dt_masks_read_masks_history(dt_develop_t *dev, const dt_imgid_t imgid)
         memcpy(point, ptbuf + i*point_size, point_size);
         form->points = g_list_append(form->points, point);
       }
+
+      // ai provenance trailer of a group (see masks.h): the blob must hold
+      // exactly the appended size and carry a valid magic and version to
+      // restore it, anything else leaves the trailer zeroed -- never an
+      // error, a blob written by an upstream darktable simply has none.
+      // read before dt_masks_legacy_params on purpose: no v1..v6 migration
+      // touches group point blobs -- revisit this placement if one ever does
+      if((form->type & DT_MASKS_GROUP) && ptbuf)
+      {
+        const int blob_len = sqlite3_column_bytes(stmt, 5);
+        const size_t pts_len = (size_t)nb_points * point_size;
+        dt_masks_ai_trailer_t trailer;
+        // nb_points is signed database (and thus sidecar) input: a negative
+        // value wraps pts_len, and a truncating comparison could still make
+        // the sizes coincide -- guard the sign and compare in size_t, or
+        // the memcpy below reads out of bounds
+        if(nb_points >= 0
+           && (size_t)blob_len == pts_len + sizeof(trailer))
+        {
+          memcpy(&trailer, ptbuf + pts_len, sizeof(trailer));
+          if(trailer.magic == DT_MASKS_AI_TRAILER_MAGIC
+             && trailer.version == DT_MASKS_AI_TRAILER_VERSION)
+            form->ai_trailer = trailer;
+        }
+      }
     }
 
     if(form->version != dt_masks_version())
@@ -1192,14 +1220,26 @@ void dt_masks_write_masks_history_item(const dt_imgid_t imgid,
   {
     const size_t point_size = form->functions->point_struct_size;
     const guint nb = g_list_length(form->points);
-    char *const restrict ptbuf = malloc(nb * point_size);
+    // an ai-created group of paths persists its provenance trailer by
+    // appending it to the point blob (see masks.h): a reader that knows
+    // the layout detects it by exact size + magic, an upstream reader
+    // ignores the excess bytes. groups without a valid trailer keep the
+    // upstream-identical blob
+    const gboolean with_trailer = (form->type & DT_MASKS_GROUP)
+      && form->ai_trailer.magic == DT_MASKS_AI_TRAILER_MAGIC
+      && form->ai_trailer.version == DT_MASKS_AI_TRAILER_VERSION;
+    const size_t blob_size = nb * point_size
+      + (with_trailer ? sizeof(dt_masks_ai_trailer_t) : 0);
+    char *const restrict ptbuf = malloc(blob_size);
     int pos = 0;
     for(GList *points = form->points; points; points = g_list_next(points))
     {
       memcpy(ptbuf + pos, points->data, point_size);
       pos += point_size;
     }
-    DT_DEBUG_SQLITE3_BIND_BLOB(stmt, 6, ptbuf, nb * point_size, SQLITE_TRANSIENT);
+    if(with_trailer)
+      memcpy(ptbuf + pos, &form->ai_trailer, sizeof(dt_masks_ai_trailer_t));
+    DT_DEBUG_SQLITE3_BIND_BLOB(stmt, 6, ptbuf, blob_size, SQLITE_TRANSIENT);
     DT_DEBUG_SQLITE3_BIND_INT(stmt, 7, nb);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -1577,6 +1617,67 @@ void dt_masks_reset_show_masks_icons(void)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bd->masks_shapes[n]), 0);
         gtk_widget_queue_draw(bd->masks_shapes[n]);
       }
+    }
+  }
+}
+
+gboolean dt_masks_shapes_locked(void)
+{
+#ifdef HAVE_AI
+  // the object tool is the only one with an asynchronous session today;
+  // a second one would add its own predicate HERE and nowhere else
+  return dt_masks_object_session_busy();
+#else
+  return FALSE;
+#endif
+}
+
+// where a locked button parks its construction tooltip while the lock
+// borrows the slot to say why. freed with the widget
+#define DT_MASKS_SHAPE_TIP "dt-masks-shape-tooltip"
+
+void dt_masks_update_shapes_sensitivity(void)
+{
+  const dt_develop_t *dev = darktable.develop;
+  if(!dev || dev->first_load) return;
+
+  const gboolean locked = dt_masks_shapes_locked();
+  for(GList *modules = dev->iop; modules; modules = g_list_next(modules))
+  {
+    const dt_iop_module_t *m = modules->data;
+    if(!m) continue;
+    const dt_iop_gui_blend_data_t *bd = m->blend_data;
+    // continue, never break: a module without blending data says nothing
+    // about the next one (see the TODO in dt_masks_reset_show_masks_icons)
+    if(!bd || !bd->masks_support || !bd->masks_inited) continue;
+
+    for(int n = 0; n < DEVELOP_MASKS_NB_SHAPES; n++)
+    {
+      GtkWidget *w = bd->masks_shapes[n];
+      if(!w) continue;
+      // the state is re-derived, never toggled, so this is idempotent;
+      // skipping the no-op keeps a periodic caller from re-triggering a
+      // tooltip query under the pointer at every tick
+      const gboolean want = !locked;
+      if(gtk_widget_get_sensitive(w) == want) continue;
+
+      // park the construction tooltip on the first lock. an insensitive
+      // widget still answers a tooltip query in gtk3, so the greyed button
+      // stays the place that explains itself -- and state and text are
+      // recomputed here together, so they cannot diverge. "" stands for
+      // "had none": the key must exist from then on, or the next unlock
+      // would park the lock message as if it were the original
+      gchar *saved = g_object_get_data(G_OBJECT(w), DT_MASKS_SHAPE_TIP);
+      if(!saved)
+      {
+        gchar *tip = gtk_widget_get_tooltip_text(w);
+        saved = tip ? tip : g_strdup("");
+        g_object_set_data_full(G_OBJECT(w), DT_MASKS_SHAPE_TIP, saved, g_free);
+      }
+      gtk_widget_set_sensitive(w, want);
+      gtk_widget_set_tooltip_text
+        (w, locked ? _("mask still computing, try again in a moment")
+                   : (*saved ? saved : NULL));
     }
   }
 }

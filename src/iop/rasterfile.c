@@ -35,7 +35,10 @@
 #include "common/fast_guided_filter.h"
 #include "common/pfm.h"
 #include "common/ras2vect.h"
+#include "common/rasterfile_recipe.h"
 #include "common/utility.h"
+#include "develop/masks.h"
+#include "develop/masks/object_recipe.h"
 #include "imageio/imageio_png.h"
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
@@ -53,7 +56,7 @@
 
 #define SET_THRESHOLD 0.6f
 
-DT_MODULE_INTROSPECTION(1, dt_iop_rasterfile_params_t)
+DT_MODULE_INTROSPECTION(2, dt_iop_rasterfile_params_t)
 
 typedef enum dt_iop_rasterfile_mode_t
 {
@@ -73,12 +76,26 @@ typedef struct dt_iop_rasterfile_params_t
   dt_iop_rasterfile_mode_t mode;  // $DEFAULT: DT_RASTERFILE_MODE_ALL $DESCRIPTION: "mode"
   char path[RASTERFILE_MAXFILE];
   char file[RASTERFILE_MAXFILE];
+  int32_t _pad;                   // explicit: aligns the recipe to 8 bytes
+  // provenance of an AI-generated mask file, or all-zero for a plain file
+  // picked by hand. when valid, the file is resolved content-addressed
+  // against the LOCAL mask root (see commit_params); path/file above are
+  // then informative only, so a library moved between machines keeps
+  // resolving. inert bytes on builds without the AI subsystem
+  dt_rf_recipe_t recipe;
 } dt_iop_rasterfile_params_t;
 
 typedef struct dt_iop_rasterfile_data_t
 {
   dt_iop_rasterfile_mode_t mode;
   char filepath[PATH_MAX];
+  // TRUE when the params carry a valid recipe: a missing or unreadable
+  // file is then an expected transient state (the mask is recomputable and
+  // a recompute is the answer), so the read path logs without toasting
+  gboolean quiet;
+  // committed copy of the provenance recipe, so the pixelpipe safety net
+  // can schedule a recompute without touching the live GUI params
+  dt_rf_recipe_t recipe;
 } dt_iop_rasterfile_data_t;
 
 typedef struct dt_rasterfile_cache_t
@@ -132,6 +149,7 @@ typedef struct dt_iop_rasterfile_gui_data_t
   GtkWidget *fbutton;
   GtkWidget *file;
   GtkWidget *vectorize;
+  GtkWidget *recompute;
 } dt_iop_rasterfile_gui_data_t;
 
 int legacy_params(dt_iop_module_t *self,
@@ -141,6 +159,28 @@ int legacy_params(dt_iop_module_t *self,
                   int32_t *new_params_size,
                   int *new_version)
 {
+  typedef struct dt_iop_rasterfile_params_v1_t
+  {
+    dt_iop_rasterfile_mode_t mode;
+    char path[RASTERFILE_MAXFILE];
+    char file[RASTERFILE_MAXFILE];
+  } dt_iop_rasterfile_params_v1_t;
+
+  if(old_version == 1)
+  {
+    const dt_iop_rasterfile_params_v1_t *o = old_params;
+    dt_iop_rasterfile_params_t *n = calloc(1, sizeof(dt_iop_rasterfile_params_t));
+
+    n->mode = o->mode;
+    memcpy(n->path, o->path, sizeof(n->path));
+    memcpy(n->file, o->file, sizeof(n->file));
+    // recipe stays zeroed: no provenance, plain path/file resolution
+
+    *new_params = n;
+    *new_params_size = sizeof(dt_iop_rasterfile_params_t);
+    *new_version = 2;
+    return 0;
+  }
   return 1;
 }
 
@@ -167,8 +207,11 @@ static void _vectorize_button_clicked(GtkWidget *widget,
   dt_pthread_mutex_lock(&cd->lock);
 
   const dt_image_t *const image = &(self->dev->image_storage);
+  // full-resolution file: a negative turdsize selects the historical speckle
+  // cleanup (50) and 0.8 the matching curve tolerance, otherwise every tiny
+  // speckle becomes a form and floods the mask manager with anchors
   GList *forms = ras2forms(cd->mask, cd->width, cd->height, image,
-                           SET_THRESHOLD, 0, 0.0, NULL);
+                           SET_THRESHOLD, -1, 0.0, 0.8, NULL);
 
   dt_pthread_mutex_unlock(&cd->lock);
 
@@ -191,6 +234,7 @@ static void _vectorize_button_clicked(GtkWidget *widget,
 
 static float *_read_rasterfile(char *filename,
                                const dt_iop_rasterfile_mode_t mode,
+                               const gboolean quiet,
                                int *swidth,
                                int *sheight)
 {
@@ -207,7 +251,8 @@ static float *_read_rasterfile(char *filename,
     if(!dt_imageio_png_read_header(filename, &png))
     {
       dt_print(DT_DEBUG_ALWAYS, "failed to read PNG header from '%s'", filename ? filename : "???");
-      dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
+      if(!quiet)
+        dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
       return NULL;
     }
 
@@ -218,7 +263,8 @@ static float *_read_rasterfile(char *filename,
       fclose(png.f);
       png_destroy_read_struct(&png.png_ptr, &png.info_ptr, NULL);
       dt_print(DT_DEBUG_ALWAYS, "can't read raster mask file '%s'", filename ? filename : "???");
-      dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
+      if(!quiet)
+        dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
       return NULL;
     }
 
@@ -226,7 +272,8 @@ static float *_read_rasterfile(char *filename,
     {
       dt_free_align(buf);
       dt_print(DT_DEBUG_ALWAYS, "can't read raster mask file '%s'", filename ? filename : "???");
-      dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
+      if(!quiet)
+        dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
       return NULL;
     }
 
@@ -237,7 +284,8 @@ static float *_read_rasterfile(char *filename,
     {
       dt_free_align(buf);
       dt_print(DT_DEBUG_ALWAYS, "can't read raster mask file '%s'", filename ? filename : "???");
-      dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
+      if(!quiet)
+        dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
       return NULL;
     }
 
@@ -286,7 +334,8 @@ static float *_read_rasterfile(char *filename,
   {
     dt_print(DT_DEBUG_ALWAYS,
              "can't read raster mask file '%s'", filename ? filename : "???");
-    dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
+    if(!quiet)
+      dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
 
     dt_free_align(image);
     dt_free_align(mask);
@@ -407,6 +456,10 @@ static void _fbutton_clicked(GtkWidget *widget, dt_iop_module_t *self)
       dt_strlcpy_to_fixed(p->file, bname, sizeof(p->file));
       g_free(bname);
 
+      // picking a file by hand detaches any AI provenance: from here on the
+      // chosen file IS the mask, no fingerprint may override it
+      memset(&p->recipe, 0, sizeof(p->recipe));
+
       _update_filepath(self);
       dt_dev_add_history_item(darktable.develop, self, TRUE);
     }
@@ -423,11 +476,69 @@ static void _fbutton_clicked(GtkWidget *widget, dt_iop_module_t *self)
   g_object_unref(filechooser);
 }
 
+// provisional dev trigger for the AI mask edit session, replaced by the
+// validated UX (the planned provenance section with its own edit button):
+// behind a conf key defaulting to FALSE, the 'recompute mask' button
+// becomes 'edit mask' when a valid recipe exists. only the entry point it
+// calls, dt_object_mask_edit_begin, is meant to stay
+#define CONF_RASTERFILE_DEV_EDIT_KEY "plugins/darkroom/masks/object/dev_edit_button"
+
+static gboolean _dev_edit_enabled(void)
+{
+  return dt_conf_key_exists(CONF_RASTERFILE_DEV_EDIT_KEY)
+         && dt_conf_get_bool(CONF_RASTERFILE_DEV_EDIT_KEY);
+}
+
+// redo the mask from its recipe with the models installed NOW. this is the
+// user-consented escape when the recorded model is gone and the pinned
+// replay rightly refuses to run: the recipe is rebound to the active
+// models and persisted FIRST -- its fingerprint changes, so the redone
+// mask lives under a new name and resolution follows automatically
+static void _recompute_clicked(GtkWidget *widget, dt_iop_module_t *self)
+{
+  dt_iop_rasterfile_params_t *p = self->params;
+  if(!dt_rf_recipe_valid(&p->recipe) || !self->dev)
+    return;
+
+  // provisional dev trigger (see _dev_edit_enabled): reopen the recorded
+  // session interactively instead of recomputing headless
+  if(_dev_edit_enabled())
+  {
+    dt_object_edit_target_t target = { 0 };
+    target.kind = DT_OBJECT_EDIT_RASTER;
+    target.raster_multi_priority = self->multi_priority;
+    target.has_recipe = TRUE;
+    target.recipe = p->recipe;
+    dt_object_mask_edit_begin(self, &target);
+    return;
+  }
+
+  dt_rf_recipe_t rebound = p->recipe;
+  if(!dt_object_recipe_rebind_models(&rebound))
+  {
+    dt_control_log(_("no AI model available to recompute this mask"));
+    return;
+  }
+
+  if(memcmp(&rebound, &p->recipe, sizeof(rebound)) != 0)
+  {
+    p->recipe = rebound;
+    dt_dev_add_history_item(darktable.develop, self, TRUE);
+  }
+  // no toast here: dt_object_recipe_schedule_recompute emits it for the
+  // three triggers at once, so this path cannot drift from the automatic
+  // ones or flash two messages in a row
+  dt_object_recipe_schedule_recompute(&p->recipe,
+                                      self->dev->image_storage.id);
+}
+
 static void _file_callback(GtkWidget *widget, dt_iop_module_t *self)
 {
   dt_iop_rasterfile_params_t *p = self->params;
   const gchar *select = dt_bauhaus_combobox_get_text(widget);
   dt_strlcpy_to_fixed(p->file, select, sizeof(p->file));
+  // same detachment as the file chooser: a hand-picked file wins
+  memset(&p->recipe, 0, sizeof(p->recipe));
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 }
 
@@ -466,10 +577,40 @@ static float *_get_rasterfile_mask(dt_dev_pixelpipe_iop_t *piece,
     _clear_cache(cd);
     dt_print(DT_DEBUG_PIPE,
              "read image raster file `%s'", d->filepath);
-    cd->mask = _read_rasterfile(d->filepath, d->mode, &cd->width, &cd->height);
+    cd->mask = _read_rasterfile(d->filepath, d->mode, d->quiet,
+                                &cd->width, &cd->height);
     cd->hash = cd->mask ? hash : DT_INVALID_HASH;
     dt_print(DT_DEBUG_PIPE,
              "got raster mask data %p %dx%d", cd->mask, cd->width, cd->height);
+
+    // safety net: a valid recipe can regenerate a missing or unreadable
+    // file. never from a thumbnail pipe (cheap pipes must not flood the
+    // job queue; the full/export pipes will come). two regimes:
+    //  - a pipe whose output leaves the machine (export) or a context
+    //    with no job system at all (darktable-cli, whose export is the
+    //    only reason its pipes run) blocks and recomputes NOW: these
+    //    pipes run once, a wrong output is final;
+    //  - the darkroom schedules asynchronously and gets reprocessed when
+    //    the recompute lands. leaving cd->hash invalid meanwhile is
+    //    deliberate: the next pipe run rereads the file
+    if(!cd->mask
+       && !(piece->pipe->type & DT_DEV_PIXELPIPE_THUMBNAIL)
+       && dt_rf_recipe_valid(&d->recipe))
+    {
+      const gboolean sync_ctx
+        = (piece->pipe->type & DT_DEV_PIXELPIPE_EXPORT)
+          || !dt_control_running();
+      const gboolean retry_now = sync_ctx
+        ? dt_object_recipe_recompute_now(&d->recipe, piece->pipe->image.id)
+        : dt_object_recipe_schedule_recompute(&d->recipe,
+                                              piece->pipe->image.id);
+      if(retry_now)
+      {
+        cd->mask = _read_rasterfile(d->filepath, d->mode, d->quiet,
+                                    &cd->width, &cd->height);
+        cd->hash = cd->mask ? hash : DT_INVALID_HASH;
+      }
+    }
   }
   if(cd->mask)
   {
@@ -607,7 +748,32 @@ void commit_params(dt_iop_module_t *self,
   dt_iop_rasterfile_data_t *d = piece->data;
 
   d->mode = p->mode;
-  gchar *fullpath = g_build_filename(p->path, p->file, NULL);
+  // a recipe makes the file recomputable: its absence is then a transient
+  // state handled by a recompute, not a toast (see _read_rasterfile)
+  d->quiet = dt_rf_recipe_valid(&p->recipe);
+  d->recipe = p->recipe;
+  gchar *fullpath = NULL;
+  if(dt_rf_recipe_valid(&p->recipe))
+  {
+    // content-addressed resolution: the recipe fingerprint names the file
+    // under the LOCAL mask root, whatever path was recorded on the machine
+    // that produced it
+    const dt_image_t *img = &pipe->image;
+    gchar *base = g_path_get_basename(img->filename);
+    char *dot = g_strrstr(base, ".");
+    if(dot) *dot = '\0';
+    gchar *fname = dt_rasterfile_recipe_filename(&p->recipe, base,
+                                                 img->width, img->height,
+                                                 img->exif_datetime_taken);
+    gchar *root = dt_rasterfile_mask_root();
+    fullpath = g_build_filename(root, fname, NULL);
+    g_free(root);
+    g_free(fname);
+    g_free(base);
+  }
+  else
+    fullpath = g_build_filename(p->path, p->file, NULL);
+
   dt_strlcpy_to_fixed(d->filepath, fullpath, sizeof(d->filepath));
   g_free(fullpath);
 }
@@ -635,6 +801,7 @@ void reload_defaults(dt_iop_module_t *self)
   dt_iop_rasterfile_params_t *dp = self->default_params;
   memset(dp->path, 0, sizeof(dp->path));
   memset(dp->file, 0, sizeof(dp->file));
+  memset(&dp->recipe, 0, sizeof(dp->recipe));
 }
 
 void distort_mask(dt_iop_module_t *self,
@@ -674,9 +841,57 @@ void gui_changed(dt_iop_module_t *self,
 
     if(other)
       dt_dev_reprocess_center(self->dev, self->iop_order);
+
+    // proactive: a valid recipe whose cache file is missing (library moved
+    // to this machine, cache purged) is regenerated without waiting for a
+    // pipe to fail reading it. the anti-respawn table absorbs repeats
+    if(dt_rf_recipe_valid(&p->recipe) && self->dev)
+    {
+      const dt_image_t *img = &self->dev->image_storage;
+      gchar *base = g_path_get_basename(img->filename);
+      char *dot = g_strrstr(base, ".");
+      if(dot) *dot = '\0';
+      gchar *fname = dt_rasterfile_recipe_filename(&p->recipe, base,
+                                                   img->width, img->height,
+                                                   img->exif_datetime_taken);
+      gchar *root = dt_rasterfile_mask_root();
+      gchar *fullpath = g_build_filename(root, fname, NULL);
+      // an open AI edit session on this instance keeps the file
+      // legitimately absent while it prepares a replacement: without the
+      // gate every gui_update would schedule a headless recompute
+      // concurrent with the session's own inference stack -- and pin a
+      // fresh failure when the recorded model is still missing. the
+      // session gate falls when the closing gesture frees the session
+      // data, which is exactly when the finalisation job STARTS: the
+      // second gate covers the seconds it then spends rendering and
+      // inferring, when the replacement file still does not exist
+      if(!g_file_test(fullpath, G_FILE_TEST_EXISTS)
+         && !dt_object_mask_edit_active(self->op, self->multi_priority)
+         && !dt_object_mask_finalize_running())
+        dt_object_recipe_schedule_recompute(&p->recipe, img->id);
+      g_free(fullpath);
+      g_free(root);
+      g_free(fname);
+      g_free(base);
+    }
   }
 
   gtk_widget_set_sensitive(g->vectorize, p->path[0] && p->file[0]);
+  gtk_widget_set_sensitive(g->recompute, dt_rf_recipe_valid(&p->recipe));
+  // provisional dev trigger (see _dev_edit_enabled): relabel the button
+  // when it opens an edit session instead of a headless recompute -- only
+  // when that session can actually run. without AI support, or with the
+  // model not installed, dt_object_mask_edit_begin declines (the non-AI
+  // stub does so silently) and the relabelled button would do nothing
+#ifdef HAVE_AI
+  const gboolean edits = _dev_edit_enabled()
+                         && dt_rf_recipe_valid(&p->recipe)
+                         && dt_masks_object_available();
+#else
+  const gboolean edits = FALSE;
+#endif
+  gtk_button_set_label(GTK_BUTTON(g->recompute),
+                       edits ? _("edit mask") : _("recompute mask"));
 }
 
 void gui_update(dt_iop_module_t *self)
@@ -691,6 +906,7 @@ void init(dt_iop_module_t *self)
   dt_iop_rasterfile_params_t *d = self->default_params;
   memset(d->path, 0, sizeof(d->path));
   memset(d->file, 0, sizeof(d->file));
+  memset(&d->recipe, 0, sizeof(d->recipe));
 
   /*
     Implementation note and reminder:
@@ -769,9 +985,21 @@ void gui_init(dt_iop_module_t *self)
   g_signal_connect(g->vectorize, "clicked",
                    G_CALLBACK(_vectorize_button_clicked), self);
 
+  // only meaningful for AI masks carrying a provenance recipe
+  g->recompute = gtk_button_new_with_label(_("recompute mask"));
+  gtk_widget_set_tooltip_text
+    (g->recompute,
+     _("regenerate this AI mask from its recorded recipe using the"
+       " currently installed models.\nuse this when the mask file is"
+       " missing and the model it was made with has been updated or"
+       " removed: the mask is redone with the current model instead"));
+  g_signal_connect(g->recompute, "clicked",
+                   G_CALLBACK(_recompute_clicked), self);
+
   dt_gui_box_add(self->widget,
                  dt_gui_hbox(g->fbutton, dt_gui_expand(g->file)),
-                 g->vectorize);
+                 g->vectorize,
+                 g->recompute);
 }
 
 #undef RASTERFILE_MAXFILE

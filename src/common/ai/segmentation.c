@@ -228,14 +228,19 @@ static void _crop_resize_mask(const float *const restrict src,
   DT_OMP_FOR(shared(range_lut))
   for(int y = 0; y < dst_h; y++)
   {
-    const float sy = (dst_h > 1) ? (float)y * (float)(valid_h - 1) / (float)(dst_h - 1) : 0.0f;
+    // pixel-centre convention: output pixel y covers [y, y+1[, whose centre
+    // y + 0.5 maps to (y + 0.5) * scale in mask space, i.e. sample index
+    // (y + 0.5) * scale - 0.5. the previous align-corners mapping stretched
+    // the mask outwards, with a signed error sweeping from -2 to +4 output
+    // pixels across the frame at scale 1/6
+    const float sy = MAX(((float)y + 0.5f) * scale - 0.5f, 0.0f);
     const int y0 = MIN((int)sy, valid_h - 1);
     const int y1 = MIN(y0 + 1, valid_h - 1);
     const float fy = sy - (float)y0;
 
     for(int x = 0; x < dst_w; x++)
     {
-      const float sx = (dst_w > 1) ? (float)x * (float)(valid_w - 1) / (float)(dst_w - 1) : 0.0f;
+      const float sx = MAX(((float)x + 0.5f) * scale - 0.5f, 0.0f);
       const int x0 = MIN((int)sx, valid_w - 1);
       const int x1 = MIN(x0 + 1, valid_w - 1);
       const float fx = sx - (float)x0;
@@ -255,11 +260,14 @@ static void _crop_resize_mask(const float *const restrict src,
         // reference luma at the output pixel (guide is at dst resolution)
         const int luma_ref = _luma709(&guide_rgb[(y * guide_w + x) * 3]);
 
-        // map the 4 source-grid corners back into guide coords
-        const float gx0 = (valid_w > 1) ? (float)x0 * (float)(dst_w - 1) / (float)(valid_w - 1) : 0.0f;
-        const float gx1 = (valid_w > 1) ? (float)x1 * (float)(dst_w - 1) / (float)(valid_w - 1) : 0.0f;
-        const float gy0 = (valid_h > 1) ? (float)y0 * (float)(dst_h - 1) / (float)(valid_h - 1) : 0.0f;
-        const float gy1 = (valid_h > 1) ? (float)y1 * (float)(dst_h - 1) / (float)(valid_h - 1) : 0.0f;
+        // map the 4 source-grid corners back into guide coords -- exact
+        // inverse of the sampling mapping above, so that the range weights
+        // are read at the guide pixels the mask values actually come from
+        const float inv_scale = (scale > 1e-6f) ? 1.0f / scale : 0.0f;
+        const float gx0 = ((float)x0 + 0.5f) * inv_scale - 0.5f;
+        const float gx1 = ((float)x1 + 0.5f) * inv_scale - 0.5f;
+        const float gy0 = ((float)y0 + 0.5f) * inv_scale - 0.5f;
+        const float gy1 = ((float)y1 + 0.5f) * inv_scale - 0.5f;
 
         const int ix00 = MIN(MAX((int)(gx0 + 0.5f), 0), guide_w - 1);
         const int ix01 = MIN(MAX((int)(gx1 + 0.5f), 0), guide_w - 1);
@@ -1209,6 +1217,17 @@ static gboolean _get_cache_dir(char *out, size_t size)
   return FALSE;
 }
 
+gboolean dt_seg_disk_cache_exists(const dt_imgid_t imgid)
+{
+  char dir[PATH_MAX] = {0};
+  if(!_get_cache_dir(dir, sizeof(dir)))
+    return FALSE;
+
+  char path[PATH_MAX] = {0};
+  snprintf(path, sizeof(path), "%s/%d.seg", dir, imgid);
+  return g_file_test(path, G_FILE_TEST_EXISTS);
+}
+
 gboolean dt_seg_disk_cache_save(dt_seg_context_t *ctx,
                                 const dt_imgid_t imgid,
                                 const dt_hash_t distort_hash,
@@ -1227,12 +1246,20 @@ gboolean dt_seg_disk_cache_save(dt_seg_context_t *ctx,
   char path[PATH_MAX] = {0};
   snprintf(path, sizeof(path), "%s/%d.seg", dir, imgid);
 
-  FILE *fp = g_fopen(path, "wb");
+  // write to a temp name unique to this writer, then move atomically: the
+  // interactive encode thread and a headless recipe replay may both save
+  // this slot, and interleaved direct writes would produce a file of the
+  // same byte structure that passes every validation with mixed embeddings
+  char tmppath[PATH_MAX + 64] = {0};
+  snprintf(tmppath, sizeof(tmppath), "%s.%d-%p.tmp",
+           path, (int)getpid(), (void *)g_thread_self());
+
+  FILE *fp = g_fopen(tmppath, "wb");
   if(!fp)
   {
     dt_print(DT_DEBUG_AI,
              "[segmentation] disk cache: cannot open %s for writing",
-             path);
+             tmppath);
     return FALSE;
   }
 
@@ -1290,11 +1317,25 @@ gboolean dt_seg_disk_cache_save(dt_seg_context_t *ctx,
 
   if(!ok)
   {
-    g_unlink(path);
+    g_unlink(tmppath);
     dt_print(DT_DEBUG_AI,
              "[segmentation] disk cache: write error for imgid %d",
              imgid);
     return FALSE;
+  }
+
+  if(g_rename(tmppath, path) != 0)
+  {
+    // a concurrent writer may have installed its file first: keep the
+    // version that won, drop ours
+    g_unlink(tmppath);
+    if(!g_file_test(path, G_FILE_TEST_EXISTS))
+    {
+      dt_print(DT_DEBUG_AI,
+               "[segmentation] disk cache: cannot move %s into place",
+               tmppath);
+      return FALSE;
+    }
   }
 
   dt_print(DT_DEBUG_AI,

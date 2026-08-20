@@ -1685,6 +1685,20 @@ static void _blendop_masks_add_shape(GtkGestureSingle *gesture,
   }
 #endif
 
+  // starting ANY shape while a mask computation is in flight destroys it in
+  // silence: dt_masks_change_form_gui below clears the form gui, and with it
+  // the scratchpad of the tool that is computing. refuse at the entry, before
+  // the first mutation. the buttons are also desensitised
+  // (dt_masks_update_shapes_sensitivity), but that only covers the pointer:
+  // a "blend`shapes" shortcut reaches this callback through an event gtk
+  // synthesises without consulting sensitivity, so this test is the invariant
+  // and the greying is its signal
+  if(dt_masks_shapes_locked())
+  {
+    dt_control_log(_("mask still computing, try again in a moment"));
+    return;
+  }
+
   _blendop_masks_modes_toggle(NULL, self, DEVELOP_MASK_MASK);
 
   // set all shape buttons to inactive

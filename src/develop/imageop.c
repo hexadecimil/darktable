@@ -1511,6 +1511,14 @@ int dt_iop_legacy_params(dt_iop_module_t *module,
   int ret = 0;
   gboolean auto_init = FALSE;
 
+  // params written by a NEWER version of this module cannot be
+  // translated: the loop below would never run and we would report
+  // success while *new_params stays untouched -- for the history reader
+  // that is a freshly malloc'ed, uninitialized buffer. report a version
+  // mismatch instead; every caller has a clean rejection path for it
+  if(old_version > new_version)
+    return 1;
+
   if(module->legacy_params)
   {
     int cversion = old_version;

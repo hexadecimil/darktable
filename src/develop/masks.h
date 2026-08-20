@@ -20,6 +20,7 @@
 
 #include "common/darktable.h"
 #include "common/opencl.h"
+#include "common/rasterfile_recipe.h"
 #include "develop/pixelpipe.h"
 #include "dtgtk/button.h"
 #include "dtgtk/gradientslider.h"
@@ -211,6 +212,64 @@ typedef struct dt_masks_point_group_t
   float opacity;
 } dt_masks_point_group_t;
 
+// ---- ai provenance trailer for groups of path forms ----
+//
+// a group of paths produced by the ai object mask carries the provenance
+// recipe of the session that created it -- the exact prompt clicks, decode
+// boundaries and model versions (see common/rasterfile_recipe.h) -- so the
+// group can later be re-opened for ai editing from its original prompts.
+// the trailer lives in dt_masks_form_t by value and is persisted by
+// appending it to the group's point blob in the masks history: a reader
+// that does not know the layout (an upstream darktable) reads exactly
+// nb * sizeof(dt_masks_point_group_t) bytes, ignores the excess and drops
+// it on its next write -- the mask itself stays intact either way.
+//
+// known exception, documented and accepted (no format change): the XMP
+// import path for sidecars older than v3 (_add_mask_entries_to_db,
+// exif.cc) strictly validates the group blob size and rejects the whole
+// mask on mismatch. that path is unreachable for masks written by this
+// build, which always produces v3+ sidecars whose blobs are read verbatim.
+// watch upstream: if that strict validation is ever generalized to the
+// v3+ path, the trailer must migrate to its own storage
+#define DT_MASKS_AI_TRAILER_MAGIC 0x44544154u  // "DTAT"; 0 = no recipe
+#define DT_MASKS_AI_TRAILER_VERSION 1
+// the session was seeded with a synthetic prev_mask (context
+// rasterisation): its recipe alone cannot reproduce the starting mask, a
+// re-edit must seed a context again instead of replaying the clicks
+#define DT_MASKS_AI_TRAILER_CONTEXT_SEEDED (1u << 0)
+
+typedef struct dt_masks_ai_trailer_t
+{
+  uint32_t magic;        // DT_MASKS_AI_TRAILER_MAGIC, 0 = no recipe
+  uint32_t version;      // trailer layout, independent of DEVELOP_MASKS_VERSION
+  uint32_t flags;        // bit 0 = CONTEXT_SEEDED
+  // low 32 bits of an image identity hash (basename without extension,
+  // sensor dimensions, capture datetime -- the same ingredients as the
+  // rasterfile fingerprint, cf. rasterfile_recipe.h): a history pasted
+  // onto ANOTHER image carries clicks recorded on the original photo, and
+  // a re-edit must detect that and seed a context instead of replaying
+  // them. mirrored by outil/verifier_trailer.py
+  uint32_t image_hash;
+  // hash of the group content at capture time: the group's own serialized
+  // blob (trailer excluded) followed by each child's point blob in list
+  // order. covers child states (union/difference), opacities, order and
+  // membership -- any manual retouch changes it, and a re-edit then knows
+  // the recorded clicks no longer describe the current shapes
+  int64_t paths_hash;
+  dt_rf_recipe_t recipe; // the very struct the rasterfile params embed
+} dt_masks_ai_trailer_t;
+
+// appended to serialized blobs and copied around by value: no implicit
+// padding allowed, layout frozen -- any change bumps the trailer version,
+// and an unknown version reads as no trailer at all.
+// deliberate lifecycle choices: dt_masks_form_duplicate does NOT copy the
+// trailer (a duplicate is a new, hand-owned group and degrades to context
+// seeding; may be revisited with the mask-edit work). size note: each
+// trailer adds ~1.1 KB to the XMP packet of exported JPEGs, whose APP1
+// segment caps at 64 KB -- marginal against the existing mask data, but
+// part of that budget.
+G_STATIC_ASSERT(sizeof(dt_masks_ai_trailer_t) == 1096);
+
 /** structure used to store pointers to the functions implementing operations on a mask shape */
 /** plus a few per-class descriptive data items */
 typedef struct dt_masks_functions_t
@@ -369,6 +428,11 @@ typedef struct dt_masks_form_t
   dt_mask_id_t formid;
   // version of the form
   int version;
+  // ai provenance trailer, meaningful for groups of ai-produced paths only
+  // (magic == 0 otherwise). in-memory it travels by value through form
+  // duplication and the history deep copies; on disk it is appended to the
+  // group's point blob, see dt_masks_write_masks_history_item
+  dt_masks_ai_trailer_t ai_trailer;
 } dt_masks_form_t;
 
 typedef struct dt_masks_form_gui_points_t
@@ -486,7 +550,25 @@ extern const dt_masks_functions_t dt_masks_functions_group;
 extern const dt_masks_functions_t dt_masks_functions_object;
 /** check if AI object mask model is downloaded and AI is enabled */
 gboolean dt_masks_object_available(void);
+/** TRUE while an AI computation owns the object tool session: the eager
+ * encode, an interactive decode, or the replay of a reopened recipe */
+gboolean dt_masks_object_session_busy(void);
 #endif
+
+/** THE question every "add shape" entry point asks before mutating
+ * anything: would starting a new shape destroy work in progress? starting
+ * one goes through dt_masks_change_form_gui, which clears the form gui and
+ * with it the per-type scratchpad of the tool currently computing. keep
+ * this a pure predicate: it is read from gestures AND from the widget
+ * refresh below, which must not have side effects */
+gboolean dt_masks_shapes_locked(void);
+
+/** re-derive the sensitivity (and the explanatory tooltip) of every "add
+ * shape" button of every module from the predicate above. assignment, never
+ * a toggle: no exit path can leave a button stuck, the last call wins and
+ * the truth is re-read each time. cheap and idempotent, made to be called
+ * from a timer as well as from the state transitions */
+void dt_masks_update_shapes_sensitivity(void);
 
 /** init dt_masks_form_gui_t struct with default values */
 void dt_masks_init_form_gui(dt_masks_form_gui_t *gui);

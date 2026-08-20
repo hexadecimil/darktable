@@ -3690,8 +3690,8 @@
   </dtconfig>
   <dtconfig>
     <name>plugins/darkroom/masks/object/feather</name>
-    <type min="0.0005" max="1.0">float</type>
-    <default>0.0005</default>
+    <type min="0.0" max="1.0">float</type>
+    <default>0.0</default>
     <shortdescription>AI mask feather</shortdescription>
     <longdescription>feather (border softness) applied to the resulting path mask. 0 = hard edge, higher values create a softer transition.</longdescription>
   </dtconfig>
@@ -3757,6 +3757,20 @@
     <default>10.0</default>
     <shortdescription>DenseCRF edge-snap strength</shortdescription>
     <longdescription>weight of the bilateral (edge-aware) pairwise term in DenseCRF boundary refinement. higher values make the mask snap more aggressively to image edges</longdescription>
+  </dtconfig>
+  <dtconfig>
+    <name>plugins/darkroom/masks/object/ai_refine</name>
+    <type>bool</type>
+    <default>FALSE</default>
+    <shortdescription>refine AI mask contour with a dedicated network</shortdescription>
+    <longdescription>run a boundary refinement network on the mask contour after each click. the segmentation decoder emits a fixed low-resolution mask, so on a large image one mask pixel spans dozens of image pixels; this recovers detail that resampling cannot. costs about one second per click on a discrete GPU, and is skipped entirely when the refinement model is missing or when the configured execution provider is CPU</longdescription>
+  </dtconfig>
+  <dtconfig>
+    <name>plugins/darkroom/masks/object/ai_refine_margin</name>
+    <type min="0.0" max="0.5">float</type>
+    <default>0.15</default>
+    <shortdescription>AI contour refinement region margin</shortdescription>
+    <longdescription>extra margin around the object bounding box, as a fraction of its size, included in the region sent to the refinement network. larger values give the network more context and move the recomposition seam further from the object</longdescription>
   </dtconfig>
   <dtconfig>
     <name>plugins/darkroom/ashift/near_delta</name>
