@@ -710,6 +710,10 @@ static void _blendop_masks_mode_callback(const dt_develop_mask_mode_t mask_mode,
 
   dt_dev_add_history_item(darktable.develop, data->module, TRUE);
 
+  // the mask manager lists raster consumers as rows of their own now:
+  // entering or leaving raster mode creates or removes such a row
+  dt_dev_masks_list_change(darktable.develop);
+
   // rebuild the accelerators
   dt_iop_connect_accels_multi(data->module->so);
 }
@@ -3000,6 +3004,9 @@ static void _raster_value_changed_callback(GtkWidget *widget,
 
   dt_dev_add_history_item(module->dev, module, TRUE);
 
+  // which source feeds this module is a row of the mask manager now
+  dt_dev_masks_list_change(module->dev);
+
   if(reprocess)
     dt_dev_reprocess_all(module->dev);
 }
@@ -3032,6 +3039,10 @@ static void _raster_polarity_callback(GtkGestureSingle *gesture,
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(togglebutton), bp->raster_mask_invert);
 
   dt_dev_add_history_item(darktable.develop, self, TRUE);
+
+  // the inverse badge of the consumer's row in the mask manager: a
+  // derived column, refreshed in place
+  dt_dev_masks_list_update(darktable.develop);
 }
 
 void dt_iop_gui_init_raster(GtkWidget *blendw, dt_iop_module_t *module)

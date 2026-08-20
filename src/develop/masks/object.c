@@ -2373,6 +2373,14 @@ static gboolean _finalize_apply_idle(gpointer data)
       p->recipe = a->recipe;
     else
       memset(&p->recipe, 0, sizeof(p->recipe));
+    // name the instance after the gesture: the mask manager row and the
+    // module header then read "precise mask" instead of a third
+    // "external raster masks". never over a name typed by hand
+    if(!rf->multi_name_hand_edited)
+    {
+      g_strlcpy(rf->multi_name, _("precise mask"), sizeof(rf->multi_name));
+      if(rf->gui_data) dt_iop_gui_update_header(rf);
+    }
     rf->enabled = TRUE;
     dt_dev_add_history_item(dev, rf, TRUE);
     // resync the module's widgets, or the stale combo would re-commit the
@@ -2427,6 +2435,8 @@ static gboolean _finalize_apply_idle(gpointer data)
     // target the focus stays on the new instance, where the mask lives
     if(created) dt_iop_request_focus(target);
     dt_control_log(_("precise raster mask applied to %s"), target->name());
+    // the manager lists this consumer as a raster row now
+    dt_dev_masks_list_change(dev);
   }
   else
     dt_control_log(_("precise raster mask saved and loaded in the raster module"));
