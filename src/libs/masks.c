@@ -307,6 +307,10 @@ typedef struct dt_lib_masks_t
   // the kind glyphs, indexed by _new_mask_shapes: same table, same order, so a
   // seventh kind is one line there and nothing at all here
   GdkPixbuf *ic_type[G_N_ELEMENTS(_new_mask_shapes)];
+  // the raster glyph, apart from ic_type on purpose: that array is
+  // indexed by _new_mask_shapes, the table that also builds the six
+  // creation buttons, and a raster mask is nothing one draws
+  GdkPixbuf *ic_raster;
 
   // a selection requested (e.g. right after creating a shape) before the tree
   // had the matching row: re-applied once gui_update rebuilds the tree. 0 = none.
@@ -1294,6 +1298,147 @@ static gboolean _mask_target_alive(const dt_iop_module_t *m)
   return FALSE;
 }
 
+// a raster consumer: a module whose blending takes its mask from another
+// module's raster output. the consumer is this panel's analogue of a
+// mask, the source its analogue of a shape -- one row per consumer
+static gboolean _raster_consumer(const dt_iop_module_t *m)
+{
+  return m && m->blend_params
+    && (m->blend_params->mask_mode & DEVELOP_MASK_ENABLED)
+    && (m->blend_params->mask_mode & DEVELOP_MASK_RASTER)
+    && m->raster_mask.sink.source != NULL;
+}
+
+// what tells a raster row apart in either store: it names a module and
+// no form. a mask row carries its group's formid, a library row its
+// shape's, and the one root row without a module is the unattached group
+static gboolean _raster_row(const dt_iop_module_t *module,
+                            const dt_mask_id_t id)
+{
+  return module != NULL && !dt_is_valid_maskid(id);
+}
+
+// wire `target` to take its mask from `source`'s raster output, or, on
+// source == NULL, unwire it and leave raster masking altogether. the
+// exact sequence of the raster combo (_raster_value_changed_callback)
+// and of the automatic path in develop/masks/object.c, announcement of a
+// displaced drawn mask included. everything is re-read at click time:
+// a menu outlives the pipe under it
+static void _raster_set_source(dt_iop_module_t *target,
+                               dt_iop_module_t *source,
+                               const dt_mask_id_t id)
+{
+  if(!_mask_target_alive(target) || !_mask_target_has_gui(target))
+    return;
+  if(source && !_mask_target_alive(source)) return;
+
+  if(target->raster_mask.sink.source)
+    g_hash_table_remove
+      (target->raster_mask.sink.source->raster_mask.source.users, target);
+
+  dt_develop_blend_params_t *bp = target->blend_params;
+  const uint32_t old_mode = bp->mask_mode;
+  gboolean reprocess = FALSE;
+
+  target->raster_mask.sink.source = source;
+  target->raster_mask.sink.id = source ? id : INVALID_MASKID;
+
+  if(source)
+  {
+    reprocess = !dt_iop_is_raster_mask_used(source, id);
+    // insert and not add: the value is the mask id, as the commit writes
+    // it -- readers only trust the keys, but no reason to feed the quirk
+    g_hash_table_insert(source->raster_mask.source.users, target,
+                        GINT_TO_POINTER(id));
+    memcpy(bp->raster_mask_source, source->op,
+           sizeof(bp->raster_mask_source));
+    bp->raster_mask_instance = source->multi_priority;
+    bp->raster_mask_id = id;
+    bp->mask_mode = (old_mode & ~DEVELOP_MASK_MASK)
+      | DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
+    if(old_mode & DEVELOP_MASK_MASK)
+      dt_control_log(_("the drawn mask of %s was replaced by the raster"
+                       " mask"), target->name());
+  }
+  else
+  {
+    memset(bp->raster_mask_source, 0, sizeof(bp->raster_mask_source));
+    bp->raster_mask_instance = 0;
+    bp->raster_mask_id = INVALID_MASKID;
+    // deliberately not the combo's "no mask used", which stays in raster
+    // mode and blends against a mask of zeros: removing the row removes
+    // the mode, the conditional blend survives
+    bp->mask_mode = old_mode & ~DEVELOP_MASK_RASTER;
+  }
+
+  dt_dev_add_history_item(darktable.develop, target, TRUE);
+  if(target->gui_data) dt_iop_gui_update(target);
+  dt_dev_masks_list_change(darktable.develop);
+  if(reprocess)
+    dt_dev_reprocess_all(darktable.develop);
+}
+
+static void _raster_assign_cb(GtkMenuItem *item, gpointer source)
+{
+  dt_iop_module_t *target = g_object_get_data(G_OBJECT(item), "target");
+  const dt_mask_id_t id =
+    GPOINTER_TO_INT(g_object_get_data(G_OBJECT(item), "rasterid"));
+  _raster_set_source(target, source, id);
+}
+
+static void _raster_detach_cb(GtkMenuItem *item, gpointer target)
+{
+  _raster_set_source(target, NULL, INVALID_MASKID);
+}
+
+// one entry per raster mask advertised by a module BEFORE `target` in
+// the pipe -- the very walk and the very cut of the blending panel's
+// raster combo (_raster_combo_populate): the pipe refuses a source at or
+// past its consumer, so none is offered. the one already in use stays,
+// greyed, and says so in the label, gtk3 giving insensitive items no
+// tooltip
+static gboolean _raster_source_items(GtkMenuShell *menu,
+                                     dt_iop_module_t *target)
+{
+  gboolean any = FALSE;
+
+  for(const GList *l = darktable.develop->iop; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *m = l->data;
+    if(m == target) break;
+
+    GHashTableIter miter;
+    gpointer key, value;
+    g_hash_table_iter_init(&miter, m->raster_mask.source.masks);
+    while(g_hash_table_iter_next(&miter, &key, &value))
+    {
+      const dt_mask_id_t id = GPOINTER_TO_INT(key);
+      const gboolean in_use = (m == target->raster_mask.sink.source)
+        && (id == target->raster_mask.sink.id);
+
+      gchar *label = in_use
+        ? g_strdup_printf("%s (%s)", (const char *)value, _("in use"))
+        : g_strdup((const char *)value);
+      GtkWidget *item = gtk_menu_item_new_with_label(label);
+      g_free(label);
+
+      if(in_use)
+        gtk_widget_set_sensitive(item, FALSE);
+      else
+      {
+        g_object_set_data(G_OBJECT(item), "target", target);
+        g_object_set_data(G_OBJECT(item), "rasterid", GINT_TO_POINTER(id));
+        g_signal_connect(item, "activate",
+                         G_CALLBACK(_raster_assign_cb), m);
+      }
+      gtk_menu_shell_append(menu, item);
+      any = TRUE;
+    }
+  }
+
+  return any;
+}
+
 // the module of the row selected in the masks list, if that module is still in
 // the pipe and can take a drawn mask -- nothing otherwise. this is the one
 // answer that comes from a deliberate gesture: the four rules below it are
@@ -1920,6 +2065,24 @@ static void _new_mask_shape_items(GtkMenuShell *menu, dt_iop_module_t *target)
                      GINT_TO_POINTER(_new_mask_shapes[i].type));
     gtk_menu_shell_append(menu, item);
   }
+
+  // the raster masks, in the same catalogue: assigning one is choosing
+  // a mask for the target, minus the drawing. only sources before the
+  // target exist for the pipe, so only they appear -- and none, no
+  // section, like the missing ctrl lines: absence over noise
+  GtkWidget *rsub = gtk_menu_new();
+  if(_raster_source_items(GTK_MENU_SHELL(rsub), target))
+  {
+    gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+    GtkWidget *ritem = gtk_menu_item_new_with_label(_("use a raster mask"));
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(ritem), rsub);
+    gtk_menu_shell_append(menu, ritem);
+  }
+  else
+  {
+    g_object_ref_sink(rsub);
+    g_object_unref(rsub);
+  }
 }
 
 // picking a module from the "..." of the target row: it says where the next
@@ -2397,7 +2560,96 @@ static void _set_iter_name(dt_lib_masks_t *lm,
                            GtkTreeModel *model,
                            GtkTreeIter *iter)
 {
-  if(!form) return;
+  if(!form)
+  {
+    // a raster row: no form anywhere, the consumer module carries
+    // everything. one writer for the derived columns, this function, on
+    // these rows too -- which is what lets _update_foreach refresh them
+    // in place when the consumer or its source is switched
+    dt_iop_module_t *rmod = NULL;
+    dt_mask_id_t rid = INVALID_MASKID;
+    _lib_masks_get_values(model, iter, &rmod, NULL, &rid);
+    if(!_raster_row(rmod, rid) || !_mask_target_alive(rmod)
+       || !_raster_consumer(rmod))
+      return;
+    dt_iop_module_t *src = rmod->raster_mask.sink.source;
+    if(!_mask_target_alive(src)) return;
+
+    // the name is exactly what a rename writes back: the source
+    // instance's own name, or its module name while it has none -- the
+    // prefill rule of the module header's rename entry
+    gchar *rname = (*src->multi_name && strcmp(src->multi_name, "0"))
+      ? dt_util_localize_segmented_name(src->multi_name, FALSE)
+      : g_strdup(src->name());
+
+    gchar *cname = dt_history_item_get_name(rmod);
+    gchar *rtarget = g_strdup_printf("→ %s", cname);
+    g_free(cname);
+
+    // the row tooltip is derived from the source's current name, so it
+    // is written here with the other derived columns: an in-place
+    // refresh after a rename then updates it along with the name,
+    // instead of leaving it stale until the next full rebuild
+    gchar *sname = dt_history_item_get_name(src);
+    gchar *rtip = g_strdup_printf
+      (_("raster mask: pixels handed over by '%s'\n"
+         "it has no shapes to edit on the photograph\n"
+         "right-click to change or remove the link"), sname);
+    g_free(sname);
+
+    // the three states that silently break a raster wiring, said on the
+    // row instead of in a toast that is gone: the pipe refuses a source
+    // at or past its consumer and blends against zeros, a source
+    // switched off writes no mask at all, and a source that stopped
+    // advertising the wanted mask -- turned raster consumer itself, or
+    // stripped of its blending -- has nothing to hand over either
+    const char *rlink = "";
+    if(src->iop_order >= rmod->iop_order)
+      rlink = _("source later in pipe");
+    else if(!src->enabled)
+      rlink = _("source is off");
+    else if(!g_hash_table_contains(src->raster_mask.source.masks,
+                                   GINT_TO_POINTER(rmod->raster_mask.sink.id)))
+      rlink = _("source provides no mask");
+
+    const gboolean rmoff = !rmod->enabled;
+    const gboolean rpower = rmod->off != NULL
+      && !rmod->hide_enable_button;
+    // develop/blend.c honours the show request of a focused raster
+    // consumer (request_raster_display), so the cell works unchanged
+    const gboolean rshow = rmod->blend_data != NULL;
+    const gboolean rshow_on = rshow
+      && rmod->enabled
+      && dt_iop_has_focus(rmod)
+      && (rmod->request_mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK);
+
+    GdkPixbuf *ricinv = rmod->blend_params->raster_mask_invert
+      ? lm->ic_inverse : NULL;
+
+    gtk_tree_store_set(GTK_TREE_STORE(model), iter,
+                       TREE_TEXT, rname,
+                       TREE_OPACITY, "",
+                       TREE_NUM, "",
+                       TREE_LINK, rlink,
+                       TREE_IC_OP, NULL,
+                       TREE_IC_OP_VISIBLE, FALSE,
+                       TREE_IC_INVERSE, ricinv,
+                       TREE_IC_INVERSE_VISIBLE, (ricinv != NULL),
+                       TREE_IC_TYPE, lm->ic_raster,
+                       TREE_IC_TYPE_VISIBLE, TRUE,
+                       TREE_TARGET, rtarget,
+                       TREE_USED_TEXT, rtip,
+                       TREE_MODULE_OFF, rmoff,
+                       TREE_MODULE_ON, !rmoff,
+                       TREE_POWER, rpower,
+                       TREE_SHOW, rshow,
+                       TREE_SHOW_ON, rshow_on,
+                       -1);
+    g_free(rtip);
+    g_free(rtarget);
+    g_free(rname);
+    return;
+  }
 
   // TREE_TEXT is exactly form->name, on every row and with nothing appended:
   // _tree_cell_edited copies the displayed string straight back into
@@ -2882,6 +3134,7 @@ static void _tree_delete_shape(GtkButton *button, dt_lib_module_t *self)
   dt_iop_module_t *module = NULL;
 
   GList *items = gtk_tree_selection_get_selected_rows(selection, NULL);
+  int removed = 0;
 
   for(const GList *items_iter = items;
       items_iter;
@@ -2898,6 +3151,16 @@ static void _tree_delete_shape(GtkButton *button, dt_lib_module_t *self)
       dt_mask_id_t grid = INVALID_MASKID;
       dt_mask_id_t id = INVALID_MASKID;
       _lib_masks_get_values(model, &iter, &module, &grid, &id);
+
+      // a raster row names no form: removing it is unlinking, offered
+      // by its own menu entry and never by this one -- a multiple
+      // selection can still carry one here
+      if(!dt_is_valid_maskid(id))
+      {
+        gtk_tree_iter_free(prev_iter);
+        gtk_tree_iter_free(next_iter);
+        continue;
+      }
 
       // moving the selection to a neighbouring row is interface comfort, not
       // persisted state: it stays as it was, flip or no flip
@@ -2935,12 +3198,18 @@ static void _tree_delete_shape(GtkButton *button, dt_lib_module_t *self)
 
       dt_masks_form_remove(module, dt_masks_get_from_id(darktable.develop, grid),
                            dt_masks_get_from_id(darktable.develop, id));
+      removed++;
     }
   }
   g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
 
-  dt_dev_add_masks_history_item(darktable.develop, NULL, TRUE);
-  _lib_masks_recreate_list(self);
+  // a selection of raster rows alone deletes nothing: no history item
+  // and no rebuild for a gesture that changed nothing
+  if(removed)
+  {
+    dt_dev_add_masks_history_item(darktable.develop, NULL, TRUE);
+    _lib_masks_recreate_list(self);
+  }
 }
 
 static void _tree_duplicate_shape(GtkButton *button, dt_lib_module_t *self)
@@ -3062,9 +3331,45 @@ static void _tree_cell_edited(GtkCellRendererText *cell,
   if(!gtk_tree_model_get_iter_from_string(model, &iter, path_string)) return;
 
   dt_mask_id_t id = INVALID_MASKID;
-  _lib_masks_get_values(model, &iter, NULL, NULL, &id);
+  dt_iop_module_t *module = NULL;
+  _lib_masks_get_values(model, &iter, &module, NULL, &id);
   dt_masks_form_t *form = dt_masks_get_from_id(darktable.develop, id);
-  if(!form) return;
+  if(!form)
+  {
+    // a raster row: the name on it is the source instance's, so a
+    // rename renames that instance -- the very write of the module
+    // header's own rename entry, seen everywhere the instance is named
+    if(_raster_row(module, id) && _mask_target_alive(module)
+       && _raster_consumer(module)
+       && _mask_target_alive(module->raster_mask.sink.source))
+    {
+      dt_iop_module_t *src = module->raster_mask.sink.source;
+      // write only on an actual change, as the header's rename entry
+      // does (_rename_module_key_press compares first): the forced
+      // write would stamp a history item and re-enable a switched-off
+      // source just for validating the prefilled name unchanged
+      gboolean changed;
+      if(strlen(new_text) == 0)
+        changed = *src->multi_name != '\0';
+      else
+      {
+        gchar *shown = (*src->multi_name && strcmp(src->multi_name, "0"))
+          ? dt_util_localize_segmented_name(src->multi_name, FALSE)
+          : g_strdup(src->name());
+        changed = g_strcmp0(shown, new_text) != 0;
+        g_free(shown);
+      }
+      if(changed)
+      {
+        if(strlen(new_text) == 0)
+          dt_iop_update_multi_name(src, "", FALSE, FALSE, TRUE);
+        else
+          dt_iop_update_multi_name(src, new_text, TRUE, TRUE, TRUE);
+        dt_dev_masks_list_update(darktable.develop);
+      }
+    }
+    return;
+  }
 
   // we want to make sure that the new name is not an empty
   // string. else this would convert in the xmp file into "<rdf:li/>"
@@ -3363,6 +3668,40 @@ static void _tree_context_menu(dt_lib_module_t *self,
   if(depth > 1)
     from_group = TRUE;
 
+  // a raster row gets a menu of its own: nothing of the shape
+  // vocabulary applies to it. rename edits the source instance's name,
+  // the submenu rewires the consumer, the last entry unlinks it --
+  // unlinking, never deleting: there is no form anywhere to destroy
+  const gboolean raster_sel = (nb == 1) && !from_group
+    && _raster_row(sel_module, grpid)
+    && _mask_target_alive(sel_module)
+    && _raster_consumer(sel_module);
+  if(raster_sel)
+  {
+    item = gtk_menu_item_new_with_label(_("rename"));
+    g_signal_connect(item, "activate", G_CALLBACK(_tree_rename), self);
+    gtk_menu_shell_append(menu, item);
+
+    GtkWidget *rsub = gtk_menu_new();
+    if(_raster_source_items(GTK_MENU_SHELL(rsub), sel_module))
+    {
+      item = gtk_menu_item_new_with_label(_("use another raster mask"));
+      gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), rsub);
+      gtk_menu_shell_append(menu, item);
+    }
+    else
+    {
+      // sink the floating reference, as _new_mask_target_header does
+      g_object_ref_sink(rsub);
+      g_object_unref(rsub);
+    }
+
+    item = gtk_menu_item_new_with_label(_("stop using this raster mask"));
+    g_signal_connect(item, "activate",
+                     G_CALLBACK(_raster_detach_cb), sel_module);
+    gtk_menu_shell_append(menu, item);
+  }
+
   if(grp && grp->type & DT_MASKS_GROUP)
   {
     // existing forms
@@ -3457,7 +3796,7 @@ static void _tree_context_menu(dt_lib_module_t *self,
     }
   }
 
-  if(!from_group && nb > 0)
+  if(!raster_sel && !from_group && nb > 0)
   {
     // the row hangs from no group, which is the whole of the rule: it owns its
     // name, TREE_EDITABLE is true on it, and the double click renames it.
@@ -3512,7 +3851,7 @@ static void _tree_context_menu(dt_lib_module_t *self,
       gtk_menu_shell_append(menu, item);
     }
   }
-  else if(nb > 0 && depth < 3)
+  else if(!raster_sel && nb > 0 && depth < 3)
   {
     // here the shape is only detached from the group of that row: it
     // stays in the mask manager and in every other module. name the
@@ -4954,6 +5293,10 @@ gboolean _find_mask_iter_by_values(GtkTreeModel *model,
     gboolean found = (fid == formid)
       && ((level == 1)
           || (module == NULL || (mod && dt_iop_module_is(module, mod->op))));
+    // raster rows all share the invalid formid: only the module pointer
+    // tells them apart, or a restored selection lands on the first one
+    if(found && !dt_is_valid_maskid(formid))
+      found = (mod == module);
     if(found) return found;
 
     GtkTreeIter child, parent = *iter;
@@ -5089,7 +5432,20 @@ static guint _forms_structure_hash(void)
   for(const GList *l = dev->iop; l; l = g_list_next(l))
   {
     const dt_iop_module_t *m = l->data;
-    if(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING) _MIX(m->blend_params->mask_id);
+    if(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
+    {
+      _MIX(m->blend_params->mask_id);
+      // the raster rows exist per wired consumer and are named after
+      // the source: both are structure, or the early-out would keep
+      // serving a list without the row a wiring just created
+      if(_raster_consumer(m))
+      {
+        const size_t rsrc = (size_t)m->raster_mask.sink.source;
+        _MIX(1u);
+        _MIX(rsrc);
+        _MIX(rsrc >> 32);
+      }
+    }
   }
 #undef _MIX
   return h;
@@ -5166,6 +5522,31 @@ void gui_update(dt_lib_module_t *self)
       continue;
 
     _lib_masks_list_recurs(store[0], NULL, form, 0, NULL, 0, 1.0, lm);
+  }
+
+  // the raster consumers, after the masks: a module taking its mask from
+  // another module's raster output had no row anywhere until now. root
+  // rows carrying a module and no form -- TREE_FORMID stays the invalid
+  // sentinel every formid reader already answers NULL for -- one per
+  // wired consumer, in pipe order
+  for(const GList *l = darktable.develop->iop; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *m = l->data;
+    if(!(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
+       || !_raster_consumer(m)
+       || !_mask_target_alive(m->raster_mask.sink.source))
+      continue;
+
+    GtkTreeIter riter;
+    gtk_tree_store_append(store[0], &riter, NULL);
+    gtk_tree_store_set(store[0], &riter,
+                       TREE_TEXT, "",
+                       TREE_MODULE, m,
+                       TREE_GROUPID, 0,
+                       TREE_FORMID, INVALID_MASKID,
+                       TREE_EDITABLE, TRUE,
+                       -1);
+    _set_iter_name(lm, NULL, 0, 1.0f, GTK_TREE_MODEL(store[0]), &riter);
   }
 
   // bottom list: the library every mask draws from -- each shape exactly once.
@@ -5329,11 +5710,19 @@ static gboolean _update_foreach(GtkTreeModel *model,
   // we retrieve the ids
   dt_mask_id_t grid = INVALID_MASKID;
   dt_mask_id_t id = INVALID_MASKID;
-  _lib_masks_get_values(model, iter, NULL, &grid, &id);
+  dt_iop_module_t *module = NULL;
+  _lib_masks_get_values(model, iter, &module, &grid, &id);
 
   // we retrieve the forms
   dt_masks_form_t *form = dt_masks_get_from_id(darktable.develop, id);
-  if(!form) return 0;
+  if(!form)
+  {
+    // a raster row refreshes in place like any other; _set_iter_name
+    // owns the whole rule
+    if(_raster_row(module, id))
+      _set_iter_name(data, NULL, 0, 1.0f, model, iter);
+    return 0;
+  }
   dt_masks_form_t *grp = dt_masks_get_from_id(darktable.develop, grid);
 
   // and the values
@@ -5981,6 +6370,8 @@ void gui_init(dt_lib_module_t *self)
   for(int i = 0; i < (int)G_N_ELEMENTS(_new_mask_shapes); i++)
     d->ic_type[i] = _get_pixbuf_from_cairo(_new_mask_shapes[i].paint,
                                            bs2, bs2);
+  d->ic_raster = _get_pixbuf_from_cairo(dtgtk_cairo_paint_masks_raster,
+                                        bs2, bs2);
 
   // the six shape toggles are back, and with them the only registration of the
   // six "shapes/add ..." paths. there can be exactly one: dt_action_locate()
