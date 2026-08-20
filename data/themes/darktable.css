@@ -1916,16 +1916,39 @@ treeview#masks-library
   background-color: shade(@bg_color, 0.9);
 }
 
-/* mask manager: the row a drag is about to drop on or between. gtk draws the
-   indicator itself under the "dnd" style class -- a line between rows
-   (reorder) or a frame around the row (add) -- and the reset at the top of
-   this file leaves both invisible (libs/tagging.c hit the same wall, see its
-   FIXME). the accent is the panel's own; note the same class also tints the
-   floating row icon of the drag, which reads as intended. */
-treeview.dnd
+/* mask manager: the row a drag is about to drop on or between. since gtk
+   3.20 the indicator is a frame gtk renders on the target row in the
+   :drop(active) state -- class "before" or "after" carves it down to one
+   insertion line, "into" (3.24.52) keeps the whole frame -- and its only
+   ink is the border, which the reset at the top of this file zeroes at a
+   priority even adwaita's own rule cannot outrank. the "dnd" class the
+   previous rule aimed at left the row indicator with gtk 3.20 and today
+   marks only a column header mid-drag, so it matched nothing here. the
+   accent is the panel's own. the rule reaches every treeview that arms
+   the indicator through gtk_tree_view_set_drag_dest_row(); libs/tagging.c
+   does not today -- its calls sit commented out behind a FIXME. */
+treeview.view:drop(active)
 {
-  color: @masks_row_on_fg;
-  border: 1px solid @masks_row_on_fg;
+  border-style: solid none;
+  border-width: 1px;
+  border-color: @masks_row_on_fg;
+}
+
+/* reorder: one line, on the edge the shape will cross */
+treeview.view:drop(active).before
+{
+  border-bottom-style: none;
+}
+
+treeview.view:drop(active).after
+{
+  border-top-style: none;
+}
+
+/* library -> mask: the whole row framed, the shape lands inside it */
+treeview.view:drop(active).into
+{
+  border-style: solid;
 }
 
 /* mask manager: the three operator buttons of the bar under the lists carry a
