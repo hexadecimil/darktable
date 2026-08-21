@@ -119,11 +119,15 @@ typedef struct _raster_cache_entry_t
   // bounding box of the pixels > 0 at level 0, inclusive coordinates;
   // an empty mask has bbox[2] < bbox[0]
   int bbox[4];
-  // the canvas outline, memoized here lazily by the display code so a
-  // re-expose never re-runs its extraction (arrives with the canvas
-  // work; reserved now so the entry owns its whole decode product)
+  // the canvas outline: closed polylines in the level-0 file frame,
+  // loops separated by DT_INVALID_COORDINATE sentinel pairs. extracted
+  // lazily by the display code and memoized here so a re-expose never
+  // re-runs marching squares. published under the table mutex, read
+  // under it once, immutable afterwards -- never a bare write, the
+  // entry is shared between the GUI and the pixelpipe threads
   float *outline;
   int outline_count;
+  gboolean outline_done;  // computed -- an empty outline memoizes too
 
   int refs;           // guarded by _raster_cache_lock
   gboolean in_table;  // FALSE once detached: dies at its last release
@@ -825,6 +829,444 @@ static int _raster_get_mask_roi(const dt_iop_module_t *const restrict module,
   return 1;
 }
 
+// ---- the canvas outline: marching squares on a display-sized mip ----
+//
+// what the photographer sees when editing the mask: the 0.5 level line
+// of the file, as closed polylines. display only -- the render above
+// never reads it, the file's graded values are the mask
+
+// the level plane padded by one virtual ring of zeros, which closes
+// every contour loop: _raster_tap already answers 0 out of bounds
+static inline float _ms_sample(const _raster_cache_entry_t *const entry,
+                               const int level,
+                               const int i,
+                               const int j)
+{
+  return _raster_tap(entry, level, i - 1, j - 1);
+}
+
+// the side the contour leaves a cell by, entered via side `entry`, or -1
+// on a non-crossing entry (a logic failure the caller drops the loop on).
+// corners: 0 (x,y), 1 (x+1,y), 2 (x+1,y+1), 3 (x,y+1); side s joins
+// corners s and (s+1)&3 -- 0 bottom, 1 right, 2 top, 3 left
+static int _ms_exit(const float v[4], const int entry)
+{
+  gboolean b[4];
+  gboolean cross[4];
+  int ncross = 0;
+  for(int k = 0; k < 4; k++)
+    b[k] = v[k] >= 0.5f;
+  for(int s = 0; s < 4; s++)
+  {
+    cross[s] = b[s] != b[(s + 1) & 3];
+    if(cross[s]) ncross++;
+  }
+  if(!cross[entry]) return -1;
+  if(ncross == 4)
+  {
+    // the saddle: two segments in one cell. the center average decides
+    // which diagonal the lit region connects across, hence which pair of
+    // corners the contour isolates -- the unlit ones when the center is
+    // lit -- and with it which crossing pairs with which. the rule only
+    // depends on the cell, never on the walk direction, so the two
+    // passes through the cell take distinct pairs
+    const gboolean center_lit
+      = 0.25f * (v[0] + v[1] + v[2] + v[3]) >= 0.5f;
+    const gboolean isolate_02 = b[0] != center_lit;
+    return entry ^ (isolate_02 ? 3 : 1);
+  }
+  for(int s = 0; s < 4; s++)
+    if(cross[s] && s != entry) return s;
+  return -1;
+}
+
+// extract the 0.5 contour of the entry as loops of level-0 file
+// coordinates separated by DT_INVALID_COORDINATE pairs -- a convention
+// internal to this type, our display callbacks are the only readers
+// (the shared point-in-form helpers read the path shapes' (INVALID,
+// index) skip convention instead). runs on the mip whose longest side
+// fits a screen-sized budget: sub-pixel fidelity at canvas scale for an
+// 8th of the work of the native plane. runs with NO lock held; NULL
+// with *count == 0 when nothing reaches the threshold (or on alloc
+// failure -- both render as "no outline", which is the right degraded
+// display). caller owns the buffer (dt_free_align)
+static float *_raster_extract_outline(const _raster_cache_entry_t *const entry,
+                                      int *count)
+{
+  double start = dt_get_debug_wtime();
+  *count = 0;
+  int level = 0;
+  while(level < RASTER_MIP_LEVELS - 1
+        && MAX(entry->lw[level], entry->lh[level]) > 1024)
+    level++;
+  const float scale = (float)(1 << level);
+  const int nx = entry->lw[level] + 2;  // the virtual zero ring
+  const int ny = entry->lh[level] + 2;
+
+  // every loop crosses a horizontal edge (the top row of its region), so
+  // starts and the visited set only need those
+  guint8 *hvisited = g_try_malloc0((size_t)(nx - 1) * ny);
+  if(!hvisited) return NULL;
+  dt_masks_dynbuf_t *dyn = dt_masks_dynbuf_init(1 << 14, "raster outline");
+  if(!dyn)
+  {
+    g_free(hvisited);
+    return NULL;
+  }
+
+  int nloops = 0;
+  // padded rows 0 and ny-1 are all zeros: no crossing can involve them
+  for(int j = 1; j < ny - 1; j++)
+    for(int i = 0; i < nx - 1; i++)
+    {
+      if(hvisited[(size_t)j * (nx - 1) + i]) continue;
+      const float e0 = _ms_sample(entry, level, i, j);
+      const float e1 = _ms_sample(entry, level, i + 1, j);
+      if((e0 >= 0.5f) == (e1 >= 0.5f)) continue;
+
+      // walk the loop: append the crossing point of the current edge,
+      // cross the adjacent cell to its exit edge, repeat until back at
+      // the start edge. every crossing edge has both neighbour cells in
+      // the padded range, so the walk needs no boundary cases
+      const size_t lstart = dt_masks_dynbuf_position(dyn);
+      gboolean horiz = TRUE;
+      int ei = i, ej = j;                  // the current crossing edge
+      int ci = i, cj = j, entry_side = 0;  // its cell above, by its bottom
+      const size_t max_steps = (size_t)4 * nx * ny;  // defensive bound
+      gboolean closed = FALSE;
+      for(size_t step = 0; step < max_steps; step++)
+      {
+        float px, py;
+        if(horiz)
+        {
+          const float v0 = _ms_sample(entry, level, ei, ej);
+          const float v1 = _ms_sample(entry, level, ei + 1, ej);
+          px = ei + (0.5f - v0) / (v1 - v0);
+          py = ej;
+          hvisited[(size_t)ej * (nx - 1) + ei] = TRUE;
+        }
+        else
+        {
+          const float v0 = _ms_sample(entry, level, ei, ej);
+          const float v1 = _ms_sample(entry, level, ei, ej + 1);
+          px = ei;
+          py = ej + (0.5f - v0) / (v1 - v0);
+        }
+        // padded sample s sits on level pixel s-1, whose center is at
+        // (s-1+0.5) * 2^level of the level-0 corner frame -- the same
+        // frame the render maps to the sensor by adding the crop
+        dt_masks_dynbuf_add_2(dyn, (px - 0.5f) * scale,
+                              (py - 0.5f) * scale);
+
+        const float v[4] = { _ms_sample(entry, level, ci, cj),
+                             _ms_sample(entry, level, ci + 1, cj),
+                             _ms_sample(entry, level, ci + 1, cj + 1),
+                             _ms_sample(entry, level, ci, cj + 1) };
+        const int exit_side = _ms_exit(v, entry_side);
+        if(exit_side < 0) break;
+        switch(exit_side)
+        {
+          case 0:  // out through the bottom, into the cell below
+            horiz = TRUE;
+            ei = ci;
+            ej = cj;
+            cj = cj - 1;
+            entry_side = 2;
+            break;
+          case 2:  // out through the top, into the cell above
+            horiz = TRUE;
+            ei = ci;
+            ej = cj + 1;
+            cj = cj + 1;
+            entry_side = 0;
+            break;
+          case 1:  // out through the right side
+            horiz = FALSE;
+            ei = ci + 1;
+            ej = cj;
+            ci = ci + 1;
+            entry_side = 3;
+            break;
+          default:  // 3: out through the left side
+            horiz = FALSE;
+            ei = ci;
+            ej = cj;
+            ci = ci - 1;
+            entry_side = 1;
+            break;
+        }
+        if(horiz && ei == i && ej == j)
+        {
+          closed = TRUE;
+          break;
+        }
+      }
+      if(!closed)
+      {
+        // the guard cut a spin a logic failure would cause: forget the
+        // partial loop rather than hand a broken polygon to the canvas
+        dt_masks_dynbuf_reset_position(dyn, lstart);
+        continue;
+      }
+
+      // light in-place simplification: marching squares emits exactly
+      // collinear runs along the axis-aligned stretches of the contour.
+      // the cross-product epsilon scales with the emitted coordinates
+      float *lp = dt_masks_dynbuf_buffer(dyn) + lstart;
+      const int n = (int)((dt_masks_dynbuf_position(dyn) - lstart) / 2);
+      const float eps = 1e-3f * scale * scale;
+      int m = 1;  // the first point always stays
+      for(int k = 1; k < n; k++)
+      {
+        const float *prev = lp + 2 * (m - 1);
+        const float *cur = lp + 2 * k;
+        const float *next = lp + 2 * ((k + 1) % n);
+        const float area2 = (cur[0] - prev[0]) * (next[1] - prev[1])
+                            - (cur[1] - prev[1]) * (next[0] - prev[0]);
+        if(fabsf(area2) <= eps) continue;
+        lp[2 * m] = cur[0];
+        lp[2 * m + 1] = cur[1];
+        m++;
+      }
+      if(m < 3)
+      {
+        dt_masks_dynbuf_reset_position(dyn, lstart);
+        continue;
+      }
+      dt_masks_dynbuf_reset_position(dyn, lstart + 2 * (size_t)m);
+      dt_masks_dynbuf_add_2(dyn, DT_INVALID_COORDINATE,
+                            DT_INVALID_COORDINATE);
+      nloops++;
+    }
+  g_free(hvisited);
+
+  const size_t total = dt_masks_dynbuf_position(dyn) / 2;
+  float *out = total > 0 ? dt_masks_dynbuf_harvest(dyn) : NULL;
+  dt_masks_dynbuf_free(dyn);
+  dt_print(DT_DEBUG_MASKS,
+           "[masks raster] outline '%s' mip %d: %d loop(s), %d points, "
+           "took %0.04f sec",
+           entry->path, level, nloops, (int)total, dt_get_lap_time(&start));
+  *count = (int)total;
+  return out;
+}
+
+// the memoized outline of an entry, extracted on first request. the
+// extraction runs outside any lock on the entry's immutable planes; the
+// result is published UNDER THE TABLE MUTEX (and read back under it),
+// never by a bare write -- the entry is shared between the GUI thread
+// asking here and the pipe threads holding references. once published
+// the fields never change again, so the returned pointer stays valid
+// lock-free for as long as the caller holds its entry reference
+static const float *_raster_entry_outline(_raster_cache_entry_t *entry,
+                                          int *count)
+{
+  g_mutex_lock(&_raster_cache_lock);
+  gboolean done = entry->outline_done;
+  const float *out = entry->outline;
+  int n = entry->outline_count;
+  g_mutex_unlock(&_raster_cache_lock);
+  if(done)
+  {
+    *count = n;
+    return out;
+  }
+
+  int fresh_count = 0;
+  float *fresh = _raster_extract_outline(entry, &fresh_count);
+
+  g_mutex_lock(&_raster_cache_lock);
+  if(entry->outline_done)
+  {
+    // a concurrent expose extracted it first: the published one wins
+    out = entry->outline;
+    n = entry->outline_count;
+    g_mutex_unlock(&_raster_cache_lock);
+    dt_free_align(fresh);
+    *count = n;
+    return out;
+  }
+  entry->outline = fresh;
+  entry->outline_count = fresh_count;
+  entry->outline_done = TRUE;
+  g_mutex_unlock(&_raster_cache_lock);
+  *count = fresh_count;
+  return fresh;
+}
+
+// the gpt polylines of the form: the memoized file-frame outline mapped
+// to the preview pipe -- +metadata crop, normalized by the sensor size,
+// scaled by the pipe input size, then through the pipe distortions, the
+// same chain every drawn shape takes for its display points
+static int _raster_get_points_border(dt_develop_t *dev,
+                                     dt_masks_form_t *form,
+                                     float **points,
+                                     int *points_count,
+                                     float **border,
+                                     int *border_count,
+                                     const int source,
+                                     const dt_iop_module_t *const module)
+{
+  (void)module; // unused arg, keep compiler from complaining
+  *points = NULL;
+  *points_count = 0;
+  if(border) *border = NULL;
+  if(border_count) *border_count = 0;
+  // no geometric border, and never a clone source
+  if(source) return 0;
+
+  dt_masks_point_raster_t *pt = _raster_point(form);
+  if(!pt) return 0;
+
+  // GUI side: the displayed image and the preview pipe set the frames
+  const dt_image_t *img = &dev->image_storage;
+  if(img->width <= 0 || img->height <= 0) return 0;
+
+  gchar *path = _raster_resolve_path(pt, img);
+  if(!path) return 0;
+  // quiet: the expose retries while a recompute prepares the file, and
+  // the negative cache prices every retry at one stat
+  _raster_cache_entry_t *entry = _raster_cache_acquire(path, TRUE);
+  g_free(path);
+  // missing file: an empty gpt is tolerated everywhere. returning 0
+  // leaves gui->pipe_hash unset, so the next expose retries -- cheap
+  if(!entry) return 0;
+
+  int ocount = 0;
+  const float *outline = _raster_entry_outline(entry, &ocount);
+  if(!outline || ocount < 4)
+  {
+    // nothing at or above the display threshold anywhere in the file:
+    // succeed with an empty polygon set so the expose does not retry
+    _raster_cache_release(entry);
+    return 1;
+  }
+
+  float wd = 0.0f, ht = 0.0f;
+  dt_masks_get_image_size(NULL, NULL, &wd, &ht);
+  float *pts = (wd > 0.0f && ht > 0.0f)
+    ? dt_alloc_align_float((size_t)ocount * 2)
+    : NULL;
+  if(!pts)
+  {
+    _raster_cache_release(entry);
+    return 0;
+  }
+
+  // the sentinel pairs separating the loops must not travel through the
+  // pipe transform (path.c writes its skip sentinels after the batch
+  // transform for the same reason): their slot carries a copy of the
+  // loop's first point for the ride and is overwritten below
+  const float sx = wd / (float)img->width;
+  const float sy = ht / (float)img->height;
+  int lstart = 0;
+  for(int k = 0; k < ocount; k++)
+  {
+    if(outline[2 * k] == DT_INVALID_COORDINATE)
+    {
+      pts[2 * k] = pts[2 * lstart];
+      pts[2 * k + 1] = pts[2 * lstart + 1];
+      lstart = k + 1;
+    }
+    else
+    {
+      pts[2 * k] = (outline[2 * k] + (float)img->crop_x) * sx;
+      pts[2 * k + 1] = (outline[2 * k + 1] + (float)img->crop_y) * sy;
+    }
+  }
+
+  if(!dt_dev_distort_transform(dev, pts, ocount))
+  {
+    dt_free_align(pts);
+    _raster_cache_release(entry);
+    return 0;
+  }
+
+  for(int k = 0; k < ocount; k++)
+    if(outline[2 * k] == DT_INVALID_COORDINATE)
+    {
+      pts[2 * k] = DT_INVALID_COORDINATE;
+      pts[2 * k + 1] = DT_INVALID_COORDINATE;
+    }
+  _raster_cache_release(entry);
+
+  *points = pts;
+  *points_count = ocount;
+  return 1;
+}
+
+// squared distance from (x, y) to the segment (ax, ay)-(bx, by)
+static float _raster_seg_dist2(const float x,
+                               const float y,
+                               const float ax,
+                               const float ay,
+                               const float bx,
+                               const float by)
+{
+  const float dx = bx - ax, dy = by - ay;
+  const float l2 = dx * dx + dy * dy;
+  float t = l2 > 0.0f ? ((x - ax) * dx + (y - ay) * dy) / l2 : 0.0f;
+  t = CLAMP(t, 0.0f, 1.0f);
+  const float px = ax + t * dx - x;
+  const float py = ay + t * dy - y;
+  return px * px + py * py;
+}
+
+// canvas selection: even-odd over the outline loops of the gpt, squared
+// distance to the nearest segment like the other shapes report. no
+// border, no anchors, no source -- selecting the shape is all a click
+// can do to it (the panel row selects it too, group.c guards this
+// callback there)
+static void _raster_get_distance(const float x,
+                                 const float y,
+                                 const float as,
+                                 dt_masks_form_gui_t *gui,
+                                 const int index,
+                                 const int num_points,
+                                 gboolean *inside,
+                                 gboolean *inside_border,
+                                 int *near,
+                                 gboolean *inside_source,
+                                 float *dist)
+{
+  (void)as;         // unused args, keep compiler from complaining
+  (void)num_points;
+  *inside = FALSE;
+  *inside_border = FALSE;
+  *near = -1;
+  *inside_source = FALSE;
+  *dist = FLT_MAX;
+
+  if(!gui) return;
+  dt_masks_form_gui_points_t *gpt = g_list_nth_data(gui->points, index);
+  if(!gpt || !gpt->points || gpt->points_count < 4) return;
+
+  int crossings = 0;
+  int start = 0;
+  for(int k = 0; k <= gpt->points_count; k++)
+  {
+    const gboolean cut = (k == gpt->points_count)
+      || gpt->points[2 * k] == DT_INVALID_COORDINATE;
+    if(!cut) continue;
+    if(k - start >= 3)
+    {
+      // each segment of the loop [start, k), closing edge included
+      for(int p = start; p < k; p++)
+      {
+        const int q = (p + 1 == k) ? start : p + 1;
+        const float ax = gpt->points[2 * p], ay = gpt->points[2 * p + 1];
+        const float bx = gpt->points[2 * q], by = gpt->points[2 * q + 1];
+        *dist = fminf(*dist, _raster_seg_dist2(x, y, ax, ay, bx, by));
+        if((ay > y) != (by > y)
+           && x < ax + (y - ay) / (by - ay) * (bx - ax))
+          crossings++;
+      }
+    }
+    start = k + 1;
+  }
+  *inside = (crossings & 1) != 0;
+}
+
 static void _raster_set_form_name(dt_masks_form_t *const form,
                                   const size_t nb)
 {
@@ -910,7 +1352,38 @@ static void _raster_events_post_expose(cairo_t *cr,
                                        const int index,
                                        const int num_points)
 {
-  // no outline yet: the canvas display comes with the render work
+  (void)num_points; // unused arg, keep compiler from complaining
+
+  // never in creation mode: a raster shape is built by code, not drawn.
+  // an empty or missing gpt (absent file, empty mask) draws nothing
+  dt_masks_form_gui_points_t *gpt = g_list_nth_data(gui->points, index);
+  if(!gpt || !gpt->points || gpt->points_count < 4) return;
+
+  const gboolean selected = (gui->group_selected == index)
+    && (gui->form_selected || gui->form_dragging);
+
+  // every loop as one cairo subpath, stroked once through the shared
+  // helper in its dashed style: the dashes read as "a precise mask",
+  // not an editable outline -- there are no anchors to draw
+  gboolean any = FALSE;
+  int start = 0;
+  for(int k = 0; k <= gpt->points_count; k++)
+  {
+    const gboolean cut = (k == gpt->points_count)
+      || gpt->points[2 * k] == DT_INVALID_COORDINATE;
+    if(!cut) continue;
+    if(k - start >= 3)
+    {
+      cairo_move_to(cr, gpt->points[2 * start], gpt->points[2 * start + 1]);
+      for(int p = start + 1; p < k; p++)
+        cairo_line_to(cr, gpt->points[2 * p], gpt->points[2 * p + 1]);
+      cairo_close_path(cr);
+      any = TRUE;
+    }
+    start = k + 1;
+  }
+  if(any)
+    dt_masks_line_stroke(cr, TRUE, FALSE, selected, zoom_scale);
 }
 
 // the function table for raster shapes
@@ -923,9 +1396,9 @@ const dt_masks_functions_t dt_masks_functions_raster = {
   .modify_property = NULL,
   .duplicate_points = _raster_duplicate_points,
   .initial_source_pos = NULL,
-  .get_distance = NULL,
+  .get_distance = _raster_get_distance,
   .get_points = NULL,
-  .get_points_border = NULL,
+  .get_points_border = _raster_get_points_border,
   .get_mask = NULL,
   .get_mask_roi = _raster_get_mask_roi,
   .get_area = NULL,
