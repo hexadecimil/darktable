@@ -591,6 +591,40 @@ gboolean dt_masks_object_available(void);
 /** TRUE while an AI computation owns the object tool session: the eager
  * encode, an interactive decode, or the replay of a reopened recipe */
 gboolean dt_masks_object_session_busy(void);
+
+/** a row of the static detector table (common/ai/detectors.h) */
+struct dt_detector_t;
+
+/** what a catalogue entry for a promptless detector can offer NOW. the
+ * catalogue writes the reason into the entry's label (GTK3 delivers no
+ * tooltip to an insensitive item), so every state maps to one wording */
+typedef enum dt_masks_object_detect_state_t
+{
+  DT_MASKS_OBJECT_DETECT_READY = 0,   // model installed: a click detects
+  DT_MASKS_OBJECT_DETECT_DOWNLOAD,    // a click downloads, then detects
+  DT_MASKS_OBJECT_DETECT_DOWNLOADING, // a download is already in flight
+  DT_MASKS_OBJECT_DETECT_UNAVAILABLE, // nothing installed or downloadable
+  DT_MASKS_OBJECT_DETECT_AI_OFF,      // AI disabled in preferences
+} dt_masks_object_detect_state_t;
+
+/** state of a detector's catalogue entry: the exact mirror of what
+ * dt_masks_object_detect_launch would accept, so the label never
+ * promises what the launch refuses. never cache it -- installs and
+ * preference flips move it */
+dt_masks_object_detect_state_t
+dt_masks_object_detect_state(const struct dt_detector_t *detector);
+
+/** GUI thread, darkroom only: run the one-shot promptless detection of
+ * `detector` as a cancellable background job -- no interactive session,
+ * no canvas freeze. the job downloads the task's model first when the
+ * state said DOWNLOAD, renders the image, runs the detector, finalises
+ * through the native precise-mask pass and applies the produced raster
+ * shape to `module` (nullable). the job writes the promptless v2
+ * provenance recipe, so the mask is regenerable like a clicked one.
+ * FALSE when nothing was launched (state refuses, or another
+ * finalisation holds the token) */
+gboolean dt_masks_object_detect_launch(const struct dt_detector_t *detector,
+                                       dt_iop_module_t *module);
 #endif
 
 /** the validated point of a raster shape: NULL when the form is not one

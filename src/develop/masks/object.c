@@ -2124,6 +2124,10 @@ typedef struct _finalize_apply_t
   dt_hash_t distort_hash; // distortion state at launch; applying a result
                           // computed on a since-changed geometry would wire
                           // a misaligned mask
+  // the detector row of a one-shot detection, NULL for the clicked
+  // routes: it words the apply toast ("'subject' applied to exposure").
+  // a row of the static table, so the pointer outlives any job
+  const dt_detector_t *detector;
 } _finalize_apply_t;
 
 // destroy-notify of the apply idle: owns everything the payload carries.
@@ -2361,7 +2365,11 @@ static gboolean _finalize_apply_idle(gpointer data)
       |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
     dt_dev_add_masks_history_item(dev, target, TRUE);
     if(target->gui_data) dt_iop_gui_update(target);
-    dt_control_log(_("precise mask applied to %s"), target->name());
+    if(a->detector)
+      dt_control_log(_("'%s' applied to %s"),
+                     _(a->detector->label), target->name());
+    else
+      dt_control_log(_("precise mask applied to %s"), target->name());
     // entering edit mode clears any form_gui in creation -- if the user
     // started a new mask session while the job ran, leave their session
     // alone, the shape is attached and committed either way
@@ -2371,6 +2379,8 @@ static gboolean _finalize_apply_idle(gpointer data)
       dt_masks_iop_update(target);
     }
   }
+  else if(a->detector)
+    dt_control_log(_("'%s' mask created"), _(a->detector->label));
   else
     dt_control_log(_("precise mask created"));
 
@@ -4096,6 +4106,535 @@ dt_object_recipe_model_gap_t
 dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing)
 {
   return _recipe_model_gap(recipe, missing, NULL, NULL);
+}
+
+// ------------------------ one-shot detection job ----------------------------
+//
+// "select subject" and its future siblings: a promptless detection as a
+// cancellable background job, no interactive session, no canvas freeze.
+// the job is the promptless replay run FORWARD: it captures a fresh v2
+// promptless recipe from the live state, then performs exactly the steps
+// dt_object_recipe_compute performs on that recipe -- the same render
+// helper at the same dimensions, the same detector call, the same
+// seed-component filter and bbox, the same native finalisation core and
+// the same content-addressed file name -- so the recipe it stores really
+// regenerates the file it wrote. what the replay cannot do is added
+// around that spine: the model may be DOWNLOADED first (the catalogue's
+// download->detect chaining), the _job_step hook keeps one toast alive
+// for the whole 15-40 s, and the produced file is applied as a raster
+// shape through the finalisation apply idle, unchanged
+
+typedef struct _detect_job_t
+{
+  dt_imgid_t imgid;
+  int32_t history_end;
+  const dt_detector_t *detector;  // row of the static table, never freed
+  // resolved at launch so the job is self-contained; the recipe records
+  // this very id, and the version once the model is installed
+  char model_id[DT_RF_RECIPE_MODEL_ID_LEN];
+  gboolean download;              // model absent: download it first
+  int render_size;                // raw render-cap preference at launch
+  float threshold;                // session threshold at launch (clamped)
+  float margin;                   // bbox padding at launch (clamped)
+  char target_op[32];
+  int target_multi_priority;
+  gboolean has_target;
+  dt_hash_t distort_hash;         // launch state; recorded in the recipe
+                                  // and revalidated at APPLY time
+  gchar *msg;                     // the one toast the job keeps alive
+  gboolean download_cancelled;    // set by the progress callback
+  // TRUE once the run entered: the serialisation token is reset by the
+  // run itself, the destroy releases it for a discarded job (the
+  // _finalize_job_destroy pattern)
+  gboolean ran;
+} _detect_job_t;
+
+static void _detect_job_destroy(void *p)
+{
+  _detect_job_t *j = p;
+  if(!j) return;
+  if(!j->ran)
+    g_atomic_int_set(&_finalize_running, 0);
+  g_free(j->msg);
+  g_free(j);
+}
+
+// the step hook of the detection job: one message ("detecting the
+// subject...") that simply stays alive, the _finalize_keep_going pattern
+static gboolean _detect_keep_going(void *p)
+{
+  dt_job_t *job = p;
+  const _detect_job_t *j = job ? dt_control_job_get_params(job) : NULL;
+  return _job_step(job, j ? j->msg : NULL);
+}
+
+#ifdef HAVE_AI_DOWNLOAD
+// worker thread, driven by dt_ai_models_download_sync: the download is
+// the one phase with an honest fraction, so the bar carries it; the
+// cancel button reaches the download through the flag the sync call polls
+static void _detect_download_progress(const char *model_id,
+                                      const double progress,
+                                      gpointer user_data)
+{
+  dt_job_t *job = user_data;
+  _detect_job_t *j = dt_control_job_get_params(job);
+  if(!_job_step(job, _("downloading the detection model...")))
+    j->download_cancelled = TRUE;
+  else
+    dt_control_job_set_progress(job, progress);
+}
+#endif
+
+static int32_t _detect_job_run(dt_job_t *job)
+{
+  _detect_job_t *const j = dt_control_job_get_params(job);
+  // from here the reset of the serialisation token is ours, on every exit
+  j->ran = TRUE;
+  gboolean ok = FALSE;
+  uint8_t *rgb = NULL;
+  float *hint = NULL;
+  float *alpha_full = NULL;
+  gchar *outpath = NULL;
+  dt_ai_environment_t *env = NULL;
+  dt_detect_context_t *det = NULL;
+  dt_dev_pixelpipe_t pipe;
+  dt_mipmap_buffer_t buf;
+  gboolean pipe_ready = FALSE, buf_ready = FALSE;
+  int out_w = 0, out_h = 0;
+  int pw = 0, ph = 0;
+  dt_rf_recipe_t recipe;
+  memset(&recipe, 0, sizeof(recipe));
+
+  const double t_start = dt_get_wtime();
+
+  dt_develop_t dev;
+  dt_dev_init(&dev, FALSE);
+  dt_dev_load_image(&dev, j->imgid);
+  // the darkroom can be ahead of the database (the interactive threads'
+  // rule); the launch flushed the history, the override covers the rest
+  if(j->history_end > 0 && j->history_end > dev.history_end)
+    dev.history_end = j->history_end;
+
+#ifdef HAVE_AI_DOWNLOAD
+  // the catalogue's chaining: the entry said "downloads the model", so
+  // the download IS the first step of the detection, on this very job --
+  // same progress entry, same cancel button
+  if(j->download)
+  {
+    char *error = dt_ai_models_download_sync(j->model_id,
+                                             _detect_download_progress,
+                                             job,
+                                             &j->download_cancelled);
+    if(error)
+    {
+      if(!j->download_cancelled)
+        dt_control_log(_("model download failed: %s"), error);
+      g_free(error);
+      goto cleanup;
+    }
+    // the version the recipe must record lives in the freshly extracted
+    // config.json; the registry scan is what reads it back
+    dt_ai_models_refresh_status();
+    // the fraction was the download's; the steps that follow carry none
+    // (the _job_step contract), so a negative value hands the bar back
+    // to its indeterminate state instead of parking it full
+    dt_control_job_set_progress(job, -1.0);
+  }
+#endif
+
+  if(!_job_step(job, j->msg)) goto cleanup;
+
+  // a fresh environment scans the installed models, so it must be
+  // created after the download; loading is BY the resolved id, with the
+  // task check of the detect consumer
+  env = dt_ai_env_init(NULL);
+  det = env ? dt_detect_load(env, j->model_id, j->detector->task) : NULL;
+  if(!det)
+  {
+    dt_control_log(_("cannot load the detection model"));
+    goto cleanup;
+  }
+
+  // ---- the recipe: the promptless v2 blob a headless replay consumes.
+  // filled before the compute, so every parameter the compute reads below
+  // is a parameter the recipe records -- the two cannot diverge. the
+  // decode scalars, the refinement pin and the matting block stay zero:
+  // no decode chain ran and no extension stage beyond the prompt kind is
+  // in use
+  recipe.magic = DT_RF_RECIPE_MAGIC;
+  recipe.version = DT_RF_RECIPE_VERSION_EXT;
+  recipe.distort_hash = (int64_t)j->distort_hash;
+  g_strlcpy(recipe.seg_model, j->model_id, sizeof(recipe.seg_model));
+  {
+    const char *v = dt_ai_model_get_version(j->model_id);
+    if(v)
+      g_strlcpy(recipe.seg_model_version, v,
+                sizeof(recipe.seg_model_version));
+  }
+  recipe.render_size = j->render_size;   // raw, the capture convention
+  recipe.threshold = j->threshold;
+  recipe.ai_refine_margin = j->margin;
+  recipe.prompt_kind = j->detector->prompt_kind;
+  recipe.detect_input = dt_detect_get_side(det);
+  recipe.class_bits = j->detector->class_bits;
+
+  // export render pipe at full input dimensions, as the replay builds it
+  dt_mipmap_cache_get(&buf, j->imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING,
+                      'r');
+  buf_ready = TRUE;
+  if(!buf.buf || !buf.width || !buf.height)
+  {
+    dt_control_log(_("precise mask: cannot get the image buffer"));
+    goto cleanup;
+  }
+  const int iw = dev.image_storage.width;
+  const int ih = dev.image_storage.height;
+  if(!dt_dev_pixelpipe_init_export(&pipe, iw, ih,
+                                   IMAGEIO_RGB | IMAGEIO_INT8, FALSE))
+  {
+    dt_control_log(_("precise mask: cannot init the render pipe"));
+    goto cleanup;
+  }
+  pipe_ready = TRUE;
+  dt_dev_pixelpipe_set_icc(&pipe, DT_COLORSPACE_SRGB, NULL,
+                           DT_INTENT_PERCEPTUAL);
+  dt_dev_pixelpipe_set_input(&pipe, &dev, (float *)buf.buf,
+                             buf.width, buf.height, buf.iscale);
+  dt_dev_pixelpipe_create_nodes(&pipe, &dev);
+  dt_dev_pixelpipe_synch_all(&pipe, &dev);
+  dt_dev_pixelpipe_get_dimensions(&pipe, &dev, pipe.iwidth, pipe.iheight,
+                                  &pipe.processed_width,
+                                  &pipe.processed_height);
+  if(pipe.processed_width <= 0 || pipe.processed_height <= 0)
+  {
+    dt_control_log(_("precise mask: cannot init the render pipe"));
+    goto cleanup;
+  }
+
+  // the effective encode dimensions under the launch's cap, with the
+  // encode-thread formula -- the recipe records THESE, and the shared
+  // render helper below recovers the same scale from them
+  {
+    const int render_target = MAX(j->render_size, 1024);
+    const double e_scale
+      = fmin((double)render_target / (double)pipe.processed_width,
+             (double)render_target / (double)pipe.processed_height);
+    const double final_scale = fmin(e_scale, 1.0);
+    out_w = (int)(final_scale * pipe.processed_width);
+    out_h = (int)(final_scale * pipe.processed_height);
+  }
+  if(out_w < 8 || out_h < 8)
+  {
+    dt_control_log(_("precise mask: cannot init the render pipe"));
+    goto cleanup;
+  }
+  recipe.encode_w = out_w;
+  recipe.encode_h = out_h;
+
+  // the recipe is complete: derive its content-addressed target, exactly
+  // as the replay does from ITS loaded dev
+  {
+    const dt_image_t *img = &dev.image_storage;
+    gchar *base = g_path_get_basename(img->filename);
+    char *dot = g_strrstr(base, ".");
+    if(dot) *dot = '\0';
+    gchar *fname = dt_rasterfile_recipe_filename(&recipe, base,
+                                                 img->width, img->height,
+                                                 img->exif_datetime_taken);
+    gchar *root = dt_rasterfile_mask_root();
+    if(g_mkdir_with_parents(root, 0755) == 0)
+      outpath = g_build_filename(root, fname, NULL);
+    else
+      dt_control_log(_("cannot create raster mask folder"));
+    g_free(root);
+    g_free(fname);
+    g_free(base);
+  }
+  if(!outpath)
+    goto cleanup;
+
+  // a valid file under this fingerprint IS this detection, already made
+  // (same recipe, same image): skip the whole compute and just apply.
+  // no instance disabling here, unlike the replay -- so a REdetection of
+  // a subject whose file was purged renders under a history that may
+  // already apply the first one through its module. the replay's
+  // documented self-influence class (and raster forms sit outside its
+  // instance disabling anyway): assumed, not solved
+  if(g_file_test(outpath, G_FILE_TEST_EXISTS) && _mask_png_valid(outpath))
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] detect: %s already exists, reusing", outpath);
+    goto apply;
+  }
+
+  rgb = _replay_render_rgb8(&dev, &pipe, &recipe, out_w, out_h);
+  if(!rgb)
+  {
+    dt_control_log(_("precise mask: native render failed"));
+    goto cleanup;
+  }
+
+  // this pipe served the encode render; the finalisation core below
+  // builds its own
+  dt_dev_pixelpipe_cleanup(&pipe);
+  pipe_ready = FALSE;
+  dt_mipmap_cache_release(&buf);
+  buf_ready = FALSE;
+
+  if(!_job_step(job, j->msg)) goto cleanup;
+
+  hint = g_try_malloc((size_t)out_w * out_h * sizeof(float));
+  if(!hint)
+  {
+    dt_control_log(_("precise mask: out of memory"));
+    goto cleanup;
+  }
+  if(!dt_detect_run(det, rgb, out_w, out_h, hint))
+  {
+    dt_control_log(_("the detection failed on this image"));
+    goto cleanup;
+  }
+  g_free(rgb);
+  rgb = NULL;
+
+  // the detector is done; release it before the heavy native pass, which
+  // loads its own refinement context (the replay's VRAM rule)
+  dt_detect_free(det);
+  det = NULL;
+  dt_ai_env_destroy(env);
+  env = NULL;
+
+  if(!_job_step(job, j->msg)) goto cleanup;
+
+  // seed filter and subject bbox, exactly as the replay derives them
+  // from this very recipe
+  {
+    const float thresh = CLAMP(recipe.threshold, 0.3f, 0.9f);
+    const float margin = CLAMPF(recipe.ai_refine_margin, 0.0f, 0.5f);
+    if(j->detector->keep_seed)
+      _keep_seed_component(hint, out_w, out_h, thresh, -1, -1);
+    dt_seg_point_t tl, br;
+    if(!_compute_bbox(hint, out_w, out_h, thresh, margin, &tl, &br))
+    {
+      dt_control_log(_("nothing detected in this image"));
+      goto cleanup;
+    }
+    const int bx = CLAMP((int)tl.x, 0, out_w - 1);
+    const int by = CLAMP((int)tl.y, 0, out_h - 1);
+    const int bw = CLAMP((int)br.x - bx + 1, 1, out_w - bx);
+    const int bh = CLAMP((int)br.y - by + 1, 1, out_h - by);
+
+    // the native finalisation, unchanged: the launch already holds the
+    // serialisation token for the whole job, so unlike the replay there
+    // is nothing to claim here
+    const _finalize_render_req_t req = {
+      .hint = hint,
+      .hint_w = out_w,
+      .hint_h = out_h,
+      .bx = bx, .by = by, .bw = bw, .bh = bh,
+      .threshold = thresh,
+      .render_target = MAX(recipe.render_size, 1024),
+      .interactive = TRUE,
+    };
+    alpha_full = _finalize_render_alpha(&dev, &req, _detect_keep_going,
+                                        job, &pw, &ph);
+  }
+  if(!alpha_full)
+    goto cleanup;
+
+  if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED)
+    goto cleanup;
+
+  if(!_write_mask_png16_atomic(outpath, alpha_full, pw, ph))
+  {
+    dt_control_log(_("failed to save the precise raster mask"));
+    goto cleanup;
+  }
+  dt_print(DT_DEBUG_AI,
+           "[object mask] detect: %s written (%dx%d, %.1fs)",
+           outpath, pw, ph, dt_get_wtime() - t_start);
+
+apply:
+  // hand over to the GUI thread: the finalisation apply idle wires the
+  // raster shape, named from its recipe by the detectors table
+  {
+    _finalize_apply_t *a = g_malloc0(sizeof(_finalize_apply_t));
+    a->imgid = j->imgid;
+    a->outpath = g_strdup(outpath);
+    a->has_target = j->has_target;
+    memcpy(a->target_op, j->target_op, sizeof(a->target_op));
+    a->target_multi_priority = j->target_multi_priority;
+    a->has_recipe = TRUE;
+    a->recipe = recipe;
+    a->detector = j->detector;
+    a->distort_hash = j->distort_hash;
+    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, _finalize_apply_idle, a,
+                    _finalize_apply_free);
+  }
+  ok = TRUE;
+
+cleanup:
+  g_free(rgb);
+  g_free(hint);
+  g_free(alpha_full);
+  g_free(outpath);
+  if(pipe_ready) dt_dev_pixelpipe_cleanup(&pipe);
+  if(buf_ready) dt_mipmap_cache_release(&buf);
+  if(det) dt_detect_free(det);
+  if(env) dt_ai_env_destroy(env);
+  dt_dev_cleanup(&dev);
+  g_atomic_int_set(&_finalize_running, 0);
+  return ok ? 0 : 1;
+}
+
+// resolve the model a detection of `detector` would use NOW: the active
+// model of its task when one is set, otherwise the registry's default
+// for the task (the download candidate), otherwise any model serving it.
+// registry copy, caller frees; NULL when the registry knows none
+static dt_ai_model_t *_detector_resolve_model(const dt_detector_t *det)
+{
+  // a registry created while AI was disabled at startup answers NULL to
+  // every lookup: complete the deferred init first (no-op otherwise)
+  dt_ai_models_init_lazy();
+
+  char *id = dt_ai_models_get_active_for_task(det->task);
+  dt_ai_model_t *model
+    = (id && id[0]) ? dt_ai_models_get_by_id(id) : NULL;
+  g_free(id);
+  if(model) return model;
+
+  dt_ai_model_t *candidate = NULL;
+  const int count = dt_ai_models_get_count();
+  for(int i = 0; i < count; i++)
+  {
+    dt_ai_model_t *m = dt_ai_models_get_by_index(i);
+    if(m && m->task && !strcmp(m->task, det->task))
+    {
+      if(m->is_default)
+      {
+        dt_ai_model_free(candidate);
+        return m;
+      }
+      if(!candidate)
+      {
+        candidate = m;
+        continue;
+      }
+    }
+    dt_ai_model_free(m);
+  }
+  return candidate;
+}
+
+dt_masks_object_detect_state_t
+dt_masks_object_detect_state(const struct dt_detector_t *detector)
+{
+  if(!detector)
+    return DT_MASKS_OBJECT_DETECT_UNAVAILABLE;
+  if(!dt_ai_registry_is_enabled())
+    return DT_MASKS_OBJECT_DETECT_AI_OFF;
+
+  dt_ai_model_t *model = _detector_resolve_model(detector);
+  if(!model)
+    return DT_MASKS_OBJECT_DETECT_UNAVAILABLE;
+
+  dt_masks_object_detect_state_t state;
+  switch(model->status)
+  {
+    case DT_AI_MODEL_DOWNLOADED:
+    case DT_AI_MODEL_UPDATE_AVAILABLE:  // the installed model still works
+      state = DT_MASKS_OBJECT_DETECT_READY;
+      break;
+    case DT_AI_MODEL_DOWNLOADING:
+      state = DT_MASKS_OBJECT_DETECT_DOWNLOADING;
+      break;
+    default:  // NOT_DOWNLOADED, UPDATE_REQUIRED, ERROR
+#ifdef HAVE_AI_DOWNLOAD
+      state = DT_MASKS_OBJECT_DETECT_DOWNLOAD;
+#else
+      state = DT_MASKS_OBJECT_DETECT_UNAVAILABLE;
+#endif
+      break;
+  }
+  dt_ai_model_free(model);
+  return state;
+}
+
+gboolean dt_masks_object_detect_launch(const struct dt_detector_t *detector,
+                                       dt_iop_module_t *module)
+{
+  dt_develop_t *dev = darktable.develop;
+  if(!detector || !dev || !dt_is_valid_imgid(dev->image_storage.id))
+    return FALSE;
+
+  // the state the catalogue labelled the entry with, re-derived: the
+  // registry may have moved between the menu and the click. a refused
+  // click must say so -- a silent no-op is a broken button (decision 13)
+  const dt_masks_object_detect_state_t state
+    = dt_masks_object_detect_state(detector);
+  if(state != DT_MASKS_OBJECT_DETECT_READY
+     && state != DT_MASKS_OBJECT_DETECT_DOWNLOAD)
+  {
+    dt_control_log(_("AI model is not available. Check preferences > AI"));
+    return FALSE;
+  }
+
+  dt_ai_model_t *model = _detector_resolve_model(detector);
+  if(!model)
+  {
+    dt_control_log(_("AI model is not available. Check preferences > AI"));
+    return FALSE;
+  }
+
+  // one heavy AI mask job at a time: the very token the interactive
+  // finalisation and the headless replay serialise on
+  if(!g_atomic_int_compare_and_exchange(&_finalize_running, 0, 1))
+  {
+    dt_control_log(_("mask still computing, try again in a moment"));
+    dt_ai_model_free(model);
+    return FALSE;
+  }
+
+  // the job re-reads the history from the database; unflushed edits
+  // (exposure, crop, ...) would silently be missing from the render
+  dt_dev_write_history(dev);
+
+  _detect_job_t *j = g_malloc0(sizeof(_detect_job_t));
+  j->imgid = dev->image_storage.id;
+  j->history_end = dev->history_end;
+  j->detector = detector;
+  g_strlcpy(j->model_id, model->id ? model->id : "", sizeof(j->model_id));
+  j->download = state == DT_MASKS_OBJECT_DETECT_DOWNLOAD;
+  j->render_size = _conf_render_size();
+  // through the session accessors, NULL session: the conf branch, with
+  // the clamps the replay re-applies -- the recorded value is the used one
+  j->threshold = _session_threshold(NULL);
+  j->margin = _session_refine_margin(NULL);
+  j->distort_hash = _compute_distort_hash(dev);
+  j->msg = g_strdup_printf(_("detecting the %s..."), _(detector->label));
+  if(module)
+  {
+    g_strlcpy(j->target_op, module->op, sizeof(j->target_op));
+    j->target_multi_priority = module->multi_priority;
+    j->has_target = TRUE;
+  }
+  dt_ai_model_free(model);
+
+  dt_job_t *job = dt_control_job_create(_detect_job_run,
+                                        "one-shot mask detection");
+  if(!job)
+  {
+    // the destroy releases the token itself (j->ran is FALSE): the one
+    // path that frees these params is also the one that gives it back
+    _detect_job_destroy(j);
+    return FALSE;
+  }
+  dt_control_job_set_params(job, j, _detect_job_destroy);
+  dt_control_job_add_progress(job, _("automatic selection"), TRUE);
+  // announce before queueing, as the finalisation launch does
+  dt_control_log("%s", j->msg);
+  dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
+  return TRUE;
 }
 
 // ----------------------------- edit session gate ----------------------------
