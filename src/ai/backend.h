@@ -262,6 +262,13 @@ int *dt_ai_model_attribute_int_array(const dt_ai_model_info_t *info,
                                      const char *key,
                                      int *out_count);
 
+/** Same contract as the int variant, for fractional attributes
+ *  (normalisation statistics and the like). Integer JSON elements are
+ *  promoted to double. */
+double *dt_ai_model_attribute_double_array(const dt_ai_model_info_t *info,
+                                           const char *key,
+                                           int *out_count);
+
 /* --- Discovery --- */
 
 /**

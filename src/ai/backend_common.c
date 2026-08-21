@@ -724,6 +724,41 @@ int *dt_ai_model_attribute_int_array(const dt_ai_model_info_t *info,
   return result;
 }
 
+double *dt_ai_model_attribute_double_array(const dt_ai_model_info_t *info,
+                                           const char *key,
+                                           int *out_count)
+{
+  if(out_count) *out_count = 0;
+  JsonNode *v = NULL;
+  JsonParser *p = _attribute_node(info, key, &v);
+  double *result = NULL;
+  if(v && JSON_NODE_HOLDS_ARRAY(v))
+  {
+    JsonArray *arr = json_node_get_array(v);
+    guint n = json_array_get_length(arr);
+    // cap manifest-driven allocation — single digits are typical
+    const guint max_n = 256;
+    if(n > max_n)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[darktable_ai] attribute '%s': %u elements exceeds cap %u, "
+               "truncating", key, n, max_n);
+      n = max_n;
+    }
+    if(n > 0)
+    {
+      result = g_new(double, n);
+      for(guint i = 0; i < n; i++)
+        // json-glib promotes integer elements to double here, so a
+        // manifest may write "1" where "1.0" is meant
+        result[i] = json_array_get_double_element(arr, i);
+      if(out_count) *out_count = (int)n;
+    }
+  }
+  if(p) g_object_unref(p);
+  return result;
+}
+
 // resolve the model's "cpu_only" block against a concrete EP. the
 // block can take two forms:
 //
