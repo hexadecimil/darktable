@@ -2295,98 +2295,33 @@ static gboolean _finalize_apply_idle(gpointer data)
     return G_SOURCE_REMOVE;
   }
 
-  // ---- source side: the external raster mask module ----
-  // never requisition an instance already serving another mask: take one
-  // whose file is empty, ours already, or that feeds no sink
-  dt_iop_module_t *rf = NULL;
-  gchar *want_file = g_path_get_basename(a->outpath);
-  for(GList *l = dev->iop; l; l = g_list_next(l))
+  // ---- the precise mask becomes a real mask: a raster shape ----
+  // a member of the target's group, combinable with drawn shapes, with
+  // per-member opacity and operator. the rasterfile channel of the old
+  // wiring stays untouched for existing edits and hand-picked files;
+  // only the NEW gesture lands here
+  dt_masks_form_t *rform = dt_masks_create(DT_MASKS_RASTER);
+  dt_masks_point_raster_t *pt = rform
+    ? calloc(1, sizeof(dt_masks_point_raster_t))
+    : NULL;
+  if(!pt)
   {
-    dt_iop_module_t *m = l->data;
-    if(strcmp(m->op, "rasterfile") || !m->params)
-      continue;
-    // never requisition the instance an edit session is open on: it is the
-    // one the user is editing, its recipe is the one the session replays,
-    // and the zero-users criterion below matches it (standalone masks are
-    // exactly how this tool creates them). the gate already identifies it
-    // by op+multi_priority -- consult it here too
-    if(dt_object_mask_edit_active(m->op, m->multi_priority))
-      continue;
-    dt_iop_rasterfile_params_t *mp = (dt_iop_rasterfile_params_t *)m->params;
-    if(mp->file[0] == '\0'
-       || !strcmp(mp->file, want_file)
-       || g_hash_table_size(m->raster_mask.source.users) == 0)
-    {
-      rf = m;
-      break;
-    }
-  }
-  g_free(want_file);
-  gboolean created = FALSE;
-  if(!rf)
-  {
-    // no free instance: create one, exactly as the multi-instance button
-    // does -- dt_iop_gui_duplicate handles pipe order, history, gui and
-    // focus in one call. the base instance of every module always sits
-    // in dev->iop, so a seed is always available. darktable has no
-    // instance cap: the only refusals are IOP_FLAGS_ONE_INSTANCE, which
-    // rasterfile does not carry but is guarded against anyway, and an
-    // allocation failure returning NULL -- both keep the old message
-    dt_iop_module_t *base = NULL;
-    for(GList *l = dev->iop; l; l = g_list_next(l))
-    {
-      dt_iop_module_t *m = l->data;
-      if(!strcmp(m->op, "rasterfile"))
-      {
-        base = m;
-        break;
-      }
-    }
-    if(base && !(base->flags() & IOP_FLAGS_ONE_INSTANCE))
-      rf = dt_iop_gui_duplicate(base, FALSE);
-    if(rf)
-    {
-      created = TRUE;
-      // what _gui_copy_callback does after the same call
-      dt_iop_connect_accels_multi(rf->so);
-    }
-  }
-  if(!rf)
-  {
-    dt_control_log(_("precise raster mask saved (no free raster instance)"));
+    dt_masks_free_form(rform);
+    dt_control_log(_("precise raster mask saved (out of memory)"));
     return G_SOURCE_REMOVE;
   }
-
+  pt->magic = DT_MASKS_RASTER_POINT_MAGIC;
+  pt->version = DT_MASKS_RASTER_POINT_VERSION;
+  if(a->has_recipe)
+    pt->recipe = a->recipe;  // content-addressed reference
+  else
   {
-    // v2 params of rasterfile, through the layout mirror at the top of this
-    // file. path/file are informative when a recipe is present: resolution
-    // then derives the file name from the recipe fingerprint
-    dt_iop_rasterfile_params_t *p = (dt_iop_rasterfile_params_t *)rf->params;
-    gchar *dir = g_path_get_dirname(a->outpath);
-    gchar *base = g_path_get_basename(a->outpath);
-    p->mode = DT_RASTERFILE_MODE_ALL;
-    g_strlcpy(p->path, dir, sizeof(p->path));
-    g_strlcpy(p->file, base, sizeof(p->file));
-    g_free(dir);
-    g_free(base);
-    if(a->has_recipe)
-      p->recipe = a->recipe;
-    else
-      memset(&p->recipe, 0, sizeof(p->recipe));
-    // name the instance after the gesture: the mask manager row and the
-    // module header then read "precise mask" instead of a third
-    // "external raster masks". never over a name typed by hand
-    if(!rf->multi_name_hand_edited)
-    {
-      g_strlcpy(rf->multi_name, _("precise mask"), sizeof(rf->multi_name));
-      if(rf->gui_data) dt_iop_gui_update_header(rf);
-    }
-    rf->enabled = TRUE;
-    dt_dev_add_history_item(dev, rf, TRUE);
-    // resync the module's widgets, or the stale combo would re-commit the
-    // previous file on the next interaction
-    if(rf->gui_data) dt_iop_gui_update(rf);
+    // sequential output file: a leaf under the local mask root
+    gchar *leaf = g_path_get_basename(a->outpath);
+    g_strlcpy(pt->file, leaf, sizeof(pt->file));
+    g_free(leaf);
   }
+  rform->points = g_list_append(rform->points, pt);
 
   // ---- sink side: the module the mask was created from ----
   dt_iop_module_t *target = NULL;
@@ -2402,45 +2337,42 @@ static gboolean _finalize_apply_idle(gpointer data)
       }
     }
 
+  // a target that somehow lost its blend params cannot wear a mask
+  // group (_group_from_module reads through them): file the shape
+  // unattached then, exactly as with no target at all
+  if(target && !target->blend_params) target = NULL;
+
+  // registers the form (unique name "precise mask #n"), appends it to
+  // dev->forms, creates or joins the module's blend group with the armed
+  // or default operator and the conf opacity, and commits the masks
+  // history -- the one type-agnostic door every created shape goes
+  // through. gui NULL: the target's gui is updated explicitly below
+  dt_masks_gui_form_save_creation(dev, target, rform, NULL);
+
   if(target && target->blend_params)
   {
-    if(target->raster_mask.sink.source)
-      g_hash_table_remove(
-        target->raster_mask.sink.source->raster_mask.source.users, target);
-
-    target->raster_mask.sink.source = rf;
-    target->raster_mask.sink.id = BLEND_RASTER_ID;
-    g_hash_table_add(rf->raster_mask.source.users, target);
-
-    memcpy(target->blend_params->raster_mask_source, rf->op,
-           sizeof(target->blend_params->raster_mask_source));
-    target->blend_params->raster_mask_instance = rf->multi_priority;
-    target->blend_params->raster_mask_id = BLEND_RASTER_ID;
-    // the raster mask replaces a drawn mask (that is the gesture), but a
-    // conditional blend stays -- and a silent replacement is announced
-    const uint32_t old_mode = target->blend_params->mask_mode;
+    // additive, the whole point: a drawn mask already on the module is
+    // KEPT and the raster shape joins it in the group. never
+    // DEVELOP_MASK_RASTER -- that is the exclusive channel of the
+    // rasterfile module, and exclusivity is what this gesture ends
     target->blend_params->mask_mode
-      = (old_mode & ~DEVELOP_MASK_MASK)
-        | DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
-    if(old_mode & DEVELOP_MASK_MASK)
-      dt_control_log(_("the drawn mask of %s was replaced by the raster mask"),
-                     target->name());
-
-    dt_dev_add_history_item(dev, target, TRUE);
+      |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+    dt_dev_add_masks_history_item(dev, target, TRUE);
     if(target->gui_data) dt_iop_gui_update(target);
-    // dt_iop_gui_duplicate focused the instance it created; the user's
-    // gesture was about `target`, so hand the focus back to it. when the
-    // instance was found, nothing moved and nothing moves here -- the
-    // two outcomes of the same gesture end on the same module. with no
-    // target the focus stays on the new instance, where the mask lives
-    if(created) dt_iop_request_focus(target);
-    dt_control_log(_("precise raster mask applied to %s"), target->name());
-    // the manager lists this consumer as a raster row now
-    dt_dev_masks_list_change(dev);
+    dt_control_log(_("precise mask applied to %s"), target->name());
+    // entering edit mode clears any form_gui in creation -- if the user
+    // started a new mask session while the job ran, leave their session
+    // alone, the shape is attached and committed either way
+    if(!dev->form_gui->creation && !dev->form_visible)
+    {
+      dt_masks_set_edit_mode(target, DT_MASKS_EDIT_FULL);
+      dt_masks_iop_update(target);
+    }
   }
   else
-    dt_control_log(_("precise raster mask saved and loaded in the raster module"));
+    dt_control_log(_("precise mask created"));
 
+  dt_dev_masks_list_change(dev);
   dt_dev_reprocess_all(dev);
   dt_control_queue_redraw_center();
   return G_SOURCE_REMOVE;
