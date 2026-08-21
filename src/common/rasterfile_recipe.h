@@ -41,10 +41,27 @@
 //    like no recipe at all.
 
 #define DT_RF_RECIPE_MAGIC 0x64745243  // "dtRC"; 0 = no recipe
+// version 1: clicked prompts, extension block all zero. version 2 (EXT)
+// is REQUIRED as soon as any extension field below is nonzero: a build
+// that only knows version 1 must refuse such a recipe (and fall back to
+// plain file display) rather than replay it without the recorded extra
+// stages and write different bytes under its fingerprint. clicked
+// sessions with a zeroed extension keep writing version 1, so their
+// recipes stay byte-identical to what earlier builds produced
 #define DT_RF_RECIPE_VERSION 1
+#define DT_RF_RECIPE_VERSION_EXT 2
 #define DT_RF_RECIPE_MAX_POINTS 32
 #define DT_RF_RECIPE_MODEL_ID_LEN 64
 #define DT_RF_RECIPE_MODEL_VERSION_LEN 16
+#define DT_RF_RECIPE_MATTING_ID_LEN 28
+#define DT_RF_RECIPE_MATTING_VERSION_LEN 12
+
+// how the mask was prompted -- the discriminant of the extension block.
+// plain defines, not an enum: the struct field must stay int32_t for the
+// introspection scanner, and a version-1 blob's zero must read as POINTS
+#define DT_RF_PROMPT_POINTS 0    // clicked prompts; points[] replay
+#define DT_RF_PROMPT_SUBJECT 1   // one-shot salient subject; no points
+#define DT_RF_PROMPT_SEMANTIC 2  // semantic classes (class_bits); no points
 
 typedef struct dt_rf_recipe_point_t
 {
@@ -89,10 +106,26 @@ typedef struct dt_rf_recipe_t
   int32_t cleanup;
   float smoothing;
   float feather;
-  int32_t n_points;      // 1..DT_RF_RECIPE_MAX_POINTS when valid
+  // prompt count: 1..DT_RF_RECIPE_MAX_POINTS when prompt_kind is POINTS,
+  // exactly 0 for the promptless kinds
+  int32_t n_points;
   int32_t _pad0;         // explicit, keep zeroed
   dt_rf_recipe_point_t points[DT_RF_RECIPE_MAX_POINTS];
-  int32_t reserved[16];  // zero-filled headroom for compatible extensions
+  // ---- extension block: carved out of the 64 bytes version 1 reserved
+  // as zero-filled headroom, so the struct size, the layout of every
+  // field above and the fingerprint of any version-1 blob are all
+  // unchanged -- a v1 recipe reads back with prompt_kind ==
+  // DT_RF_PROMPT_POINTS and every extension stage disabled, which IS its
+  // original meaning. the matting fields are reserved from day one so
+  // enabling that stage later is a value change (plus the version bump
+  // to EXT), never a second layout migration
+  int32_t prompt_kind;     // DT_RF_PROMPT_*; selects the replay family
+  int32_t detect_input;    // detector model input side; 0 for POINTS
+  int64_t class_bits;      // semantic class set; 0 unless SEMANTIC
+  int32_t matting_enabled; // reserved for the matting stage, keep 0
+  float matting_band;      // reserved: matting band width, keep 0
+  char matting_id[DT_RF_RECIPE_MATTING_ID_LEN];          // reserved, keep 0
+  char matting_version[DT_RF_RECIPE_MATTING_VERSION_LEN]; // reserved, keep 0
 } dt_rf_recipe_t;
 
 // the layout is load-bearing twice over: the struct is embedded in module
@@ -103,17 +136,41 @@ G_STATIC_ASSERT(sizeof(dt_rf_recipe_point_t) == 24);
 G_STATIC_ASSERT(sizeof(dt_rf_recipe_t)
                 == 240 + DT_RF_RECIPE_MAX_POINTS * sizeof(dt_rf_recipe_point_t)
                    + 64);
+// the extension block must occupy EXACTLY the 64 bytes version 1 kept as
+// reserved[16]: pin its first field to where that array began and its
+// last to the end of the struct -- combined with the size assert above
+// (the field sizes sum to 64) this leaves no room for implicit padding
+// anywhere in the block
+G_STATIC_ASSERT(G_STRUCT_OFFSET(dt_rf_recipe_t, prompt_kind)
+                == 240
+                   + DT_RF_RECIPE_MAX_POINTS * sizeof(dt_rf_recipe_point_t));
+G_STATIC_ASSERT(G_STRUCT_OFFSET(dt_rf_recipe_t, matting_version)
+                   + DT_RF_RECIPE_MATTING_VERSION_LEN
+                == sizeof(dt_rf_recipe_t));
 
 // a recipe is only acted upon when fully understood: an unknown version is
 // deliberately NOT valid, the embedding module then falls back to plain
-// path/file resolution without touching the recipe bytes
+// path/file resolution without touching the recipe bytes. clicked recipes
+// carry their prompt points; promptless ones carry none -- a blob mixing
+// the two families describes no session anybody could have recorded. a
+// promptless kind IS an extension field in use, so the version contract
+// above applies: version EXT is mandatory for it, and a version-1 blob
+// claiming one marks a writer that forgot the bump -- refused here, so
+// the mistake surfaces on the new builds instead of silently degrading
+// on the version-1-only ones
 static inline gboolean dt_rf_recipe_valid(const dt_rf_recipe_t *r)
 {
-  return r
-         && r->magic == DT_RF_RECIPE_MAGIC
-         && r->version == DT_RF_RECIPE_VERSION
-         && r->n_points > 0
-         && r->n_points <= DT_RF_RECIPE_MAX_POINTS;
+  if(!r || r->magic != DT_RF_RECIPE_MAGIC)
+    return FALSE;
+  if(r->version != DT_RF_RECIPE_VERSION
+     && r->version != DT_RF_RECIPE_VERSION_EXT)
+    return FALSE;
+  if(r->prompt_kind == DT_RF_PROMPT_POINTS)
+    return r->n_points > 0 && r->n_points <= DT_RF_RECIPE_MAX_POINTS;
+  return r->version == DT_RF_RECIPE_VERSION_EXT
+         && (r->prompt_kind == DT_RF_PROMPT_SUBJECT
+             || r->prompt_kind == DT_RF_PROMPT_SEMANTIC)
+         && r->n_points == 0;
 }
 
 // the local root folder for raster mask files: the user preference when set,
