@@ -2824,6 +2824,16 @@ int dt_ai_run(
         ret = -3;
         break;
       }
+      // the capacity of a caller-provided buffer is defined by the shape
+      // the caller DECLARED. record that count before the shape array is
+      // overwritten with ORT's actual dimensions below, or the copy bound
+      // further down would compare ORT's count against itself and the
+      // clamp could never fire -- a model whose output outgrows the
+      // declared shape would overrun the caller's allocation
+      const int64_t declared_count = outputs[i].data
+        ? _safe_element_count(outputs[i].shape, outputs[i].ndim)
+        : -1;
+
       // update caller's shape array with actual ORT output dimensions.
       // this is essential for dynamic-shape models where the caller's
       // pre-assumed shape may differ from what ORT actually produced.
@@ -2851,8 +2861,12 @@ int dt_ai_run(
         break;
       }
 
-      const int64_t caller_count
-        = _safe_element_count(outputs[i].shape, outputs[i].ndim);
+      // a caller that pre-allocated is bounded by what it declared; one
+      // that passed NULL data gets a buffer sized below from ORT's own
+      // count, so the updated shape is the right bound for it
+      const int64_t caller_count = (declared_count >= 0)
+        ? declared_count
+        : _safe_element_count(outputs[i].shape, outputs[i].ndim);
       if(caller_count < 0)
       {
         dt_print(DT_DEBUG_AI,
