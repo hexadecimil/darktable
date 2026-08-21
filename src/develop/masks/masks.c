@@ -1242,9 +1242,12 @@ void dt_masks_write_masks_history_item(const dt_imgid_t imgid,
     DT_DEBUG_SQLITE3_BIND_BLOB(stmt, 6, ptbuf, blob_size, SQLITE_TRANSIENT);
     DT_DEBUG_SQLITE3_BIND_INT(stmt, 7, nb);
     sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
     free(ptbuf);
   }
+  // the statement is prepared unconditionally above: a form without
+  // functions (a shape type this build does not know) skips the INSERT
+  // but must still release the statement
+  sqlite3_finalize(stmt);
 }
 
 void dt_masks_free_form(dt_masks_form_t *form)
