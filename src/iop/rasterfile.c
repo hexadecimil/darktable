@@ -382,8 +382,11 @@ static void _recompute_clicked(GtkWidget *widget, dt_iop_module_t *self)
     return;
 
   // provisional dev trigger (see _dev_edit_enabled): reopen the recorded
-  // session interactively instead of recomputing headless
-  if(_dev_edit_enabled())
+  // session interactively instead of recomputing headless. clicked
+  // recipes only -- a promptless recipe records no session to reopen and
+  // dt_object_mask_edit_begin refuses it, so routing it here would be a
+  // silent no-op; it keeps the headless recompute below instead
+  if(_dev_edit_enabled() && p->recipe.prompt_kind == DT_RF_PROMPT_POINTS)
   {
     dt_object_edit_target_t target = { 0 };
     target.kind = DT_OBJECT_EDIT_RASTER;
@@ -763,10 +766,14 @@ void gui_changed(dt_iop_module_t *self,
   // when it opens an edit session instead of a headless recompute -- only
   // when that session can actually run. without AI support, or with the
   // model not installed, dt_object_mask_edit_begin declines (the non-AI
-  // stub does so silently) and the relabelled button would do nothing
+  // stub does so silently) and the relabelled button would do nothing.
+  // promptless recipes stay on the recompute label for the same reason:
+  // no recorded session exists, edit_begin refuses them (an entry that
+  // cannot act must not wear the acting label -- decision 13's rule)
 #ifdef HAVE_AI
   const gboolean edits = _dev_edit_enabled()
                          && dt_rf_recipe_valid(&p->recipe)
+                         && p->recipe.prompt_kind == DT_RF_PROMPT_POINTS
                          && dt_masks_object_available();
 #else
   const gboolean edits = FALSE;
