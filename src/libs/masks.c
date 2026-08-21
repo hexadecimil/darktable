@@ -24,6 +24,7 @@
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
+#include "develop/masks/object_recipe.h"
 #include "dtgtk/paint_cell.h"
 #include "gui/accelerators.h"
 #include "gui/drag_and_drop.h"
@@ -2748,6 +2749,34 @@ static void _set_iter_name(dt_lib_masks_t *lm,
     }
   }
 
+  // a raster shape whose backing file is gone renders as an absent group
+  // member without a word on canvas -- the render skips it and, when the
+  // recipe allows, repairs it in the background -- so the row is the one
+  // surface that says it. overrides the library words above: a shape
+  // that cannot render outranks a shape nothing renders. one stat per
+  // row refresh, and the refresh-in-place path updates it like every
+  // other derived column
+  if(form->type & DT_MASKS_RASTER)
+  {
+    const dt_masks_point_raster_t *rpt = dt_masks_raster_point(form);
+    gchar *rpath = rpt
+      ? dt_masks_raster_resolve_path(rpt, &darktable.develop->image_storage)
+      : NULL;
+    if(!rpath || !g_file_test(rpath, G_FILE_TEST_EXISTS))
+    {
+#ifdef HAVE_AI
+      // a valid recipe means the render path schedules the recompute on
+      // its own: the file is on its way back
+      const gboolean repairing = rpt && dt_rf_recipe_valid(&rpt->recipe);
+#else
+      // without the AI subsystem no recipe can be replayed here
+      const gboolean repairing = FALSE;
+#endif
+      link = repairing ? _("file missing, recomputing") : _("file missing");
+    }
+    g_free(rpath);
+  }
+
   // M2: "what is this group for?" answered on the row that raises the
   // question. the mask rows only -- which is a root row carrying a module:
   // grp_id is 0 there, and a library row carries no module at all.
@@ -2834,6 +2863,10 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   // agrees on one answer -- the whole of the rule is _row_type_index() above
   const int ty = _row_type_index(form, 0);
   GdkPixbuf *ictype = (ty >= 0) ? lm->ic_type[ty] : NULL;
+  // a raster shape is none of the drawable kinds (it deliberately has no
+  // _new_mask_shapes entry -- that table builds the creation buttons):
+  // its row shows the glyph the raster consumer rows already use
+  if(!ictype && form->type & DT_MASKS_RASTER) ictype = lm->ic_raster;
 
   gtk_tree_store_set(GTK_TREE_STORE(model), iter,
                      TREE_TEXT, str,
@@ -3544,6 +3577,28 @@ static gboolean _selected_row_rect(GtkWidget *view, GdkRectangle *rect)
   return rect->height > 0;
 }
 
+// ask the recompute of a raster shape's mask file from its provenance
+// recipe. the answer lands asynchronously: the recompute job reprocesses
+// the darkroom when the file is back, and the row badge follows on the
+// next refresh. the formid travels on the menu item, as the "add
+// existing shape" entries do
+static void _tree_raster_recompute(GtkMenuItem *item, gpointer user_data)
+{
+  (void)user_data;
+  const dt_mask_id_t id =
+    GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(item), "formid"));
+  dt_masks_form_t *form = dt_masks_get_from_id(darktable.develop, id);
+  const dt_masks_point_raster_t *rpt = dt_masks_raster_point(form);
+  if(!rpt || !dt_rf_recipe_valid(&rpt->recipe)) return;
+  if(dt_object_recipe_schedule_recompute(&rpt->recipe,
+                                         darktable.develop->image_storage.id))
+    dt_control_log(_("recomputing the precise mask file"));
+  else
+    // the stub of a build without AI declines, and so does a job system
+    // gone away: either way nothing will be recomputed
+    dt_control_log(_("recomputing the mask file needs the AI subsystem"));
+}
+
 // the context menu of a tree row, built at click. it was inline in
 // _tree_button_pressed_cb, which made that function 345 lines of which the
 // gesture handling was ten: the menu is one subject, the hit-testing of a click
@@ -3700,6 +3755,28 @@ static void _tree_context_menu(dt_lib_module_t *self,
     g_signal_connect(item, "activate",
                      G_CALLBACK(_raster_detach_cb), sel_module);
     gtk_menu_shell_append(menu, item);
+  }
+
+  // a raster-SHAPE row -- a real form, unlike the consumer rows above:
+  // its pixels come from a mask file a valid provenance recipe can
+  // regenerate. offer that regeneration; the render repairs a missing
+  // file on its own, this entry is for asking again by hand (the mask
+  // root moved back in, the models changed). everything else on the
+  // menu -- operators, opacity, move, remove, delete -- is the shared
+  // shape vocabulary and applies unchanged. grpid holds TREE_FORMID of
+  // the selected row, see the note above
+  if(nb == 1 && grp && (grp->type & DT_MASKS_RASTER))
+  {
+    const dt_masks_point_raster_t *rpt = dt_masks_raster_point(grp);
+    if(rpt && dt_rf_recipe_valid(&rpt->recipe))
+    {
+      item = gtk_menu_item_new_with_label(_("recompute mask file"));
+      g_object_set_data(G_OBJECT(item), "formid",
+                        GUINT_TO_POINTER(grp->formid));
+      g_signal_connect(item, "activate",
+                       G_CALLBACK(_tree_raster_recompute), self);
+      gtk_menu_shell_append(menu, item);
+    }
   }
 
   if(grp && grp->type & DT_MASKS_GROUP)
@@ -5198,11 +5275,21 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
   // a row that only ever answered with a rename box read as a row that could
   // do nothing else
   gchar *state = g_strdup(str2);
+  // a raster shape would lie with the "edit on the photograph" promise:
+  // it has no anchors, a click can only select it. its sentence says
+  // what it is instead, badge behaviour included -- the one place the
+  // missing-file state is explained rather than just named
+  const char *click_line = (form->type & DT_MASKS_GROUP)
+    ? _("click to edit these shapes on the photograph")
+    : (form->type & DT_MASKS_RASTER)
+      ? _("precise mask: this shape renders a raster mask file\n"
+          "it has no anchors to edit on the photograph; it combines,\n"
+          "inverts and takes opacity like any other shape.\n"
+          "if its file is missing the row says so; a valid recipe\n"
+          "recomputes it, or right-click to ask again")
+      : _("click to edit this shape on the photograph");
   snprintf(str2, sizeof(str2), "%s%s%s",
-           (form->type & DT_MASKS_GROUP)
-             ? _("click to edit these shapes on the photograph")
-             : _("click to edit this shape on the photograph"),
-           *state ? "\n\n" : "", state);
+           click_line, *state ? "\n\n" : "", state);
   g_free(state);
 
   if(!(form->type & DT_MASKS_GROUP))

@@ -76,6 +76,23 @@ static gchar *_raster_resolve_path(const dt_masks_point_raster_t *pt,
   return path;
 }
 
+// ---- the panel's window into the shape (libs/masks.c) ----
+// the missing-file badge and the recompute menu entry need the same two
+// answers the render derives for itself: is the point one this build
+// can read, and which file under the mask root does it name
+
+dt_masks_point_raster_t *dt_masks_raster_point(const dt_masks_form_t *form)
+{
+  if(!form || !(form->type & DT_MASKS_RASTER)) return NULL;
+  return _raster_point(form);
+}
+
+gchar *dt_masks_raster_resolve_path(const dt_masks_point_raster_t *pt,
+                                    const dt_image_t *img)
+{
+  return _raster_resolve_path(pt, img);
+}
+
 // ---- the decoded-file cache ----
 //
 // get_mask_roi runs on pixelpipe threads, several pipes in parallel, and

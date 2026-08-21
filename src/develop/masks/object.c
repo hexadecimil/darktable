@@ -4649,6 +4649,11 @@ static gboolean _recompute_landed_idle(gpointer data)
   dt_control_log_ack_all();
   dt_control_log(_("AI mask recomputed"));
 
+  // the masks panel may carry a missing-file badge on a raster shape
+  // row: rebuild the list now that the file is back, or the badge would
+  // outlive the repair until some unrelated masks interaction
+  dt_dev_masks_list_change(dev);
+
   // all pipes, not only the center: the preview rendered a zeroed mask too
   dt_dev_reprocess_all(dev);
   return G_SOURCE_REMOVE;

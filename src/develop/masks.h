@@ -593,6 +593,15 @@ gboolean dt_masks_object_available(void);
 gboolean dt_masks_object_session_busy(void);
 #endif
 
+/** the validated point of a raster shape: NULL when the form is not one
+ * or its serialized blob has a layout this build does not know */
+dt_masks_point_raster_t *dt_masks_raster_point(const dt_masks_form_t *form);
+/** the mask file path a raster point names for `img`: content-addressed
+ * from the recipe fingerprint under the local mask root, or the fallback
+ * leaf under that same root. NULL when it names nothing. caller frees */
+gchar *dt_masks_raster_resolve_path(const dt_masks_point_raster_t *pt,
+                                    const dt_image_t *img);
+
 /** THE question every "add shape" entry point asks before mutating
  * anything: would starting a new shape destroy work in progress? starting
  * one goes through dt_masks_change_form_gui, which clears the form gui and
