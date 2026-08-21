@@ -19,8 +19,10 @@
 #include "common/math.h"
 #include "common/rasterfile_io.h"
 #include "common/rasterfile_recipe.h"
+#include "control/control.h"
 #include "develop/imageop.h"
 #include "develop/masks.h"
+#include "develop/masks/object_recipe.h"
 
 // the raster shape: a persistent mask form whose content is not a geometry
 // but a reference to a raster mask file (see dt_masks_point_raster_t in
@@ -543,14 +545,68 @@ static int _raster_get_mask_roi(const dt_iop_module_t *const restrict module,
     = _raster_cache_acquire(path, dt_rf_recipe_valid(&pt->recipe));
   if(!entry)
   {
-    // missing or unreadable file: the member is skipped cleanly and the
-    // group composes the remaining shapes (the recompute safety net
-    // arrives with the missing-file commit)
-    dt_print(DT_DEBUG_MASKS,
-             "[masks %s] raster mask file '%s' not readable, member skipped",
-             form->name, path);
-    g_free(path);
-    return 0;
+#ifdef HAVE_AI
+    // ---- missing-file safety net, the rasterfile module's regime ----
+    // (mirror of _get_rasterfile_mask, iop/rasterfile.c): a valid recipe
+    // makes the absence a transient state that a recompute repairs.
+    // never from a thumbnail pipe -- cheap pipes must not flood the job
+    // queue, the full/export pipes will come. two regimes:
+    //  - a pipe whose output leaves the machine (export) or a context
+    //    with no job system at all (darktable-cli) recomputes NOW,
+    //    blocking: these pipes run once, a wrong output is final;
+    //  - the darkroom schedules asynchronously; the land reprocesses
+    //    every pipe and the fresh runs re-acquire the file
+    if(dt_rf_recipe_valid(&pt->recipe)
+       && !(piece->pipe->type & DT_DEV_PIXELPIPE_THUMBNAIL))
+    {
+      const gboolean sync_ctx
+        = (piece->pipe->type & DT_DEV_PIXELPIPE_EXPORT)
+          || !dt_control_running();
+      if(sync_ctx)
+      {
+        if(dt_object_recipe_recompute_now(&pt->recipe,
+                                          piece->pipe->image.id))
+          entry = _raster_cache_acquire(path, TRUE);
+      }
+      else
+      {
+        // the point blob does not change when the recompute lands, so
+        // neither does dt_masks_group_hash: the module output cached
+        // during THIS run (rendered without the mask) would be served
+        // again after the land's reprocess. mark the pipe so its next
+        // run drops the cachelines from this module on -- the pre-run
+        // purge of pixelpipe_hb.c consumes and resets the mark. set
+        // before the finalize gate below: whoever lands the file (our
+        // schedule, another pipe's, or the finalisation job) must
+        // become visible here
+        piece->pipe->cache_obsolete_order
+          = MIN(piece->pipe->cache_obsolete_order,
+                (uint32_t)module->iop_order);
+        // scheduling is safe from a pixelpipe thread: it marks the
+        // anti-respawn table and enqueues a job, nothing more, and the
+        // table absorbs repeated calls. during the precise-mask
+        // finalisation the file is legitimately absent while the job
+        // prepares it -- recomputing the OLD recipe then would race
+        // the very job that replaces the file (the same gate the
+        // rasterfile module's proactive repair takes)
+        if(!dt_object_mask_finalize_running())
+          dt_object_recipe_schedule_recompute(&pt->recipe,
+                                              piece->pipe->image.id);
+      }
+    }
+#else
+    // regenerating a mask file from its provenance recipe is AI
+    // machinery: without it a missing file has no repair path on this
+    // machine. the member is skipped -- silent by design, logged below
+#endif
+    if(!entry)
+    {
+      dt_print(DT_DEBUG_MASKS,
+               "[masks %s] raster mask file '%s' not readable, member skipped",
+               form->name, path);
+      g_free(path);
+      return 0;
+    }
   }
   g_free(path);
 
