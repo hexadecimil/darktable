@@ -85,6 +85,7 @@ FILE(GLOB SOURCE_FILES
   "common/pwstorage/backend_kwallet.c"
   "common/pwstorage/pwstorage.c"
   "common/ras2vect.c"
+  "common/rasterfile_io.c"
   "common/rasterfile_recipe.c"
   "common/ratings.c"
   "common/resource_limits.c"

@@ -35,6 +35,7 @@
 #include "common/fast_guided_filter.h"
 #include "common/pfm.h"
 #include "common/ras2vect.h"
+#include "common/rasterfile_io.h"
 #include "common/rasterfile_recipe.h"
 #include "common/utility.h"
 #include "develop/masks.h"
@@ -68,6 +69,12 @@ typedef enum dt_iop_rasterfile_mode_t
   DT_RASTERFILE_MODE_REDBLUE = DT_RASTERFILE_MODE_RED | DT_RASTERFILE_MODE_BLUE, // $DESCRIPTION: "red and blue"
   DT_RASTERFILE_MODE_GREENBLUE = DT_RASTERFILE_MODE_GREEN | DT_RASTERFILE_MODE_BLUE, // $DESCRIPTION: "green and blue"
 } dt_iop_rasterfile_mode_t;
+
+// the mode bits pass unchanged into the shared reader of
+// common/rasterfile_io.c: lock the numeric equivalence
+G_STATIC_ASSERT(DT_RASTERFILE_MODE_RED == DT_RASTERFILE_IO_RED);
+G_STATIC_ASSERT(DT_RASTERFILE_MODE_GREEN == DT_RASTERFILE_IO_GREEN);
+G_STATIC_ASSERT(DT_RASTERFILE_MODE_BLUE == DT_RASTERFILE_IO_BLUE);
 
 #define RASTERFILE_MAXFILE 2048
 
@@ -230,132 +237,6 @@ static void _vectorize_button_clicked(GtkWidget *widget,
 
     dt_masks_register_forms(dev, forms);
   }
-}
-
-static float *_read_rasterfile(char *filename,
-                               const dt_iop_rasterfile_mode_t mode,
-                               const gboolean quiet,
-                               int *swidth,
-                               int *sheight)
-{
-  *swidth = 0;
-  *sheight = 0;
-  if(!filename || filename[0] == 0) return NULL;
-
-  const char *extension = g_strrstr(filename, ".");
-  const gboolean is_png = extension && !g_ascii_strcasecmp(extension, ".png");
-
-  if(is_png)
-  {
-    dt_imageio_png_t png;
-    if(!dt_imageio_png_read_header(filename, &png))
-    {
-      dt_print(DT_DEBUG_ALWAYS, "failed to read PNG header from '%s'", filename ? filename : "???");
-      if(!quiet)
-        dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
-      return NULL;
-    }
-
-    const size_t rowbytes = png_get_rowbytes(png.png_ptr, png.info_ptr);
-    uint8_t *buf = dt_alloc_aligned((size_t)png.height * rowbytes);
-    if(!buf)
-    {
-      fclose(png.f);
-      png_destroy_read_struct(&png.png_ptr, &png.info_ptr, NULL);
-      dt_print(DT_DEBUG_ALWAYS, "can't read raster mask file '%s'", filename ? filename : "???");
-      if(!quiet)
-        dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
-      return NULL;
-    }
-
-    if(!dt_imageio_png_read_image(&png, buf))
-    {
-      dt_free_align(buf);
-      dt_print(DT_DEBUG_ALWAYS, "can't read raster mask file '%s'", filename ? filename : "???");
-      if(!quiet)
-        dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
-      return NULL;
-    }
-
-    const int width = png.width;
-    const int height = png.height;
-    float *mask = dt_iop_image_alloc(width, height, 1);
-    if(!mask)
-    {
-      dt_free_align(buf);
-      dt_print(DT_DEBUG_ALWAYS, "can't read raster mask file '%s'", filename ? filename : "???");
-      if(!quiet)
-        dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
-      return NULL;
-    }
-
-    if(png.bit_depth < 16)
-    {
-      const float normalizer = 1.0f / 255.0f;
-      DT_OMP_FOR()
-      for(size_t k = 0; k < (size_t)width * height; k++)
-      {
-        const size_t base = 3 * k;
-        float val = 0.0f;
-        if(mode & DT_RASTERFILE_MODE_RED)   val = MAX(val, buf[base] * normalizer);
-        if(mode & DT_RASTERFILE_MODE_GREEN) val = MAX(val, buf[base + 1] * normalizer);
-        if(mode & DT_RASTERFILE_MODE_BLUE)  val = MAX(val, buf[base + 2] * normalizer);
-        mask[k] = CLIP(val);
-      }
-    }
-    else
-    {
-      const float normalizer = 1.0f / 65535.0f;
-      DT_OMP_FOR()
-      for(size_t k = 0; k < (size_t)width * height; k++)
-      {
-        const size_t base = 6 * k;
-        const float red = (buf[base] * 256.0f + buf[base + 1]) * normalizer;
-        const float green = (buf[base + 2] * 256.0f + buf[base + 3]) * normalizer;
-        const float blue = (buf[base + 4] * 256.0f + buf[base + 5]) * normalizer;
-        float val = 0.0f;
-        if(mode & DT_RASTERFILE_MODE_RED)   val = MAX(val, red);
-        if(mode & DT_RASTERFILE_MODE_GREEN) val = MAX(val, green);
-        if(mode & DT_RASTERFILE_MODE_BLUE)  val = MAX(val, blue);
-        mask[k] = CLIP(val);
-      }
-    }
-
-    dt_free_align(buf);
-    *swidth = width;
-    *sheight = height;
-    return mask;
-  }
-
-  int width, height, channels, error = 0;
-  float *image = dt_read_pfm(filename, &error, &width, &height, &channels, 3);
-  float *mask = dt_iop_image_alloc(width, height, 1);
-  if(!image || !mask)
-  {
-    dt_print(DT_DEBUG_ALWAYS,
-             "can't read raster mask file '%s'", filename ? filename : "???");
-    if(!quiet)
-      dt_control_log(_("can't read raster mask file '%s'"), filename ? filename : "???");
-
-    dt_free_align(image);
-    dt_free_align(mask);
-    return NULL;
-  }
-
-  DT_OMP_FOR()
-  for(size_t k = 0; k < (size_t)width * height; k++)
-  {
-    float val = 0.0f;
-    if(mode & DT_RASTERFILE_MODE_RED)   val = MAX(val, image[k*3]);
-    if(mode & DT_RASTERFILE_MODE_GREEN) val = MAX(val, image[k*3+1]);
-    if(mode & DT_RASTERFILE_MODE_BLUE)  val = MAX(val, image[k*3+2]);
-    mask[k] = CLIP(val);
-  }
-
-  *swidth = width;
-  *sheight = height;
-  dt_free_align(image);
-  return mask;
 }
 
 static int _check_extension(const struct dirent *namestruct)
@@ -577,8 +458,8 @@ static float *_get_rasterfile_mask(dt_dev_pixelpipe_iop_t *piece,
     _clear_cache(cd);
     dt_print(DT_DEBUG_PIPE,
              "read image raster file `%s'", d->filepath);
-    cd->mask = _read_rasterfile(d->filepath, d->mode, d->quiet,
-                                &cd->width, &cd->height);
+    cd->mask = dt_rasterfile_io_read(d->filepath, d->mode, d->quiet,
+                                     &cd->width, &cd->height);
     cd->hash = cd->mask ? hash : DT_INVALID_HASH;
     dt_print(DT_DEBUG_PIPE,
              "got raster mask data %p %dx%d", cd->mask, cd->width, cd->height);
@@ -606,8 +487,8 @@ static float *_get_rasterfile_mask(dt_dev_pixelpipe_iop_t *piece,
                                               piece->pipe->image.id);
       if(retry_now)
       {
-        cd->mask = _read_rasterfile(d->filepath, d->mode, d->quiet,
-                                    &cd->width, &cd->height);
+        cd->mask = dt_rasterfile_io_read(d->filepath, d->mode, d->quiet,
+                                         &cd->width, &cd->height);
         cd->hash = cd->mask ? hash : DT_INVALID_HASH;
       }
     }
@@ -749,7 +630,7 @@ void commit_params(dt_iop_module_t *self,
 
   d->mode = p->mode;
   // a recipe makes the file recomputable: its absence is then a transient
-  // state handled by a recompute, not a toast (see _read_rasterfile)
+  // state handled by a recompute, not a toast (see dt_rasterfile_io_read)
   d->quiet = dt_rf_recipe_valid(&p->recipe);
   d->recipe = p->recipe;
   gchar *fullpath = NULL;
