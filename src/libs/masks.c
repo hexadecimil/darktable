@@ -19,6 +19,7 @@
 
 #include "develop/masks.h"
 #include "bauhaus/bauhaus.h"
+#include "common/ai/detectors.h"
 #include "common/darktable.h"
 #include "control/conf.h"
 #include "control/control.h"
@@ -376,6 +377,9 @@ static void _creation_bar_update(dt_lib_masks_t *d);
 static void _arm_bar_update(dt_lib_masks_t *d);
 static void _target_row_update(dt_lib_masks_t *d);
 static void _creation_end_continuous(void);
+#ifdef HAVE_AI
+static void _object_button_menu(dt_lib_module_t *self, GtkWidget *button);
+#endif
 
 // the list an index names -- see DT_MASKS_NVIEWS above for which is which.
 // an index rather than two named fields, so that "do it to both" stays a
@@ -1998,6 +2002,19 @@ static void _bt_add_shape_cb(GtkGestureSingle *gesture,
   const gboolean continuous =
     dt_modifier_is(dt_gui_current_state(gesture), GDK_CONTROL_MASK);
 
+#ifdef HAVE_AI
+  // two behaviours live behind the object button -- the one-shot
+  // detections and the clicked session (decision of the UX framing) --
+  // and a press cannot say which one it means: the button opens a menu
+  // instead, labels distinguishing the two
+  if(GPOINTER_TO_INT(shape) == DT_MASKS_OBJECT)
+  {
+    _object_button_menu(self,
+      gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(gesture)));
+    return;
+  }
+#endif
+
   // taken or refused, the six buttons end up showing what is armed and
   // nothing else. only the refusal needs the call: _start_creation() refreshes
   // the panel itself on the other path, and has already said why in the same
@@ -2021,6 +2038,117 @@ static void _tree_add_shape(GtkWidget *widget, gpointer shape)
   _start_creation(self, module, GPOINTER_TO_INT(shape), FALSE);
 }
 
+#ifdef HAVE_AI
+// activate an automatic-selection entry: resolve the target the item
+// carries (falling back like _tree_add_shape) and hand it to the one-shot
+// detection job. the entry was sensitive, so the state allowed it -- but
+// the registry and the pipe may have moved between the menu and the
+// click: the guards of _start_creation, in its order and with its words,
+// every one of them BEFORE the target is touched. the target is then put
+// in listening state exactly as _start_creation puts it -- the apply
+// idle rewrites mask_mode when the shape lands, but the job's result
+// must land on a module that renders it, visibly armed for the wait
+static void _detect_activate(GtkWidget *widget, gpointer detector)
+{
+  dt_lib_module_t *self = darktable.develop->proxy.masks.module;
+  if(!self) return;
+
+  // enable_drawn_mask below takes the focus, and a focus change tears
+  // down a mask computation in flight without a word -- the very guard
+  // _start_creation opens with
+  if(dt_masks_shapes_locked())
+  {
+    dt_control_log(_("mask still computing, try again in a moment"));
+    return;
+  }
+
+  // the launch re-derives this state and refuses on its own; asking
+  // first keeps that refusal ahead of the module mutations below
+  const dt_masks_object_detect_state_t state
+    = dt_masks_object_detect_state(detector);
+  if(state != DT_MASKS_OBJECT_DETECT_READY
+     && state != DT_MASKS_OBJECT_DETECT_DOWNLOAD)
+  {
+    dt_control_log(_("AI model is not available. Check preferences > AI"));
+    return;
+  }
+
+  dt_iop_module_t *module = g_object_get_data(G_OBJECT(widget), "target");
+  if(!module) module = _mask_default_target(self);
+
+  if(!_mask_target_alive(module) || !_mask_target_ok(module))
+  {
+    dt_control_log
+      (_("select a mask or open a module to choose where the shape goes"));
+    return;
+  }
+
+  // before the launch, deliberately: the launch flushes the history and
+  // captures the distort hash, so the item that enables the module must
+  // exist by then -- reversed, arming a disabled distort module
+  // (liquify) would change the geometry after the capture and the apply
+  // would discard the finished mask as a geometry change
+  dt_iop_gui_enable_drawn_mask(module);
+  dt_iop_request_focus(module);
+
+  dt_masks_object_detect_launch(detector, module);
+}
+
+// one entry per row of the detector table. what a click can do RIGHT NOW
+// is in the label: gtk3 delivers no tooltip to an insensitive item, so
+// the reason an entry cannot detect is part of it -- the convention of
+// every refusal in this panel's menus. READY detects; DOWNLOAD stays
+// sensitive too, because the click can act -- it downloads the model and
+// the detection follows on the same job; everything else states why it
+// is inert
+static gboolean _detect_menu_items(GtkMenuShell *menu,
+                                   dt_iop_module_t *target)
+{
+  if(!target) return FALSE;
+
+  gboolean any = FALSE;
+  for(size_t i = 0; i < G_N_ELEMENTS(dt_detectors); i++)
+  {
+    const dt_detector_t *det = &dt_detectors[i];
+    const char *reason = NULL;
+    gboolean sensitive = FALSE;
+    switch(dt_masks_object_detect_state(det))
+    {
+      case DT_MASKS_OBJECT_DETECT_READY:
+        sensitive = TRUE;
+        break;
+      case DT_MASKS_OBJECT_DETECT_DOWNLOAD:
+        reason = _("downloads the model");
+        sensitive = TRUE;
+        break;
+      case DT_MASKS_OBJECT_DETECT_DOWNLOADING:
+        reason = _("downloading the model...");
+        break;
+      case DT_MASKS_OBJECT_DETECT_AI_OFF:
+        reason = _("AI disabled in preferences");
+        break;
+      default:
+        reason = _("model not installed");
+    }
+
+    gchar *name = g_strdup_printf(_("select %s"), _(det->label));
+    gchar *label = reason ? g_strdup_printf("%s (%s)", name, reason)
+                          : g_strdup(name);
+    GtkWidget *item = gtk_menu_item_new_with_label(label);
+    g_free(label);
+    g_free(name);
+
+    gtk_widget_set_sensitive(item, sensitive);
+    g_object_set_data(G_OBJECT(item), "target", target);
+    g_signal_connect(item, "activate", G_CALLBACK(_detect_activate),
+                     (gpointer)det);
+    gtk_menu_shell_append(menu, item);
+    any = TRUE;
+  }
+  return any;
+}
+#endif
+
 // one row per shape type, wired to the callback the context menu and the shape
 // shortcuts already use. the module travels on the item, so the same function
 // fills the top level of the catalogue, every per-module submenu, and the
@@ -2031,6 +2159,19 @@ static void _new_mask_shape_items(GtkMenuShell *menu, dt_iop_module_t *target)
   // list: every caller resolves one first. what is left below is written per
   // entry because it really is per entry -- one model that is not installed
   if(!target) return;
+
+#ifdef HAVE_AI
+  // the automatic selections head the catalogue (M2.1): a detection is
+  // picked like a shape, minus the drawing, and it targets the very
+  // module this list hangs from. the heading is an insensitive item --
+  // these menus have no header widget, and a separator alone would not
+  // name what follows
+  GtkWidget *dhead = gtk_menu_item_new_with_label(_("automatic selection"));
+  gtk_widget_set_sensitive(dhead, FALSE);
+  gtk_menu_shell_append(menu, dhead);
+  _detect_menu_items(menu, target);
+  gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+#endif
 
   // by menu_rank and not by table order: the table is the row's order, and a
   // menu that opened on "add brush" because the row does would have moved the
@@ -2085,6 +2226,48 @@ static void _new_mask_shape_items(GtkMenuShell *menu, dt_iop_module_t *target)
     g_object_unref(rsub);
   }
 }
+
+#ifdef HAVE_AI
+// the object button's menu: the automatic selections and the clicked
+// session side by side -- the two behaviours the button stands for,
+// distinguished by their labels since an icon cannot say which one a
+// press means. same target resolution and the same refusal words as the
+// catalogue; the clicked entry rides _tree_add_shape, so every guard of
+// _start_creation applies unchanged
+static void _object_button_menu(dt_lib_module_t *self, GtkWidget *button)
+{
+  dt_iop_module_t *target = _mask_default_target(self);
+  if(!target)
+  {
+    dt_control_log
+      (_("select a mask or open a module to choose where the shape goes"));
+    return;
+  }
+
+  GtkMenuShell *menu = GTK_MENU_SHELL(gtk_menu_new());
+  _detect_menu_items(menu, target);
+  gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+
+  // the interactive session, under its own name -- the state convention
+  // of the shape entries: the reason lives in the label
+  const gboolean session_ok = dt_masks_object_available();
+  gchar *label = session_ok
+    ? g_strdup(_("select by clicking"))
+    : g_strdup_printf("%s (%s)", _("select by clicking"),
+                      _("AI model not available"));
+  GtkWidget *item = gtk_menu_item_new_with_label(label);
+  g_free(label);
+  gtk_widget_set_sensitive(item, session_ok);
+  g_object_set_data(G_OBJECT(item), "target", target);
+  g_signal_connect(item, "activate", G_CALLBACK(_tree_add_shape),
+                   GINT_TO_POINTER(DT_MASKS_OBJECT));
+  gtk_menu_shell_append(menu, item);
+
+  // dt_gui_menu_popup takes the floating ref and drops it on "deactivate"
+  dt_gui_menu_popup(GTK_MENU(menu), button,
+                    GDK_GRAVITY_SOUTH_WEST, GDK_GRAVITY_NORTH_WEST);
+}
+#endif
 
 // picking a module from the "..." of the target row: it says where the next
 // shape goes, and stops there. taking the focus IS the answer, rule 2 of
@@ -2766,13 +2949,38 @@ static void _set_iter_name(dt_lib_masks_t *lm,
     {
 #ifdef HAVE_AI
       // a valid recipe means the render path schedules the recompute on
-      // its own: the file is on its way back
-      const gboolean repairing = rpt && dt_rf_recipe_valid(&rpt->recipe);
+      // its own -- but only when the replay's model gates would pass:
+      // "recomputing" must not promise what the replay refuses, so the
+      // row states the model-gap verdict instead. the diagnostic is the
+      // exact mirror of those gates, promptless recipes included, and it
+      // is never cached: installs and rebinds move it between refreshes
+      if(rpt && dt_rf_recipe_valid(&rpt->recipe))
+      {
+        switch(dt_object_recipe_model_gap(&rpt->recipe, NULL))
+        {
+          case DT_OBJECT_RECIPE_MODELS_OK:
+            link = _("file missing, recomputing");
+            break;
+          case DT_OBJECT_RECIPE_MODELS_INSTALLABLE:
+          case DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND:
+            link = _("file missing, model download needed");
+            break;
+          case DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD:
+            link = _("file missing, recorded model changed");
+            break;
+          case DT_OBJECT_RECIPE_MODELS_AI_OFF:
+            link = _("file missing, AI disabled");
+            break;
+          default:
+            link = _("file missing, model unknown");
+        }
+      }
+      else
+        link = _("file missing");
 #else
       // without the AI subsystem no recipe can be replayed here
-      const gboolean repairing = FALSE;
+      link = _("file missing");
 #endif
-      link = repairing ? _("file missing, recomputing") : _("file missing");
     }
     g_free(rpath);
   }
@@ -3770,7 +3978,38 @@ static void _tree_context_menu(dt_lib_module_t *self,
     const dt_masks_point_raster_t *rpt = dt_masks_raster_point(grp);
     if(rpt && dt_rf_recipe_valid(&rpt->recipe))
     {
-      item = gtk_menu_item_new_with_label(_("recompute mask file"));
+      // GTK3 lesson, the panel's convention: when the replay's model
+      // gates would refuse -- the model-gap verdict is their exact
+      // mirror -- the reason is spelled in the label and the entry
+      // disabled, rather than promising a recompute that changes
+      // nothing. a build without AI keeps the plain entry: its click
+      // already answers with the subsystem toast
+      const char *reason = NULL;
+#ifdef HAVE_AI
+      switch(dt_object_recipe_model_gap(&rpt->recipe, NULL))
+      {
+        case DT_OBJECT_RECIPE_MODELS_OK:
+          break;
+        case DT_OBJECT_RECIPE_MODELS_INSTALLABLE:
+        case DT_OBJECT_RECIPE_MODELS_DRIFT_BEHIND:
+          reason = _("model download needed");
+          break;
+        case DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD:
+          reason = _("recorded model changed");
+          break;
+        case DT_OBJECT_RECIPE_MODELS_AI_OFF:
+          reason = _("AI disabled in preferences");
+          break;
+        default:
+          reason = _("model unknown");
+      }
+#endif
+      gchar *rlabel = reason
+        ? g_strdup_printf("%s (%s)", _("recompute mask file"), reason)
+        : g_strdup(_("recompute mask file"));
+      item = gtk_menu_item_new_with_label(rlabel);
+      g_free(rlabel);
+      gtk_widget_set_sensitive(item, reason == NULL);
       g_object_set_data(G_OBJECT(item), "formid",
                         GUINT_TO_POINTER(grp->formid));
       g_signal_connect(item, "activate",
