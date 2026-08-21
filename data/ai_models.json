@@ -16,6 +16,13 @@
       "default": false
     },
     {
+      "id": "mask-subject-birefnet",
+      "name": "subject birefnet lite",
+      "task": "mask-subject",
+      "min_version": "1.0",
+      "default": true
+    },
+    {
       "id": "denoise-nind",
       "name": "denoise nind",
       "task": "denoise",
