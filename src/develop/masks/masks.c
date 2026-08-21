@@ -977,6 +977,8 @@ dt_masks_form_t *dt_masks_create(const dt_masks_type_t type)
     form->functions = &dt_masks_functions_gradient;
   else if(type & DT_MASKS_GROUP)
     form->functions = &dt_masks_functions_group;
+  else if(type & DT_MASKS_RASTER)
+    form->functions = &dt_masks_functions_raster;
 #ifdef HAVE_AI
   else if(type & DT_MASKS_OBJECT)
     form->functions = &dt_masks_functions_object;

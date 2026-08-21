@@ -47,6 +47,11 @@ typedef enum dt_masks_type_t
 #ifdef HAVE_AI
   DT_MASKS_OBJECT = 1 << 8,
 #endif
+  // a persistent shape whose content is not a geometry but a reference to
+  // a raster mask file (an AI precise mask or a hand-picked file). bit 8
+  // stays reserved for DT_MASKS_OBJECT on every build, HAVE_AI or not:
+  // the two types must never collide across build variants
+  DT_MASKS_RASTER = 1 << 9,
 } dt_masks_type_t;
 
 /**masts states */
@@ -269,6 +274,38 @@ typedef struct dt_masks_ai_trailer_t
 // segment caps at 64 KB -- marginal against the existing mask data, but
 // part of that budget.
 G_STATIC_ASSERT(sizeof(dt_masks_ai_trailer_t) == 1096);
+
+// ---- the raster shape: a mask that IS a file ----
+//
+// the single serialized "point" of a DT_MASKS_RASTER form. not a geometry:
+// a reference to the mask file that renders the shape, plus the provenance
+// recipe that can regenerate that file (see common/rasterfile_recipe.h).
+// when the recipe is valid it IS the reference -- the file name is derived
+// content-addressed from its fingerprint under the local mask root, exactly
+// like iop/rasterfile.c commit_params does; `file` is only read when the
+// recipe is absent (sequential "<basename>_mask_N.png" output or a future
+// hand-picked file) and names a leaf under the mask root.
+// POD and layout frozen: the blob travels verbatim through DB and XMP and
+// is hashed for pipe invalidation (dt_masks_group_hash), so no implicit
+// padding and every reserved byte zeroed. an unknown version renders the
+// form inert (never a wrong render). image identity is deliberately NOT
+// stored: it is re-derived from the pipe's image at render time, the same
+// semantics as the rasterfile module
+#define DT_MASKS_RASTER_POINT_MAGIC 0x4454524Du  // "DTRM"; 0 = invalid
+#define DT_MASKS_RASTER_POINT_VERSION 1
+
+typedef struct dt_masks_point_raster_t
+{
+  uint32_t magic;      // DT_MASKS_RASTER_POINT_MAGIC
+  uint32_t version;    // DT_MASKS_RASTER_POINT_VERSION
+  uint32_t flags;      // reserved, keep zeroed
+  int32_t _pad;        // explicit, keep zeroed (the blob is hashed)
+  char file[256];      // fallback leaf name when recipe.magic == 0
+  dt_rf_recipe_t recipe;
+} dt_masks_point_raster_t;
+
+// 16 + 256 + 1072: any drift breaks every stored history of this type
+G_STATIC_ASSERT(sizeof(dt_masks_point_raster_t) == 1344);
 
 /** structure used to store pointers to the functions implementing operations on a mask shape */
 /** plus a few per-class descriptive data items */
@@ -546,6 +583,7 @@ extern const dt_masks_functions_t dt_masks_functions_brush;
 extern const dt_masks_functions_t dt_masks_functions_path;
 extern const dt_masks_functions_t dt_masks_functions_gradient;
 extern const dt_masks_functions_t dt_masks_functions_group;
+extern const dt_masks_functions_t dt_masks_functions_raster;
 #ifdef HAVE_AI
 extern const dt_masks_functions_t dt_masks_functions_object;
 /** check if AI object mask model is downloaded and AI is enabled */
