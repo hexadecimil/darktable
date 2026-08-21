@@ -18,6 +18,8 @@
 
 #include "common/ai/segmentation.h"
 #include "common/ai/refine.h"
+#include "common/ai/detect.h"
+#include "common/ai/detectors.h"
 #include "common/ai_models.h"
 #include "common/colorspaces.h"
 #include "common/debug.h"
@@ -3151,6 +3153,74 @@ static gboolean _launch_native_finalize(_object_data_t *d,
  *    refinement pass succeeded; the replay's own attempt may degrade
  *    differently (model pinning above only guarantees the same weights). */
 
+// render the recorded encode frame through the already prepared export
+// pipe and hand it back as the uint8 RGB the model consumers take. the
+// sampling scale is recovered with the encode-thread formula from the
+// recorded cap; when the recorded dims come from a .seg made under
+// another cap the formula cannot land on them, fall back to the dim
+// ratio (sub-pixel sampling difference, accepted for that rare case).
+// shared by the clicked replay (which encodes the render) and the
+// promptless replay (which runs the detector on it directly). NULL on
+// failure, reported inside
+static uint8_t *_replay_render_rgb8(dt_develop_t *dev,
+                                    dt_dev_pixelpipe_t *pipe,
+                                    const dt_rf_recipe_t *recipe,
+                                    const int enc_w,
+                                    const int enc_h)
+{
+  const int render_cap = MAX(recipe->render_size, 1024);
+  const double e_scale
+    = fmin((double)render_cap / (double)pipe->processed_width,
+           (double)render_cap / (double)pipe->processed_height);
+  double final_scale = fmin(e_scale, 1.0);
+  if((int)(final_scale * pipe->processed_width) != enc_w
+     || (int)(final_scale * pipe->processed_height) != enc_h)
+  {
+    final_scale = fmin((double)enc_w / (double)pipe->processed_width,
+                       (double)enc_h / (double)pipe->processed_height);
+    // bound the requested ROI to the scaled extent of the processed
+    // frame: the ratio truncates, so allow the accepted one-pixel slack,
+    // but reject a recipe whose dims the render cannot reach -- the
+    // prompts would land on the wrong grid anyway
+    if((int)(final_scale * pipe->processed_width) + 1 < enc_w
+       || (int)(final_scale * pipe->processed_height) + 1 < enc_h)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: recorded dims %dx%d not reachable"
+               " from the processed frame, rejecting", enc_w, enc_h);
+      return NULL;
+    }
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: recorded dims %dx%d do not match the "
+             "recorded render cap, using the dim ratio", enc_w, enc_h);
+  }
+
+  dt_print(DT_DEBUG_AI,
+           "[object mask] replay: rendering %dx%d for encoding...",
+           enc_w, enc_h);
+  // the return value signals "pipe altered mid-flight", not success --
+  // the backbuf and its dimensions are the check that matters
+  dt_dev_pixelpipe_process_no_gamma(pipe, dev, 0, 0, enc_w, enc_h,
+                                    final_scale);
+  if(!pipe->backbuf
+     || pipe->backbuf_width != enc_w || pipe->backbuf_height != enc_h)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: render for encoding returned %dx%d,"
+             " expected %dx%d",
+             pipe->backbuf_width, pipe->backbuf_height, enc_w, enc_h);
+    return NULL;
+  }
+
+  // backbuf is float RGBA, convert to uint8 RGB -- same as the encode
+  // thread
+  uint8_t *rgb = _backbuf_to_rgb8(pipe, enc_w, enc_h);
+  if(!rgb)
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: render for encoding failed");
+  return rgb;
+}
+
 dt_object_recipe_status_t
 dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
                          const dt_imgid_t imgid,
@@ -3160,25 +3230,68 @@ dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
   if(!dt_rf_recipe_valid(recipe) || !dt_is_valid_imgid(imgid))
     return DT_OBJECT_RECIPE_FAILED;
 
-  // the recorded decode boundaries drive the replay; the last one produced
-  // the mask the finalisation worked from. a recipe without any boundary
-  // defines no refinement chain and cannot be replayed
-  int last_decode = -1;
-  for(int i = 0; i < recipe->n_points; i++)
-    if(recipe->points[i].decode_after)
-      last_decode = i;
-  if(last_decode < 0)
+  // the two replay families part here: a clicked recipe replays its
+  // recorded decode boundaries through the segmentation stack, a
+  // promptless one replays a single detector inference. the detectors
+  // table is the single authority mapping the recorded prompt kind to a
+  // registry task and its post-processing; a pair it does not know is an
+  // unusable recipe, not a "pick a default"
+  const gboolean promptless = recipe->prompt_kind != DT_RF_PROMPT_POINTS;
+  const dt_detector_t *detector = NULL;
+  if(promptless)
+  {
+    detector = dt_detector_find(recipe->prompt_kind, recipe->class_bits);
+    if(!detector)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: no detector for prompt kind %d /"
+               " class bits %llx",
+               recipe->prompt_kind,
+               (unsigned long long)recipe->class_bits);
+      return DT_OBJECT_RECIPE_FAILED;
+    }
+  }
+
+  // the matting fields are reserved: no build has the matting stage yet,
+  // so a recipe recording one cannot be reproduced -- replaying without
+  // it would write different bytes under a fingerprint that promises it.
+  // deterministic (like the boundary check below), outside the model-gap
+  // mirror: it is a capability of the build, not a model to install
+  if(recipe->matting_enabled)
   {
     dt_print(DT_DEBUG_AI,
-             "[object mask] replay: recipe records no decode boundary");
+             "[object mask] replay: recipe records a matting stage this"
+             " build cannot reproduce -- not replaying");
     return DT_OBJECT_RECIPE_FAILED;
+  }
+
+  // the recorded decode boundaries drive the clicked replay; the last one
+  // produced the mask the finalisation worked from. a clicked recipe
+  // without any boundary defines no refinement chain and cannot be
+  // replayed. stays -1 for a promptless recipe: the decode loop below
+  // then never iterates
+  int last_decode = -1;
+  if(!promptless)
+  {
+    for(int i = 0; i < recipe->n_points; i++)
+      if(recipe->points[i].decode_after)
+        last_decode = i;
+    if(last_decode < 0)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: recipe records no decode boundary");
+      return DT_OBJECT_RECIPE_FAILED;
+    }
   }
 
   // pin the models to the recorded versions. the fingerprint names the
   // exact weights; replaying with anything else would write different
   // content under the same name and poison a shared store forever. hard
   // failure on any deviation: it is retryable once the right models are
-  // installed, and a mask-to-0 in the meantime beats silent divergence
+  // installed, and a mask-to-0 in the meantime beats silent divergence.
+  // the seg_model slot of a promptless recipe carries the recorded
+  // DETECTOR -- the same pin applies unchanged, and the model gap
+  // diagnostic below stays its exact mirror for both families
   const char *seg_ver = dt_ai_model_get_version(recipe->seg_model);
   if(g_strcmp0(seg_ver, recipe->seg_model_version) != 0)
   {
@@ -3223,6 +3336,7 @@ dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
   int hint_w = 0, hint_h = 0;
   dt_ai_environment_t *env = NULL;
   dt_seg_context_t *seg = NULL;
+  dt_detect_context_t *det = NULL;
   dt_dev_pixelpipe_t pipe;
   dt_mipmap_buffer_t buf;
   gboolean pipe_ready = FALSE, buf_ready = FALSE;
@@ -3322,20 +3436,47 @@ dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
     g_unlink(outpath);
   }
 
-  // load the RECORDED segmentation model, not the currently active one: the
-  // replay reproduces the original session. a missing model is a clean
-  // failure -- the caller may retry once it is installed
+  // load the RECORDED model, not the currently active one: the replay
+  // reproduces the original session. a missing model is a clean failure
+  // -- the caller may retry once it is installed
   env = dt_ai_env_init(NULL);
-  seg = env ? dt_seg_load(env, recipe->seg_model) : NULL;
-  if(!seg)
+  if(promptless)
   {
-    dt_print(DT_DEBUG_AI,
-             "[object mask] replay: segmentation model '%s' unavailable",
-             recipe->seg_model);
-    goto cleanup;
+    det = env ? dt_detect_load(env, recipe->seg_model, detector->task)
+              : NULL;
+    if(!det)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: detector model '%s' unavailable",
+               recipe->seg_model);
+      goto cleanup;
+    }
+    // the input side shapes the whole resample geometry: a model
+    // repackaged at another side would produce different bytes under the
+    // same recorded (id, version), so the side is pinned like the
+    // version is
+    if(dt_detect_get_side(det) != recipe->detect_input)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: detector input side %d differs from"
+               " the recorded %d -- not replaying",
+               dt_detect_get_side(det), recipe->detect_input);
+      goto cleanup;
+    }
   }
-  od.env = env;
-  od.seg = seg;
+  else
+  {
+    seg = env ? dt_seg_load(env, recipe->seg_model) : NULL;
+    if(!seg)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] replay: segmentation model '%s' unavailable",
+               recipe->seg_model);
+      goto cleanup;
+    }
+    od.env = env;
+    od.seg = seg;
+  }
 
   const int enc_w = recipe->encode_w;
   const int enc_h = recipe->encode_h;
@@ -3397,122 +3538,100 @@ dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
   // grid uses -- then the plain processed->encode factor of _launch_decode
   // (which uses no pixel-centre offset either). the normalised coordinates
   // are scale-invariant, so the preview pipe of the capture and this export
-  // pipe agree by the same convention every stored mask form relies on
-  const int n = recipe->n_points;
-  enc_pts = g_new(float, (size_t)n * 2);
-  for(int k = 0; k < n; k++)
+  // pipe agree by the same convention every stored mask form relies on.
+  // a promptless recipe has no points to map
+  if(!promptless)
   {
-    enc_pts[k * 2 + 0] = recipe->points[k].x * (float)pipe.iwidth;
-    enc_pts[k * 2 + 1] = recipe->points[k].y * (float)pipe.iheight;
-  }
-  dt_dev_distort_transform_plus(&dev, &pipe, 0.0, DT_DEV_TRANSFORM_DIR_ALL,
-                                enc_pts, n);
-  const float psx = (float)enc_w / (float)pipe.processed_width;
-  const float psy = (float)enc_h / (float)pipe.processed_height;
-  for(int k = 0; k < n; k++)
-  {
-    enc_pts[k * 2 + 0] *= psx;
-    enc_pts[k * 2 + 1] *= psy;
-  }
-
-  // encoder embeddings: the disk cache first, keyed exactly like the
-  // interactive session (imgid + current distortion state + model). the
-  // cache is validated without dimensions, so a hit at other dims than the
-  // recipe records would put the prompts on the wrong grid -- re-encode then
-  gboolean encoded = FALSE;
-  if(dt_seg_disk_cache_load(seg, imgid, cur_hash))
-  {
-    int cw = 0, ch = 0;
-    dt_seg_get_encoded_rgb(seg, &cw, &ch);
-    if(cw == enc_w && ch == enc_h)
-      encoded = TRUE;
-    else
+    const int n = recipe->n_points;
+    enc_pts = g_new(float, (size_t)n * 2);
+    for(int k = 0; k < n; k++)
     {
-      dt_print(DT_DEBUG_AI,
-               "[object mask] replay: cached encoding is %dx%d, recipe "
-               "records %dx%d, re-encoding", cw, ch, enc_w, enc_h);
-      dt_seg_reset_encoding(seg);
+      enc_pts[k * 2 + 0] = recipe->points[k].x * (float)pipe.iwidth;
+      enc_pts[k * 2 + 1] = recipe->points[k].y * (float)pipe.iheight;
+    }
+    dt_dev_distort_transform_plus(&dev, &pipe, 0.0,
+                                  DT_DEV_TRANSFORM_DIR_ALL, enc_pts, n);
+    const float psx = (float)enc_w / (float)pipe.processed_width;
+    const float psy = (float)enc_h / (float)pipe.processed_height;
+    for(int k = 0; k < n; k++)
+    {
+      enc_pts[k * 2 + 0] *= psx;
+      enc_pts[k * 2 + 1] *= psy;
     }
   }
 
-  if(!encoded)
+  // both families render at EXACTLY the recorded dims -- never re-read
+  // the render-size conf for this render, a changed preference would
+  // shift the geometry the recipe describes
+  if(promptless)
   {
-    // render at EXACTLY the recorded dims -- never re-read the render-size
-    // conf for this render, a changed preference would shift the prompt
-    // grid. the sampling scale is recovered with the encode-thread formula
-    // from the recorded cap; when the recorded dims come from a .seg made
-    // under another cap the formula cannot land on them, fall back to the
-    // dim ratio (sub-pixel sampling difference, accepted for that rare case)
-    const int render_cap = MAX(recipe->render_size, 1024);
-    const double e_scale
-      = fmin((double)render_cap / (double)pipe.processed_width,
-             (double)render_cap / (double)pipe.processed_height);
-    double final_scale = fmin(e_scale, 1.0);
-    if((int)(final_scale * pipe.processed_width) != enc_w
-       || (int)(final_scale * pipe.processed_height) != enc_h)
-    {
-      final_scale = fmin((double)enc_w / (double)pipe.processed_width,
-                         (double)enc_h / (double)pipe.processed_height);
-      // bound the requested ROI to the scaled extent of the processed
-      // frame: the ratio truncates, so allow the accepted one-pixel slack,
-      // but reject a recipe whose dims the render cannot reach -- the
-      // prompts would land on the wrong grid anyway
-      if((int)(final_scale * pipe.processed_width) + 1 < enc_w
-         || (int)(final_scale * pipe.processed_height) + 1 < enc_h)
-      {
-        dt_print(DT_DEBUG_AI,
-                 "[object mask] replay: recorded dims %dx%d not reachable"
-                 " from the processed frame, rejecting", enc_w, enc_h);
-        goto cleanup;
-      }
-      dt_print(DT_DEBUG_AI,
-               "[object mask] replay: recorded dims %dx%d do not match the "
-               "recorded render cap, using the dim ratio", enc_w, enc_h);
-    }
-
-    dt_print(DT_DEBUG_AI,
-             "[object mask] replay: rendering %dx%d for encoding...",
-             enc_w, enc_h);
-    // the return value signals "pipe altered mid-flight", not success --
-    // the backbuf and its dimensions are the check that matters
-    dt_dev_pixelpipe_process_no_gamma(&pipe, &dev, 0, 0, enc_w, enc_h,
-                                      final_scale);
-    if(!pipe.backbuf
-       || pipe.backbuf_width != enc_w || pipe.backbuf_height != enc_h)
-    {
-      dt_print(DT_DEBUG_AI,
-               "[object mask] replay: render for encoding returned %dx%d,"
-               " expected %dx%d",
-               pipe.backbuf_width, pipe.backbuf_height, enc_w, enc_h);
-      goto cleanup;
-    }
-
-    // backbuf is float RGBA, convert to uint8 RGB -- same as the encode
-    // thread
-    rgb = _backbuf_to_rgb8(&pipe, enc_w, enc_h);
+    // no embedding cache to consult: the detector keeps no per-image
+    // state, every replay renders and infers
+    rgb = _replay_render_rgb8(&dev, &pipe, recipe, enc_w, enc_h);
     if(!rgb)
+      goto cleanup;
+
+    hint_w = enc_w;
+    hint_h = enc_h;
+    hint = g_try_malloc((size_t)enc_w * enc_h * sizeof(float));
+    if(!hint)
+      goto cleanup;
+    if(!dt_detect_run(det, rgb, enc_w, enc_h, hint))
     {
-      dt_print(DT_DEBUG_AI, "[object mask] replay: render for encoding failed");
+      dt_print(DT_DEBUG_AI, "[object mask] replay: detection failed");
       goto cleanup;
     }
-
-    // same CPU fallback as the interactive encode thread, pinned to the
-    // recorded model
-    encoded = _seg_encode_cpu_fallback(&seg, env, recipe->seg_model,
-                                       rgb, enc_w, enc_h);
-    od.seg = seg;
-    // populate the disk cache for repeated replays -- but never clobber a
-    // file the interactive session wrote: a single slot exists per image,
-    // and overwriting it with the recipe dims would silently degrade the
-    // session's working resolution on its next cache hit
-    if(encoded && !dt_seg_disk_cache_exists(imgid))
-      dt_seg_disk_cache_save(seg, imgid, cur_hash, rgb, enc_w, enc_h);
     g_free(rgb);
     rgb = NULL;
+  }
+  else
+  {
+    // encoder embeddings: the disk cache first, keyed exactly like the
+    // interactive session (imgid + current distortion state + model). the
+    // cache is validated without dimensions, so a hit at other dims than
+    // the recipe records would put the prompts on the wrong grid --
+    // re-encode then
+    gboolean encoded = FALSE;
+    if(dt_seg_disk_cache_load(seg, imgid, cur_hash))
+    {
+      int cw = 0, ch = 0;
+      dt_seg_get_encoded_rgb(seg, &cw, &ch);
+      if(cw == enc_w && ch == enc_h)
+        encoded = TRUE;
+      else
+      {
+        dt_print(DT_DEBUG_AI,
+                 "[object mask] replay: cached encoding is %dx%d, recipe "
+                 "records %dx%d, re-encoding", cw, ch, enc_w, enc_h);
+        dt_seg_reset_encoding(seg);
+      }
+    }
+
     if(!encoded)
     {
-      dt_print(DT_DEBUG_AI, "[object mask] replay: encoding failed");
-      goto cleanup;
+      rgb = _replay_render_rgb8(&dev, &pipe, recipe, enc_w, enc_h);
+      if(!rgb)
+        goto cleanup;
+
+      // same CPU fallback as the interactive encode thread, pinned to the
+      // recorded model
+      encoded = _seg_encode_cpu_fallback(&seg, env, recipe->seg_model,
+                                         rgb, enc_w, enc_h);
+      od.seg = seg;
+      // populate the disk cache for repeated replays -- but never
+      // clobber a file the interactive session wrote: a single slot
+      // exists per image, and overwriting it with the recipe dims would
+      // silently degrade the session's working resolution on its next
+      // cache hit
+      if(encoded && !dt_seg_disk_cache_exists(imgid))
+        dt_seg_disk_cache_save(seg, imgid, cur_hash, rgb, enc_w, enc_h);
+      g_free(rgb);
+      rgb = NULL;
+      if(!encoded)
+      {
+        dt_print(DT_DEBUG_AI, "[object mask] replay: encoding failed");
+        goto cleanup;
+      }
     }
   }
 
@@ -3617,8 +3736,14 @@ dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
     }
   }
 
-  // the segmentation stack is done; release it before the heavy native pass
-  // (which loads its own refinement context, as the interactive job does)
+  // the model stack of either family is done; release it before the heavy
+  // native pass (which loads its own refinement context, as the
+  // interactive job does)
+  if(det)
+  {
+    dt_detect_free(det);
+    det = NULL;
+  }
   if(od.refine)
   {
     dt_refine_free(od.refine);
@@ -3635,6 +3760,11 @@ dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
   // derives it: final threshold, CascadePSP margin as padding
   const float thresh = CLAMP(recipe->threshold, 0.3f, 0.9f);
   const float margin = CLAMPF(recipe->ai_refine_margin, 0.0f, 0.5f);
+  // the component filter of a single-object detection: no clicked seed
+  // exists, so the filter keeps the largest component. multi-component
+  // detectors (a sky between branches) skip it by their table row
+  if(promptless && detector->keep_seed)
+    _keep_seed_component(hint, hint_w, hint_h, thresh, -1, -1);
   dt_seg_point_t tl, br;
   if(!_compute_bbox(hint, hint_w, hint_h, thresh, margin, &tl, &br))
   {
@@ -3700,6 +3830,7 @@ cleanup:
   if(buf_ready) dt_mipmap_cache_release(&buf);
   if(od.refine) dt_refine_free(od.refine);
   if(seg) dt_seg_free(seg);
+  if(det) dt_detect_free(det);
   if(env) dt_ai_env_destroy(env);
   dt_dev_cleanup(&dev);
   // a deterministic failure deserves a visible trace even without -d ai:
@@ -3721,7 +3852,13 @@ cleanup:
 // nothing, so any change to the gates in dt_object_recipe_compute must
 // land here too. anything but OK is refined into the cause an UX surface
 // can act on; the verdict is cheap and never cached (installs, rebinds
-// and edits all change it)
+// and edits all change it). the promptless family shares the
+// (seg_model, version) pin verbatim, and the extra replay gates that a
+// registry or manifest change can move -- the detector table row, the
+// task family of the recorded id, the model's input side -- are
+// mirrored below. the one deviation, stated: the matting-capability
+// gate stays outside the mirror, a build property no download can
+// move, like the boundary check
 
 // the priority when the recipe's two models disagree: the verdict
 // needing the heaviest user action wins. NOT the enum order --
@@ -3840,6 +3977,57 @@ _recipe_model_gap(const dt_rf_recipe_t *recipe,
 
       seg_gap = _model_gap_one(recipe->seg_model,
                                recipe->seg_model_version, ids);
+
+      // the promptless replay additionally resolves its detector row
+      // and loads BY ID with a task check and an input-side pin (the
+      // gates of dt_object_recipe_compute and dt_detect_load): registry
+      // and manifest properties, so OK must consult them too or it
+      // would promise a replay those gates refuse
+      if(recipe->prompt_kind != DT_RF_PROMPT_POINTS)
+      {
+        const dt_detector_t *detector
+          = dt_detector_find(recipe->prompt_kind, recipe->class_bits);
+        if(!detector)
+          // the recipe names a detector this build's table does not
+          // know: like an unknown id, nothing a download can produce
+          seg_gap = DT_OBJECT_RECIPE_MODELS_UNKNOWN;
+        else
+        {
+          // a catalogue update can reassign an id to another task; the
+          // replay then refuses the load and no download repairs it --
+          // "redo with the current models" is the only repair, the
+          // DRIFT_AHEAD offer (the refine active-check precedent)
+          dt_ai_model_t *m = dt_ai_models_get_by_id(recipe->seg_model);
+          if(m && g_strcmp0(m->task, detector->task) != 0)
+            seg_gap = DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD;
+          dt_ai_model_free(m);
+
+          if(seg_gap == DT_OBJECT_RECIPE_MODELS_OK)
+          {
+            // the input-side pin: a model repackaged locally at another
+            // side under the same (id, version). only checkable once
+            // the install matches (OK), the manifest exists then
+            dt_ai_environment_t *env = dt_ai_registry_get_env();
+            const dt_ai_model_info_t *info = env
+              ? dt_ai_get_model_info_by_id(env, recipe->seg_model)
+              : NULL;
+            int n = 0;
+            int *sizes = info
+              ? dt_ai_model_attribute_int_array(info, "input_sizes", &n)
+              : NULL;
+            const int side = (sizes && n > 0) ? sizes[0] : 0;
+            g_free(sizes);
+            // the manifest carries its OWN task field and that is the
+            // one dt_detect_load actually refuses on -- a hand-edited
+            // config.json can move it independently of the registry
+            // task above, so consult it too (a NULL info short-circuits
+            // on the zero side before the dereference)
+            if(side <= 0 || side != recipe->detect_input
+               || g_strcmp0(info->task_type, detector->task) != 0)
+              seg_gap = DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD;
+          }
+        }
+      }
 
       if(recipe->ai_refine)
       {
@@ -4399,6 +4587,16 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
   dt_develop_t *dev = darktable.develop;
   if(!target || !target->has_recipe || !dt_rf_recipe_valid(&target->recipe))
     return FALSE;
+  // a promptless recipe records no clicked session to reopen: revising
+  // one is a redetect, not a decode replay -- refuse until that surface
+  // exists
+  if(target->recipe.prompt_kind != DT_RF_PROMPT_POINTS)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] edit: promptless recipes have no click"
+             " session to reopen");
+    return FALSE;
+  }
   // opening a session goes through dt_masks_change_form_gui, which tears
   // down whatever session is in flight -- same guard as every other
   // creation entry point
@@ -4816,12 +5014,49 @@ gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe)
   if(!dt_rf_recipe_valid(recipe))
     return FALSE;
 
-  char *seg_id = dt_ai_models_get_active_for_task("mask");
+  // the seg_model slot carries the interactive segmentation model of a
+  // clicked recipe and the recorded detector of a promptless one: rebind
+  // from the active model of the family's OWN task, or a subject recipe
+  // would silently be rebound to the click-session SAM model
+  const char *seg_task = "mask";
+  if(recipe->prompt_kind != DT_RF_PROMPT_POINTS)
+  {
+    const dt_detector_t *detector
+      = dt_detector_find(recipe->prompt_kind, recipe->class_bits);
+    if(!detector)
+      return FALSE;
+    seg_task = detector->task;
+  }
+
+  char *seg_id = dt_ai_models_get_active_for_task(seg_task);
   if(!seg_id || !*seg_id)
   {
     g_free(seg_id);
     return FALSE;
   }
+
+  if(recipe->prompt_kind != DT_RF_PROMPT_POINTS)
+  {
+    // the input side travels with the model: repin it to the new model's
+    // manifest, or the rebound recipe would fail the side gate of its
+    // own replay
+    dt_ai_environment_t *env = dt_ai_registry_get_env();
+    const dt_ai_model_info_t *info
+      = env ? dt_ai_get_model_info_by_id(env, seg_id) : NULL;
+    int n = 0;
+    int *sizes
+      = info ? dt_ai_model_attribute_int_array(info, "input_sizes", &n)
+             : NULL;
+    const int side = (sizes && n > 0) ? sizes[0] : 0;
+    g_free(sizes);
+    if(side <= 0)
+    {
+      g_free(seg_id);
+      return FALSE;
+    }
+    recipe->detect_input = side;
+  }
+
   memset(recipe->seg_model, 0, sizeof(recipe->seg_model));
   memset(recipe->seg_model_version, 0, sizeof(recipe->seg_model_version));
   g_strlcpy(recipe->seg_model, seg_id, sizeof(recipe->seg_model));
