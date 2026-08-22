@@ -43,6 +43,7 @@
 #include "common/ai_models.h"
 #include "common/darktable.h"
 #include "common/math.h"
+#include "control/control.h"
 
 #include <math.h>
 #include <string.h>
@@ -55,6 +56,13 @@ static const float DETECT_STD[3] = { 0.229f, 0.224f, 0.225f };
 struct dt_detect_context_t
 {
   dt_ai_context_t *ai_ctx;
+  dt_ai_environment_t *env;  // borrowed: the caller's env, which every
+                             // call site destroys after the context --
+                             // held for the one CPU reload below
+  char *model_id;
+  gboolean cpu_fallback_done; // the CPU retry is single-shot: once the
+                              // session was swapped (or the swap
+                              // failed), a failure is final
   int side;             // attributes.input_sizes[0]
   gboolean letterbox;   // attributes.letterbox: keep aspect, pad with 0
   gboolean sigmoid;     // output_activation != "none": logits -> sigmoid
@@ -140,6 +148,8 @@ dt_detect_context_t *dt_detect_load(dt_ai_environment_t *env,
 
   dt_detect_context_t *ctx = g_malloc0(sizeof(dt_detect_context_t));
   ctx->ai_ctx = ai;
+  ctx->env = env;
+  ctx->model_id = g_strdup(model_id);
   ctx->side = side;
   ctx->letterbox = dt_ai_model_attribute_bool(info, "letterbox");
 
@@ -194,6 +204,7 @@ void dt_detect_free(dt_detect_context_t *ctx)
   if(!ctx) return;
   g_free(ctx->t_image);
   g_free(ctx->o_mask);
+  g_free(ctx->model_id);
   if(ctx->ai_ctx) dt_ai_unload_model(ctx->ai_ctx);
   g_free(ctx);
 }
@@ -202,6 +213,46 @@ void dt_detect_free(dt_detect_context_t *ctx)
 int dt_detect_get_side(const dt_detect_context_t *ctx)
 {
   return ctx ? ctx->side : 0;
+}
+
+
+/* Swap the failing session for one on the CPU provider, the
+ * dt_restore_reload_session_cpu pattern: the swapped session lives on
+ * the context, so later runs reuse it instead of rebuilding one per
+ * call, and dt_detect_free releases it like any other. */
+static gboolean _reload_session_cpu(dt_detect_context_t *ctx)
+{
+  if(!ctx || !ctx->env || !ctx->model_id) return FALSE;
+
+  // nothing to fall back FROM when the configured provider already is
+  // the CPU: a swap would rebuild the same session, run the doomed
+  // inference twice and toast a GPU failure that never happened. the
+  // refine consumer draws the same line (dt_refine_load)
+  if(dt_ai_env_get_provider(ctx->env) == DT_AI_PROVIDER_CPU)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[detect] configured provider is CPU, no fallback");
+    return FALSE;
+  }
+
+  // unload the old session BEFORE creating the new one: on GPU EPs the
+  // failing session may still hold VRAM, and the CPU session creation
+  // happens to be cheaper if no other ORT state is in flight
+  dt_ai_unload_model(ctx->ai_ctx);
+  ctx->ai_ctx = NULL;
+
+  dt_ai_context_t *cpu = dt_ai_load_model_ext(ctx->env, ctx->model_id,
+                                              NULL, DT_AI_PROVIDER_CPU,
+                                              DT_AI_OPT_DEFAULT, NULL, 0);
+  if(!cpu)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[detect] CPU fallback session load failed for %s",
+             ctx->model_id);
+    return FALSE;
+  }
+  ctx->ai_ctx = cpu;
+  return TRUE;
 }
 
 
@@ -320,8 +371,29 @@ gboolean dt_detect_run(dt_detect_context_t *ctx,
   };
   if(dt_ai_run(ctx->ai_ctx, &input, 1, &output, 1) != 0)
   {
-    dt_print(DT_DEBUG_AI, "[detect] inference failed");
-    return FALSE;
+    // one retry on the CPU provider, the restore_* convention: the
+    // observed failure mode is the GPU EP running out of VRAM
+    // mid-graph (DirectML 8007000E) while darktable's own OpenCL pipe
+    // holds the card -- a lost cause on that provider, a few seconds
+    // on the CPU. the CPU failing too is the final answer, and the
+    // caller's message stays the one the user reads. the flag is set
+    // BEFORE the attempt: a failed swap must not be retried either
+    const gboolean already = ctx->cpu_fallback_done;
+    ctx->cpu_fallback_done = TRUE;
+    if(already || !_reload_session_cpu(ctx))
+    {
+      dt_print(DT_DEBUG_AI, "[detect] inference failed");
+      return FALSE;
+    }
+    dt_print(DT_DEBUG_AI,
+             "[detect] GPU inference failed; retrying on CPU");
+    dt_control_log(_("AI detection: GPU inference failed, "
+                     "falling back to CPU"));
+    if(dt_ai_run(ctx->ai_ctx, &input, 1, &output, 1) != 0)
+    {
+      dt_print(DT_DEBUG_AI, "[detect] inference failed");
+      return FALSE;
+    }
   }
 
   // the backend rewrites the output shape with the dimensions the model

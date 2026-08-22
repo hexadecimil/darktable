@@ -52,6 +52,10 @@ gboolean dt_detect_available(const char *task);
  * single call on a background job, so a CPU fallback is slow but blocks
  * nothing, and a warmup would exactly double the cost.
  *
+ * `env` is borrowed for the lifetime of the context (the CPU retry of
+ * dt_detect_run reloads through it): destroy the context first, the
+ * environment after, as every call site of this consumer already does.
+ *
  * Makes no GLib/GTK call visible to the main thread, so it may be
  * called from a worker job.
  */
@@ -78,6 +82,15 @@ int dt_detect_get_side(const dt_detect_context_t *ctx);
  * declares: whatever the frame dimensions, the resample happens here
  * (bilinear, pixel-centre both ways) and no caller has to pre-fit its
  * render -- the frame size never reaches the session.
+ *
+ * A failed inference is retried ONCE on the CPU provider (the
+ * restore_* convention, with its toast): the known failure mode is
+ * the GPU provider running out of VRAM while darktable's own OpenCL
+ * pipe holds the card. The swapped session stays on the context, so
+ * a later call neither rebuilds it nor retries the doomed provider;
+ * only when the CPU fails too does this return FALSE. A session the
+ * user already configured on the CPU has nothing to fall back to,
+ * and its failure is final at once, without the toast.
  *
  * @param ctx   detection context.
  * @param rgb   uint8 HWC image, 3 channels, rgb_w x rgb_h.
