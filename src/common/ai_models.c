@@ -371,6 +371,22 @@ static char *_fetch_asset_digest(
 
 // core API
 
+// the default per-user models root. models are heavy and pinned by the
+// recipes' (id, version), so ONE copy serves every instance of this
+// user: the root deliberately follows the user data dir, NOT the
+// instance's --configdir (unlike the raster mask cache, whose files
+// are per-image working state). an instance that wants its own root
+// sets plugins/ai/models_path in ITS darktablerc -- conf lives in the
+// instance configdir, so the override IS the per-instance scoping --
+// and reads keep falling back to this default root (see
+// _installed_model_dir and the backend's _scan_all_paths), so moving
+// a root never strands the models already downloaded here
+static char *_default_models_dir(void)
+{
+  return g_build_filename(g_get_user_data_dir(),
+                          "darktable", "models", NULL);
+}
+
 // set up directories and provider config; returns FALSE if a required
 // directory could not be created — the model/cache dirs are unusable
 // and downloads/scans will fail; no-op returning TRUE if already
@@ -386,8 +402,7 @@ static gboolean _setup_registry(dt_ai_registry_t *registry)
   // init_lazy, so it must be the LAST field published
   char *models = dt_ai_resolve_models_path_override();
   if(!models)
-    models = g_build_filename(g_get_user_data_dir(),
-                              "darktable", "models", NULL);
+    models = _default_models_dir();
   char *cache = g_build_filename(cachedir, "ai_downloads", NULL);
 
   // attempt both before bailing so the log reports every missing dir
@@ -702,6 +717,41 @@ static gboolean _valid_model_id(const char *model_id)
   return TRUE;
 }
 
+// resolve the directory a model is REALLY installed in: the registry
+// root first, then the default per-user root -- the read fallback of
+// the models_path override, mirroring the backend's _scan_all_paths
+// (explicit paths scanned first, default root always appended). newly
+// allocated, NULL when the model is installed in neither. READ paths
+// only: downloads and deletes stay on models_dir, so an instance can
+// never destroy the copy the other instances share
+static char *_installed_model_dir(dt_ai_registry_t *registry,
+                                  const char *model_id)
+{
+  if(!registry->models_dir) return NULL;
+
+  char *dir = g_build_filename(registry->models_dir, model_id, NULL);
+  char *config = g_build_filename(dir, "config.json", NULL);
+  gboolean found = g_file_test(dir, G_FILE_TEST_IS_DIR)
+                   && g_file_test(config, G_FILE_TEST_EXISTS);
+  g_free(config);
+  if(found) return dir;
+  g_free(dir);
+
+  char *root = _default_models_dir();
+  const gboolean same = g_strcmp0(root, registry->models_dir) == 0;
+  dir = same ? NULL : g_build_filename(root, model_id, NULL);
+  g_free(root);
+  if(!dir) return NULL;
+
+  config = g_build_filename(dir, "config.json", NULL);
+  found = g_file_test(dir, G_FILE_TEST_IS_DIR)
+          && g_file_test(config, G_FILE_TEST_EXISTS);
+  g_free(config);
+  if(found) return dir;
+  g_free(dir);
+  return NULL;
+}
+
 void dt_ai_models_refresh_status(void)
 {
   dt_ai_registry_t *registry = darktable.ai_registry;
@@ -734,12 +784,14 @@ void dt_ai_models_refresh_status(void)
     if(!_valid_model_id(model->id))
       continue;
 
-    // check if model directory exists and contains required files
-    char *model_dir = g_build_filename(registry->models_dir, model->id, NULL);
-    char *config_path = g_build_filename(model_dir, "config.json", NULL);
+    // where the model really is: the registry root, or the default
+    // user root when an override redirected models_dir -- a model
+    // present only there is installed all the same (read fallback)
+    char *model_dir = _installed_model_dir(registry, model->id);
+    char *config_path
+      = model_dir ? g_build_filename(model_dir, "config.json", NULL) : NULL;
 
-    if(g_file_test(model_dir, G_FILE_TEST_IS_DIR)
-       && g_file_test(config_path, G_FILE_TEST_EXISTS))
+    if(model_dir)
     {
       model->status = DT_AI_MODEL_DOWNLOADED;
       // read version from the model's own config.json
@@ -780,10 +832,18 @@ void dt_ai_models_refresh_status(void)
     g_free(model_dir);
   }
 
-  // pass 2: discover locally-installed models not in registry
-  if(registry->models_dir)
+  // pass 2: discover locally-installed models not in registry -- in
+  // both roots when an override made them differ, the registry root
+  // first: a model present in both is taken from the override (the
+  // "skip if already in registry" check below is what shadows), the
+  // very first-seen-wins rule of the backend's directory scan
+  char *fallback_root = registry->models_dir ? _default_models_dir() : NULL;
+  const char *roots[2] = { registry->models_dir, NULL };
+  if(fallback_root && g_strcmp0(fallback_root, registry->models_dir) != 0)
+    roots[1] = fallback_root;
+  for(int r = 0; r < 2 && roots[r]; r++)
   {
-    GDir *dir = g_dir_open(registry->models_dir, 0, NULL);
+    GDir *dir = g_dir_open(roots[r], 0, NULL);
     if(dir)
     {
       const char *entry_name;
@@ -796,7 +856,7 @@ void dt_ai_models_refresh_status(void)
         if(_find_model_unlocked(registry, entry_name))
           continue;
 
-        char *model_dir = g_build_filename(registry->models_dir, entry_name, NULL);
+        char *model_dir = g_build_filename(roots[r], entry_name, NULL);
         char *config_path = g_build_filename(model_dir, "config.json", NULL);
 
         if(g_file_test(model_dir, G_FILE_TEST_IS_DIR)
@@ -819,6 +879,7 @@ void dt_ai_models_refresh_status(void)
       g_dir_close(dir);
     }
   }
+  g_free(fallback_root);
 
   g_mutex_unlock(&registry->lock);
 }
@@ -2018,6 +2079,11 @@ gboolean dt_ai_models_delete(const char *model_id)
   }
   g_mutex_unlock(&registry->lock);
 
+  // deliberately the registry root alone, never the read fallback: an
+  // instance whose override borrows a model from the default user root
+  // must not be able to destroy what the other instances share. such a
+  // borrowed model survives its "delete" and the next status refresh
+  // honestly reports it installed again
   char *model_dir = g_build_filename(registry->models_dir, model_id, NULL);
   _rmdir_recursive(model_dir);
   g_free(model_dir);
@@ -2189,7 +2255,11 @@ char *dt_ai_models_get_path(const char *model_id)
   if(!downloaded)
     return NULL;
 
-  return g_build_filename(registry->models_dir, model_id, NULL);
+  // the read fallback of the status scan, applied to the path handed
+  // out: DOWNLOADED may have been earned under the default user root
+  char *dir = _installed_model_dir(registry, model_id);
+  return dir ? dir
+             : g_build_filename(registry->models_dir, model_id, NULL);
 }
 
 void dt_ai_models_get_spatial_dims(const char *model_id,
