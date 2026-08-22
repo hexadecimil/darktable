@@ -43,6 +43,12 @@ typedef struct dt_detector_t
 {
   const char *task;    // registry task whose models implement it
   const char *label;   // base name of the created form, lowercase msgid
+  const char *glyph;   // monochrome text glyph heading the catalogue
+                       // entry: menus carry no image icons
+                       // (GtkImageMenuItem is deprecated), so the
+                       // glyph is part of the label text -- it greys
+                       // with the entry and follows the theme like
+                       // any other character. UTF-8, never translated
   int32_t prompt_kind; // DT_RF_PROMPT_* recorded in the recipe
   int64_t class_bits;  // semantic class set; 0 = salient subject
   gboolean keep_seed;  // TRUE: single-object detection, keep only one
@@ -52,7 +58,7 @@ typedef struct dt_detector_t
 } dt_detector_t;
 
 static const dt_detector_t dt_detectors[] = {
-  { "mask-subject", N_("subject"), DT_RF_PROMPT_SUBJECT, 0, TRUE },
+  { "mask-subject", N_("subject"), "✦", DT_RF_PROMPT_SUBJECT, 0, TRUE },
 };
 
 // resolve a recipe's (prompt_kind, class_bits) to its table row; NULL

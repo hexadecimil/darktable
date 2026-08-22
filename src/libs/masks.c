@@ -2131,9 +2131,13 @@ static gboolean _detect_menu_items(GtkMenuShell *menu,
         reason = _("model not installed");
     }
 
+    // the glyph of the detector's table row heads the label: plain
+    // text, so it greys with an insensitive entry and follows the
+    // theme -- these menus carry no image icons
     gchar *name = g_strdup_printf(_("select %s"), _(det->label));
-    gchar *label = reason ? g_strdup_printf("%s (%s)", name, reason)
-                          : g_strdup(name);
+    gchar *label = reason
+      ? g_strdup_printf("%s %s (%s)", det->glyph, name, reason)
+      : g_strdup_printf("%s %s", det->glyph, name);
     GtkWidget *item = gtk_menu_item_new_with_label(label);
     g_free(label);
     g_free(name);
@@ -2186,17 +2190,27 @@ static void _new_mask_shape_items(GtkMenuShell *menu, dt_iop_module_t *target)
     if(i == (int)G_N_ELEMENTS(_new_mask_shapes)) continue;
 
     const gchar *reason = NULL;
+    const gchar *glyph = "";
 
 #ifdef HAVE_AI
-    if(_new_mask_shapes[i].type == DT_MASKS_OBJECT && !dt_masks_object_available())
-      reason = _("AI model not available");
+    if(_new_mask_shapes[i].type == DT_MASKS_OBJECT)
+    {
+      // the ✦ of the automatic entries, on this one too: not a
+      // detectors row, but the same AI family -- and at the menu
+      // site, not in the table, whose label also names the panel
+      // button and its tooltip
+      glyph = "✦ ";
+      if(!dt_masks_object_available())
+        reason = _("AI model not available");
+    }
 #endif
 
     // gtk3 delivers no event, hence no tooltip, to an insensitive widget:
     // whatever an entry cannot do has to be readable in the entry itself
     gchar *label = reason
-      ? g_strdup_printf("%s (%s)", _(_new_mask_shapes[i].label), reason)
-      : g_strdup(_(_new_mask_shapes[i].label));
+      ? g_strdup_printf("%s%s (%s)", glyph,
+                        _(_new_mask_shapes[i].label), reason)
+      : g_strdup_printf("%s%s", glyph, _(_new_mask_shapes[i].label));
 
     GtkWidget *item = gtk_menu_item_new_with_label(label);
     g_free(label);
@@ -2249,11 +2263,13 @@ static void _object_button_menu(dt_lib_module_t *self, GtkWidget *button)
   gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
 
   // the interactive session, under its own name -- the state convention
-  // of the shape entries: the reason lives in the label
+  // of the shape entries: the reason lives in the label. the ✦ of the
+  // automatic entries is hardcoded here: not a detectors row, but the
+  // same AI family, and the menu reads as one section
   const gboolean session_ok = dt_masks_object_available();
   gchar *label = session_ok
-    ? g_strdup(_("select by clicking"))
-    : g_strdup_printf("%s (%s)", _("select by clicking"),
+    ? g_strdup_printf("✦ %s", _("select by clicking"))
+    : g_strdup_printf("✦ %s (%s)", _("select by clicking"),
                       _("AI model not available"));
   GtkWidget *item = gtk_menu_item_new_with_label(label);
   g_free(label);
