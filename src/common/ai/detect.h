@@ -74,6 +74,11 @@ int dt_detect_get_side(const dt_detect_context_t *ctx);
  * so the caller feeds the finalisation exactly what the interactive
  * decoder feeds it.
  *
+ * The model tensor is ALWAYS side x side, the size the manifest
+ * declares: whatever the frame dimensions, the resample happens here
+ * (bilinear, pixel-centre both ways) and no caller has to pre-fit its
+ * render -- the frame size never reaches the session.
+ *
  * @param ctx   detection context.
  * @param rgb   uint8 HWC image, 3 channels, rgb_w x rgb_h.
  * @param rgb_w frame width, in pixels.

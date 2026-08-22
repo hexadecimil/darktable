@@ -242,7 +242,12 @@ gboolean dt_detect_run(dt_detect_context_t *ctx,
   // used area of the square input: the full square when the manifest
   // asks for a plain stretch (the BiRefNet convention), the
   // aspect-preserving letterbox otherwise, its margin padded with the
-  // zeros of the memset
+  // zeros of the memset. the plain stretch is anisotropic on purpose:
+  // a 2:3 frame lands on the 1:1 tensor with its subject distorted,
+  // which is exactly how the family is trained, and the inverse
+  // mapping below restores the frame's geometry on the way back --
+  // "fixing" it with a letterbox the manifest does not declare would
+  // feed the model a margin it never saw in training
   int uw = s, uh = s;
   if(ctx->letterbox)
   {
@@ -292,6 +297,16 @@ gboolean dt_detect_run(dt_detect_context_t *ctx,
       }
     }
   }
+
+  // the journal must show what the session is REALLY served: the
+  // caller logs its render as "rendering WxH for encoding", and a
+  // failure right after that line reads as if the frame size had
+  // reached the model. it never does -- the tensor is pinned to the
+  // manifest's side by construction -- and this line is the proof in
+  // the very journal such a hunt starts from
+  dt_print(DT_DEBUG_AI,
+           "[detect] frame %dx%d -> %dx%d tensor (used %dx%d)",
+           rgb_w, rgb_h, s, s, uw, uh);
 
   int64_t shape_img[4] = { 1, 3, s, s };
   int64_t shape_1c[4] = { 1, 1, s, s };
