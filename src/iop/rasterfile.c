@@ -400,7 +400,21 @@ static void _recompute_clicked(GtkWidget *widget, dt_iop_module_t *self)
   dt_rf_recipe_t rebound = p->recipe;
   if(!dt_object_recipe_rebind_models(&rebound))
   {
-    dt_control_log(_("no AI model available to recompute this mask"));
+    // the rebind refuses on two unrelated grounds and the message may not
+    // blame a model for the other one: a recorded matting stage this build
+    // does not carry is a BUILD CAPABILITY, and no model page, no download
+    // and no activation moves it -- "no AI model available" would send the
+    // user looking in the one place that cannot help. named first, like
+    // every other surface names it first.
+    // asked only HERE, in the failure branch, and never before the rebind:
+    // a stage the table carries at another revision is precisely what the
+    // rebind repins, so it must reach it. that is the repair the headless
+    // toast points at, and short-circuiting it would make that toast lie
+    if(!dt_object_recipe_matting_reproducible(&p->recipe))
+      dt_control_log(_("cannot recompute this mask: it records a matting"
+                       " stage this darktable cannot reproduce"));
+    else
+      dt_control_log(_("no AI model available to recompute this mask"));
     return;
   }
 

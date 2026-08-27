@@ -155,17 +155,40 @@ gboolean dt_object_recipe_recompute_now(const dt_rf_recipe_t *recipe,
 gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe);
 
 // diagnose the gap between a recipe's recorded models and the installed
-// state: one combined verdict covering the segmentation model plus, when
-// the recipe enables refinement, the refinement model -- exactly the
-// scope of the replay gates. when the two models disagree the verdict
-// needing the heaviest user action wins: AI_OFF > UNKNOWN > INSTALLABLE
-// > DRIFT_BEHIND > DRIFT_AHEAD > OK. `missing` (nullable) receives a
-// NULL-terminated vector of the model ids a download could move toward
-// the recorded state (the INSTALLABLE and DRIFT_BEHIND ones), NULL when
-// there is nothing to download; free with g_strfreev. never cache the
-// verdict: installs, rebinds and edits all change it under your feet
+// state: one combined verdict covering the segmentation model, plus the
+// refinement model when the recipe enables refinement, plus the model the
+// recorded matting operator loads when this build carries a line that
+// needs one -- exactly the scope of the replay gates, all three stages of
+// it. when the causes disagree the verdict needing the heaviest user
+// action wins: AI_OFF > UNKNOWN > INSTALLABLE > DRIFT_BEHIND >
+// DRIFT_AHEAD > OK. `missing` (nullable) receives a NULL-terminated
+// vector of the model ids a download could move toward the recorded state
+// (the INSTALLABLE and DRIFT_BEHIND ones), NULL when there is nothing to
+// download; free with g_strfreev. never cache the verdict: installs,
+// rebinds and edits all change it under your feet.
+//
+// The matting stage contributes a MODEL gap and never a build-capability
+// one -- whether this darktable carries the operator at all is the
+// separate question dt_object_recipe_matting_reproducible answers, and a
+// surface asking only this one would still be told "models check out" for
+// a replay the other gate refuses. A surface that NAMES the model at
+// fault must therefore consider three causes, not two: the matting stage
+// records no model version, so the recorded/installed vocabulary of the
+// other two does not apply to it
 dt_object_recipe_model_gap_t
 dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing);
+
+// TRUE when this build can reproduce the matting stage a recipe records,
+// and trivially TRUE for a recipe that records none. the companion of the
+// verdict above for the OTHER half of the replay gate: the matting stage
+// is a BUILD CAPABILITY, not a model -- no download, no activation and no
+// rebind of models can bring an operator this build does not carry -- so a
+// surface that only asked dt_object_recipe_model_gap would answer "models
+// check out, recomputing" for a replay that refuses. ask this one first
+// and name the stage; the model gap keeps its own, separate vocabulary.
+// like the model gap, never cache it: a private build carrying the
+// operator may open the same library tomorrow
+gboolean dt_object_recipe_matting_reproducible(const dt_rf_recipe_t *recipe);
 
 // the situation changed (a model was installed, activated or removed):
 // clear the deterministic failures pinned in the anti-respawn table so
@@ -264,6 +287,18 @@ dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing)
   // without AI support there is no registry to interrogate; AI_OFF is
   // the one verdict that promises no repair on this machine
   return DT_OBJECT_RECIPE_MODELS_AI_OFF;
+}
+
+// a build without AI support replays nothing at all, so it can reproduce
+// no recorded stage either. deliberately NOT a table lookup: dt_matte_find
+// would answer for the operator, but the answer would be beside the point
+// and the surfaces reading it must not offer a repair this build has no
+// machinery for. recipes recording no stage stay trivially true, which is
+// what keeps the call sites free of a second condition
+static inline gboolean
+dt_object_recipe_matting_reproducible(const dt_rf_recipe_t *recipe)
+{
+  return !recipe || !recipe->matting_enabled;
 }
 
 static inline void dt_object_recipe_reset_failed(void)

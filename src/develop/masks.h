@@ -85,6 +85,13 @@ typedef enum dt_masks_property_t
   DT_MASKS_PROPERTY_CLEANUP,
   DT_MASKS_PROPERTY_SMOOTHING,
   DT_MASKS_PROPERTY_REFINE,
+  // AI object mask, applied at finalisation only: the matting stage and
+  // its single degree of freedom. appended, like every property before
+  // them -- the panel builds one widget per entry and each form type
+  // decides which ones it answers for, so a new entry is invisible to
+  // every shape that does not handle it
+  DT_MASKS_PROPERTY_MATTING,
+  DT_MASKS_PROPERTY_MATTING_BAND,
   DT_MASKS_PROPERTY_LAST
 } dt_masks_property_t;
 

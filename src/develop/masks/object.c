@@ -24,7 +24,7 @@
 #include "common/colorspaces.h"
 #include "common/debug.h"
 #include "common/densecrf.h"
-#include "common/guided_filter.h"
+#include "common/matte.h"
 
 #include "common/rasterfile_recipe.h"
 // mirror of iop/rasterfile.c's parameter layout (v2), which lives in the
@@ -208,6 +208,18 @@ typedef struct _object_data_t
   float edit_refine_margin;
   int edit_render_size;        // recorded render cap, raw (see
                                // encoded_render_size for the convention)
+  // the matting stage of the session, seeded from the replayed recipe like
+  // every parameter above. it exists because the stage is otherwise a
+  // PREFERENCE, and a session that read the preference would re-finalise a
+  // reopened mask with today's settings instead of the ones the mask was
+  // made with -- the very drift the recorded threshold and render cap are
+  // seeded to prevent. read through _session_matte(), never directly.
+  // `edit_matte_op` points into the static table, so it is borrowed and
+  // outlives any session by construction
+  gboolean edit_matte_seeded;  // FALSE until edit_begin has seeded them
+  gboolean edit_matte_enabled;
+  const dt_matte_op_t *edit_matte_op;
+  float edit_matte_band;
   // no-op baseline: the recipe the session WOULD re-capture at the end of
   // the replay. closing with a byte-identical re-capture means the session
   // produced nothing new. snapshotting the recipe instead of a point count
@@ -403,6 +415,12 @@ static void _edit_session_end(_object_data_t *d, const int final_state)
     dt_object_mask_edit_clear_active();
   d->edit_valid = FALSE;
   d->edit_threshold = NAN;
+  // the matting override falls with the threshold one, and the borrowed
+  // table pointer goes with it: edit_valid alone already sends
+  // _session_matte back to the preference, this just leaves no stale
+  // reading behind for a later session to inherit
+  d->edit_matte_seeded = FALSE;
+  d->edit_matte_op = NULL;
   d->edit_baseline_valid = FALSE;
   g_atomic_int_set(&d->edit_pending, final_state);
 }
@@ -1861,6 +1879,38 @@ static gchar *_build_mask_path(const dt_imgid_t imgid)
  * Runs once, on a worker job, a few seconds. The interactive loop is not
  * touched. */
 
+// the preferences of the matting stage. ONE spelling of each key, shared
+// by the reader that resolves a session and by the panel widgets that
+// write them: two literals that drift apart make a control that silently
+// stops controlling anything
+#define CONF_MATTE_ENABLED_KEY "plugins/ai/matting_enabled"
+#define CONF_MATTE_OP_KEY "plugins/ai/matting_op"
+#define CONF_MATTE_BAND_KEY "plugins/ai/matting_band_scale"
+
+// the single user degree of freedom of the matting stage, clamped on the
+// way in: the preference file is hand-editable and the recipe blob is
+// untrusted, so no path may hand the render core a band scale it did not
+// vet. the law's own constants stay compiled in, covered by the operator
+// version
+#define DT_MATTE_BAND_SCALE_MIN 0.5f
+#define DT_MATTE_BAND_SCALE_MAX 2.0f
+#define DT_MATTE_BAND_SCALE_DEFAULT 1.0f
+
+// the matting stage of ONE finalisation, resolved once by the caller and
+// carried in the request. the render core never reads the configuration
+// itself: the interactive job resolves the stage from the preferences at
+// launch, the recipe replay resolves it from what the recipe RECORDED, and
+// a core that consulted dt_conf would make the replay reproduce today's
+// preferences instead of the render it is replaying.
+// declared here, ahead of the job, because the launch SNAPSHOTS it into the
+// job like it snapshots the render cap -- see _finalize_job_t::matte
+typedef struct _matte_session_t
+{
+  gboolean enabled;         // the stage runs; FALSE is the current chain
+  float band_scale;         // [DT_MATTE_BAND_SCALE_MIN, ..._MAX]
+  const dt_matte_op_t *op;  // table line, NULL when the stage is off
+} _matte_session_t;
+
 typedef struct _finalize_job_t
 {
   dt_imgid_t imgid;
@@ -1885,6 +1935,15 @@ typedef struct _finalize_job_t
                         // recipe land on the same pixels. re-reading the
                         // preference here would silently detach the two in
                         // an edit session (whose cap is the recorded one)
+  _matte_session_t matte;  // matting stage, snapshotted at launch for the
+                           // same reason as render_target: the recipe is
+                           // captured on the GUI thread at launch, so the
+                           // stage the recipe will record and the stage
+                           // this render runs must be ONE resolution. the
+                           // job body executes after an unbounded queue
+                           // wait -- resolving there would let a
+                           // preference toggled in between detach the
+                           // render from its own provenance
   dt_hash_t distort_hash;  // distortion state at launch; revalidated at
                            // APPLY time on the GUI thread (same context)
   // provenance of the mask, captured on the GUI thread at launch. when
@@ -1899,14 +1958,67 @@ typedef struct _finalize_job_t
   gboolean ran;
 } _finalize_job_t;
 
+// the matting block of a recipe, from the session the CALLER resolved for
+// the render that recipe describes. the single writer of these four
+// fields, and the single place the version is moved to EXT for them.
+//
+// an off stage writes NOTHING -- not the block, not the version bump. that
+// is the rule the recipe header states for the whole extension area, and
+// it is what makes "matting off produces the bytes earlier builds
+// produced" a property of one branch here instead of a claim about the
+// whole capture.
+//
+// FALSE means the session cannot be described. an id or a revision that
+// did not fit its fixed-size field would be silently truncated into a
+// DIFFERENT operator's name, and a fingerprint naming the wrong algorithm
+// is the exact poison the table exists to prevent; the caller then records
+// no recipe at all, which costs a content-addressed name and nothing else.
+// the G_STATIC_ASSERTs standing next to each table line make this
+// unreachable -- this is the runtime half of that guard, for the line
+// somebody adds one day without them
+static gboolean _recipe_set_matting(dt_rf_recipe_t *recipe,
+                                    const _matte_session_t *matte)
+{
+  if(!matte || !matte->enabled || !matte->op)
+    return TRUE;
+
+  if(g_strlcpy(recipe->matting_id, matte->op->id,
+               sizeof(recipe->matting_id)) >= sizeof(recipe->matting_id)
+     || g_strlcpy(recipe->matting_version, matte->op->version,
+                  sizeof(recipe->matting_version))
+        >= sizeof(recipe->matting_version))
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[object mask] matting: operator '%s' v'%s' does not fit the"
+             " recipe fields -- recording no provenance for this mask",
+             matte->op->id, matte->op->version);
+    memset(recipe->matting_id, 0, sizeof(recipe->matting_id));
+    memset(recipe->matting_version, 0, sizeof(recipe->matting_version));
+    return FALSE;
+  }
+  recipe->version = DT_RF_RECIPE_VERSION_EXT;
+  recipe->matting_enabled = 1;
+  recipe->matting_band = CLAMPF(matte->band_scale,
+                                DT_MATTE_BAND_SCALE_MIN,
+                                DT_MATTE_BAND_SCALE_MAX);
+  return TRUE;
+}
+
 // GUI thread: record everything needed to regenerate the finalised mask
 // file from the raw -- the provenance recipe stored with the raster
 // module's params, so a library opened on another machine (or after the
 // cache was purged) can recompute the file instead of showing a broken
 // mask. returns FALSE when the session cannot be described (more clicks
-// than the recipe holds); the caller then falls back to a plain file
+// than the recipe holds); the caller then falls back to a plain file.
+// `matte` is the matting stage of the render this recipe will name, as the
+// caller ALREADY resolved it -- a nullable pointer, NULL meaning "this
+// route runs no matting stage". it is a parameter and not a dt_conf read
+// here on purpose: the recipe and the render it describes must be one
+// resolution of the preference, and the render's own resolution happens at
+// launch (see _finalize_job_t::matte)
 static gboolean _capture_recipe(_object_data_t *d,
                                 dt_masks_form_gui_t *gui,
+                                const _matte_session_t *matte,
                                 dt_rf_recipe_t *recipe)
 {
   memset(recipe, 0, sizeof(*recipe));
@@ -2008,7 +2120,12 @@ static gboolean _capture_recipe(_object_data_t *d,
     }
   }
   g_free(pts);
-  return TRUE;
+  // the matting stage LAST, over an otherwise finished version-1 blob: it
+  // is the only field group whose presence moves the recipe to version
+  // EXT, and writing it here makes "an off stage leaves a byte-identical
+  // v1 recipe" readable in one place instead of inferred from a branch
+  // three hundred lines up
+  return _recipe_set_matting(recipe, matte);
 }
 
 // content hash of a group of paths for the ai trailer: the group's own
@@ -2493,6 +2610,193 @@ static gboolean _finalize_keep_going(void *p)
                         : _("computing precise raster mask..."));
 }
 
+// the stage is off unless an operator is actually there to run it. an
+// unavailable operator DISABLES the stage, it never selects another line:
+// two different algorithms under one recipe id is the one failure this
+// whole table exists to prevent
+static _matte_session_t _matte_session_off(void)
+{
+  _matte_session_t s = { .enabled = FALSE,
+                         .band_scale = DT_MATTE_BAND_SCALE_DEFAULT,
+                         .op = NULL };
+  return s;
+}
+
+// what the user asked for, for a render that is being made now. WHICH
+// operator is a preference naming a table id -- not a compiled-in choice
+// and not a combo box over an enum: the table is the single authority on
+// what exists, so an id no line carries (the default `gf-adaptive`, in a
+// build that does not register it yet) leaves the stage inert with the
+// preference on, which is precisely the state this step has to be able to
+// prove harmless. looked up by id, like the replay does, so both paths
+// meet the same "no such operator" answer through the same door -- and a
+// preference naming a line that was removed disables the stage instead of
+// falling back to another one
+static _matte_session_t _matte_session_from_conf(void)
+{
+  _matte_session_t s = _matte_session_off();
+  if(!dt_conf_get_bool(CONF_MATTE_ENABLED_KEY))
+    return s;
+
+  gchar *id = dt_conf_get_string(CONF_MATTE_OP_KEY);
+  const dt_matte_op_t *const op = dt_matte_find(id);
+  if(!op)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] matting: no operator '%s' in this build,"
+             " running the plain band stage", id ? id : "");
+    g_free(id);
+    return s;
+  }
+  g_free(id);
+  s.op = op;
+  s.enabled = TRUE;
+  s.band_scale = CLAMPF((float)dt_conf_get_float(CONF_MATTE_BAND_KEY),
+                        DT_MATTE_BAND_SCALE_MIN, DT_MATTE_BAND_SCALE_MAX);
+  return s;
+}
+
+// the matting stage a given session runs, the last of the _session_*
+// accessors -- and the only one that could not sit with the others up at
+// the top of the file, because it needs the table lookup and the
+// preference keys, both of which the finalisation block introduces.
+//
+// same rule as _session_threshold and its siblings: inside an edit session
+// the value is the one the REPLAYED RECIPE recorded, outside it the
+// preference. that rule is what closes the gap the previous step could
+// only warn about -- reopening a mask made with a matting stage used to
+// re-finalise it with whatever the preferences said today, so a session
+// that changed one click silently changed the algorithm too.
+//
+// the seeded stage is used verbatim, WITHOUT re-resolving it against the
+// preference: edit_begin resolved it from the recipe (and refused the
+// session outright when this build could not), so second-guessing it here
+// would reintroduce exactly the drift the seeding removes
+static _matte_session_t _session_matte(const _object_data_t *d)
+{
+  if(d && d->edit_valid && d->edit_matte_seeded)
+  {
+    _matte_session_t s = _matte_session_off();
+    if(d->edit_matte_enabled && d->edit_matte_op)
+    {
+      s.enabled = TRUE;
+      s.op = d->edit_matte_op;
+      s.band_scale = CLAMPF(d->edit_matte_band,
+                            DT_MATTE_BAND_SCALE_MIN, DT_MATTE_BAND_SCALE_MAX);
+    }
+    return s;
+  }
+  return _matte_session_from_conf();
+}
+
+// the operator the preference NAMES, whether or not the stage is switched
+// on. the two matting widgets need exactly that and _matte_session_from_conf
+// cannot answer it: that one returns an off session as soon as the enable
+// preference is off, so asking it would hide the very toggle that switches
+// the stage on. same door as everything else -- dt_matte_find by id -- so a
+// preference naming a line this build does not carry answers NULL here too
+static const dt_matte_op_t *_matte_conf_op(void)
+{
+  gchar *id = dt_conf_get_string(CONF_MATTE_OP_KEY);
+  const dt_matte_op_t *const op = dt_matte_find(id);
+  g_free(id);
+  return op;
+}
+
+// the operator a recipe's matting block names, resolved against THIS
+// build's table. NULL means "this build cannot reproduce that stage", and
+// it deliberately covers three different blobs:
+//  - an id no line carries: another build's operator, or a private one;
+//  - a line whose algorithm revision differs from the recorded one -- the
+//    same name over different numbers, the single thing the version field
+//    exists to catch, since the recipe is hashed verbatim to name a
+//    content-addressed file and two renders may never share one name;
+//  - a blob whose fixed-size strings are not NUL-terminated. the recipe
+//    travels in module params, an XMP sidecar and styles, so its bytes are
+//    read as DATA: handing dt_matte_find() a char array that runs off the
+//    end of the struct is how untrusted provenance becomes a read fault.
+//  - a blob announcing the stage at version 1. the matting fields live in
+//    the extension block, and the header's contract is that any nonzero
+//    field there makes version EXT mandatory: a version-1 blob claiming a
+//    stage was written by nobody, so it is a forgery or a corruption, and
+//    honouring it would let a recipe every version-1-only build replays
+//    WITHOUT the stage be replayed WITH it here -- two renders, one
+//    fingerprint. the belt every other reader of the block already wears
+//    (dt_rf_recipe_valid demands EXT for the promptless kinds), worn here
+//    too, where the last reader of the block was missing it.
+//
+// ONE lookup, shared by the replay gate and by the session the replay then
+// runs. a gate that admitted a recipe the reconstruction could not honour
+// would replay WITHOUT the recorded stage under a fingerprint promising it
+static const dt_matte_op_t *_matte_op_recorded(const dt_rf_recipe_t *recipe)
+{
+  if(!recipe || !recipe->matting_enabled)
+    return NULL;
+  if(recipe->version != DT_RF_RECIPE_VERSION_EXT)
+    return NULL;
+  if(recipe->matting_id[DT_RF_RECIPE_MATTING_ID_LEN - 1] != '\0'
+     || recipe->matting_version[DT_RF_RECIPE_MATTING_VERSION_LEN - 1] != '\0')
+    return NULL;
+  const dt_matte_op_t *const op = dt_matte_find(recipe->matting_id);
+  if(!op || g_strcmp0(op->version, recipe->matting_version))
+    return NULL;
+  return op;
+}
+
+// the queryable mirror of the matting half of the replay gate, for the UX
+// surfaces outside this file: TRUE when this build could reproduce whatever
+// matting stage the recipe records -- trivially TRUE for the recipes that
+// record none, which is every recipe a build with the stage off ever wrote.
+//
+// exported because the refusal was, until now, honest ONLY headless. four
+// surfaces answered a model-gap verdict for a cause that is not a model:
+// the recompute button ("no AI model available"), the masks panel row
+// ("file missing, recomputing" -- a promise the replay then refuses and
+// pins as a deterministic failure), its context menu entry, and the edit
+// session, which opened on a recipe it could never re-finalise. no install
+// and no activation moves a build capability, so every one of them has to
+// ask THIS question instead, and all of them ask it through this one door
+gboolean dt_object_recipe_matting_reproducible(const dt_rf_recipe_t *recipe)
+{
+  if(!recipe || !recipe->matting_enabled)
+    return TRUE;
+  return _matte_op_recorded(recipe) != NULL;
+}
+
+// what a recipe RECORDED, for a render that is being reproduced. built
+// from the RECIPE and from nothing else: the operator is the table line
+// its id names, the band scale is the number it stored. a preference
+// toggled since -- or a machine that never had the stage on at all --
+// therefore cannot change what a replay computes, which is the whole
+// contract of a content-addressed cache. the replay gate in
+// dt_object_recipe_compute has already refused every recipe this would
+// answer an off session for, so the off branch here is the recipe that
+// records no matting, never a silent downgrade of one that does
+static _matte_session_t _matte_session_recorded(const dt_rf_recipe_t *recipe)
+{
+  _matte_session_t s = _matte_session_off();
+  const dt_matte_op_t *const op = _matte_op_recorded(recipe);
+  if(!op)
+    return s;
+  s.op = op;
+  s.enabled = TRUE;
+  // the recorded scale is vetted exactly like the preference is, and for
+  // the same reason: params can be hand-edited and a sidecar can be
+  // truncated. CLAMPed rather than refused, following the recorded
+  // render_size right below (MAX(recipe->render_size, 1024) at the replay
+  // request): a scalar outside its domain is a corrupt comfort setting,
+  // not a different algorithm, and refusing it would leave a regenerable
+  // mask broken. the mapping stays a FUNCTION of the recipe bytes -- the
+  // same blob always yields the same clamped scale -- so the fingerprint
+  // still names exactly one render. what may NOT be repaired is the
+  // identity of the algorithm, and that is what _matte_op_recorded above
+  // refuses outright. a NaN fails the first comparison of CLAMPF and
+  // lands on the minimum, the conservative end
+  s.band_scale = CLAMPF(recipe->matting_band,
+                        DT_MATTE_BAND_SCALE_MIN, DT_MATTE_BAND_SCALE_MAX);
+  return s;
+}
+
 // request of the native render core below, grouped so the two call sites
 // name every field instead of threading fifteen positional arguments (an
 // inverted bbox would compile without a sound)
@@ -2504,6 +2808,7 @@ typedef struct _finalize_render_req_t
   float threshold;
   int render_target;    // encode-render size cap the hint was made under
   gboolean interactive; // FALSE suppresses every dt_control_log
+  _matte_session_t matte; // matting stage of this render, already resolved
 } _finalize_render_req_t;
 
 // the shared render core of the native finalisation: from a working-grid
@@ -2532,9 +2837,14 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
   const float threshold = req->threshold;
   const int render_target = req->render_target;
   const gboolean interactive = req->interactive;
+  const _matte_session_t matte = req->matte;
   gboolean ok = FALSE;
   float *hint_soft = NULL, *hint_bin = NULL, *alpha_gf = NULL;
   float *alpha_full = NULL, *grid = NULL;
+  // the matting operator's plane and the trimap view it may ask for. both
+  // stay NULL for every session whose operator carries no weight, which is
+  // every session of a build that ships only the witness line
+  float *alpha_op = NULL, *trimap = NULL;
   double *sat = NULL;
   gboolean pipe_ready = FALSE;
   int rx = 0, ry = 0, gw = 0, gh = 0;
@@ -2636,6 +2946,13 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
              " (R=%d, w=%d)",
              rw, rh, rx, ry, pipe.processed_width, pipe.processed_height,
              R, w_gf);
+    // the matting stage as the CALLER resolved it, printed where the band
+    // geometry is: with the stage off (the only state this build can
+    // reach) nothing below changes, and that silence is the point
+    if(matte.enabled && matte.op)
+      dt_print(DT_DEBUG_AI,
+               "[object mask] finalise: matting stage %s v%s, band scale %.2f",
+               matte.op->id, matte.op->version, (double)matte.band_scale);
 
     // only the region goes through the pipe: demosaic's modify_roi_in
     // restricts the sensor read to what the ROI needs
@@ -2672,7 +2989,11 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
     // hint on the native grid, pixel-centre mapping. the soft values are kept:
     // away from the contour they carry genuine partial coverage (defocused
     // edges, veils) that a hard threshold would destroy. the binarised copy
-    // drives the band logic and the filter, which want a clean step
+    // drives the band logic and the filter, which want a clean step.
+    // parallel over rows: every iteration writes its own two pixels and
+    // reads nothing another one writes, so the plane does not depend on
+    // the thread count -- no reduction, no ordering, same bytes
+    DT_OMP_FOR()
     for(int y = 0; y < gh; y++)
     {
       const float hy = ((float)(ry + y) + 0.5f) / (float)fy - 0.5f;
@@ -2717,6 +3038,9 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
             dt_print(DT_DEBUG_AI,
                      "[object mask] finalise: tiled network pass (%.1fs)",
                      dt_get_wtime() - t_net);
+            // same shape as the loop that filled rgb8/mask_net above: an
+            // element-wise copy-back, parallel and order-independent
+            DT_OMP_FOR()
             for(size_t k = 0; k < npix; k++)
             {
               hint_soft[k] = mask_net[k];
@@ -2755,16 +3079,163 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
     // regularisation comes from guide_weight scaling the covariances; these
     // values measure as a genuine edge snap on real sRGB contrasts, not a
     // box blur. high-ISO noise in the guide does transfer into the alpha
-    // inside the band; that is the accepted trade
-    guided_filter(guide, hint_bin, alpha_gf, gw, gh, 4, w_gf,
-                  1.0f, 100.0f, 0.0f, 1.0f);
+    // inside the band; that is the accepted trade.
+    //
+    // routed through the matting table as its witness line `gf-band`
+    // rather than called directly: the line IS this call, at these
+    // arguments, so the table indirection is falsifiable -- if the plane
+    // changes, the table is wrong, not the algorithm
+    const dt_matte_stage_t stage = {
+      .guide = guide,
+      .hint_bin = hint_bin,
+      .hint_soft = hint_soft,
+      .radius = NULL,          // uniform band; the field comes with the law
+      .width = gw, .height = gh,
+      .r_base = R, .r_max = R,
+      .w_gf = w_gf,
+      .band_scale = matte.band_scale,
+      .keep_going = keep_going,
+      .user = user,
+    };
+    if(!dt_matte_run(&dt_matte_op_gf_band, &stage, alpha_gf))
+    {
+      dt_print(DT_DEBUG_AI, "[object mask] finalise: band filter failed");
+      if(interactive)
+        dt_control_log(_("precise mask: band filter failed"));
+      goto cleanup;
+    }
 
     if(keep_going && !keep_going(user)) goto cleanup;
+
+    // ---- the matting operator of the session, when there is one.
+    //
+    // gated on the table's OWN datum, `wmatte`, and not on the operator's
+    // identity: a line whose plane carries no weight contributes nothing
+    // the composition would read, so running it would cost a second
+    // full-region plane and a second filter pass to produce a value
+    // discarded a few lines below. the witness line is exactly such a line
+    // -- it is already what produced alpha_gf -- so a session naming
+    // `gf-band` walks past this block and composes the two-term form, and
+    // a build carrying no other line can reach no other outcome
+    float wmatte = 0.0f;
+    if(matte.enabled && matte.op && matte.op->wmatte > 0.0f)
+    {
+      const dt_matte_op_t *const op = matte.op;
+      alpha_op = dt_alloc_align_float(npix);
+      if(op->caps & DT_MATTE_NEEDS_TRIMAP) trimap = dt_alloc_align_float(npix);
+      if(!alpha_op || ((op->caps & DT_MATTE_NEEDS_TRIMAP) && !trimap))
+      {
+        dt_print(DT_DEBUG_AI,
+                 "[object mask] finalise: out of memory for the matting stage");
+        if(interactive)
+          dt_control_log(_("precise mask: out of memory for the matting stage"));
+        goto cleanup;
+      }
+
+      if(trimap)
+      {
+        // the band weight, materialised once so the trimap can be a VIEW
+        // of it rather than a second definition of the same band. read
+        // from the very summed-area table the composition reads, at the
+        // very radius it uses, so "unknown" below and "the composition
+        // gives the operator some authority here" are the same predicate
+        // by construction. the plane is temporary: the composition loop
+        // re-reads the four SAT corners per pixel as it always has, which
+        // is what keeps that loop byte-identical for the witness path
+        float *wband_plane = dt_alloc_align_float(npix);
+        if(!wband_plane)
+        {
+          dt_print(DT_DEBUG_AI,
+                   "[object mask] finalise: out of memory for the band view");
+          if(interactive)
+            dt_control_log(_("precise mask: out of memory for the matting stage"));
+          goto cleanup;
+        }
+        DT_OMP_FOR()
+        for(int y = 0; y < gh; y++)
+        {
+          for(int x = 0; x < gw; x++)
+          {
+            const int x0 = MAX(x - R, 0), x1 = MIN(x + R + 1, gw);
+            const int y0 = MAX(y - R, 0), y1 = MIN(y + R + 1, gh);
+            const double area = (double)(x1 - x0) * (y1 - y0);
+            const double inside
+              = sat[(size_t)y1 * (gw + 1) + x1] - sat[(size_t)y0 * (gw + 1) + x1]
+              - sat[(size_t)y1 * (gw + 1) + x0] + sat[(size_t)y0 * (gw + 1) + x0];
+            const double f = inside / area;
+            wband_plane[(size_t)y * gw + x] = (float)(2.0 * MIN(f, 1.0 - f));
+          }
+        }
+        dt_matte_trimap_from_band(hint_bin, wband_plane, trimap, npix);
+        dt_free_align(wband_plane);
+      }
+
+      const dt_matte_stage_t op_stage = {
+        .guide = guide,
+        .hint_bin = hint_bin,
+        .hint_soft = hint_soft,
+        .radius = NULL,          // uniform band; the field comes with the law
+        .trimap = trimap,        // NULL unless the line asked for one
+        .width = gw, .height = gh,
+        .r_base = R, .r_max = R,
+        .w_gf = w_gf,
+        .band_scale = matte.band_scale,
+        .keep_going = keep_going,
+        .user = user,
+      };
+      const double t_op = dt_get_wtime();
+      if(!dt_matte_run(op, &op_stage, alpha_op))
+      {
+        // NOT a graceful degradation, unlike the network pass above. that
+        // one only sharpens a hint nobody recorded; this stage is written
+        // into the provenance recipe, and the recipe is hashed verbatim to
+        // name a content-addressed file. finishing the render without the
+        // operator would put a DIFFERENT mask under a fingerprint that
+        // promises this one -- the single failure the whole table exists
+        // to prevent. so the finalisation fails and the mask stays as it
+        // was, which a user can act on
+        dt_print(DT_DEBUG_AI,
+                 "[object mask] finalise: matting operator %s v%s failed",
+                 op->id, op->version);
+        // one FALSE covers two situations the stage contract deliberately
+        // does not tell apart (matte.h): the operator failed, or the user
+        // cancelled while it was polling keep_going. asking the predicate
+        // ourselves recovers the distinction, and a cancellation the user
+        // just requested is not a failure to toast at them. the same
+        // recovery the headless replay already performs on the render
+        // core's own FALSE (see the DT_OBJECT_RECIPE_RETRY branch of
+        // dt_object_recipe_compute)
+        if(interactive && !(keep_going && !keep_going(user)))
+          dt_control_log(_("precise mask: the matting stage failed"));
+        goto cleanup;
+      }
+      wmatte = op->wmatte;
+      dt_print(DT_DEBUG_AI,
+               "[object mask] finalise: matting stage %s ran in %.1fs"
+               " (weight %.2f)",
+               op->id, dt_get_wtime() - t_op, (double)wmatte);
+
+      if(keep_going && !keep_going(user)) goto cleanup;
+    }
 
     // composition with a continuous band weight: 1 on the binary edge,
     // fading to 0 with Chebyshev distance R. a hard band boundary would
     // truncate the filter's ramp and leave a visible alpha step on guides
-    // with no local edge (plain sky)
+    // with no local edge (plain sky).
+    //
+    // written in the generic three-term form of the stage,
+    //   alpha = wband*(wmatte*alpha_op + (1-wmatte)*alpha_gf)
+    //           + (1-wband)*hint_soft
+    // with `wmatte` zero unless an operator above actually produced a
+    // plane: there is then no second plane to read, alpha_op is NULL, the
+    // inner term is never evaluated, and what runs is the two-term
+    // composition this stage has always run -- the same two products and
+    // the same sum, in the same order. that is the identity anchor:
+    // matting off must render the very same bytes, not equivalent ones.
+    // the two are moved in lockstep by the block above (a plane without
+    // its weight, or a weight without its plane, is never reachable), so
+    // the ternary's NULL test and compose_px's zero test agree
+    DT_OMP_FOR()
     for(int y = 0; y < gh; y++)
     {
       for(int x = 0; x < gw; x++)
@@ -2779,7 +3250,9 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
         const float wband = (float)(2.0 * MIN(f, 1.0 - f));
         const size_t k = (size_t)y * gw + x;
         const float refined = CLAMPF(alpha_gf[k], 0.0f, 1.0f);
-        alpha_gf[k] = wband * refined + (1.0f - wband) * hint_soft[k];
+        const float op_px = alpha_op ? CLAMPF(alpha_op[k], 0.0f, 1.0f) : refined;
+        alpha_gf[k]
+          = dt_matte_compose_px(hint_soft[k], refined, op_px, wband, wmatte);
       }
     }
 
@@ -2842,6 +3315,8 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
 cleanup:
   g_free(grid);
   g_free(sat);
+  dt_free_align(trimap);
+  dt_free_align(alpha_op);
   dt_free_align(alpha_gf);
   dt_free_align(hint_bin);
   dt_free_align(hint_soft);
@@ -2889,6 +3364,9 @@ static int32_t _finalize_job_run(dt_job_t *job)
     .threshold = j->threshold,
     .render_target = j->render_target,
     .interactive = TRUE,
+    // a render being MADE: the stage the LAUNCH resolved from the user's
+    // configuration, snapshotted alongside the render cap and the recipe
+    .matte = j->matte,
   };
   alpha_full = _finalize_render_alpha(&dev, &req,
                                       _finalize_keep_going, job, &pw, &ph);
@@ -3087,6 +3565,14 @@ static gboolean _launch_native_finalize(_object_data_t *d,
   // applies: identical to the recipe captured below, so a later headless
   // regeneration renders exactly what this job renders
   j->render_target = MAX(d->encoded_render_size, 1024);
+  // the matting stage of THIS render, resolved on the GUI thread here and
+  // not in the job body: the recipe below is captured at this same instant,
+  // and the two must describe one stage.
+  // through the session accessor, so a finalisation launched from an EDIT
+  // session runs the stage that session was seeded with (the recorded one)
+  // instead of the preference -- the same rule the threshold, the passes
+  // and the render cap have always followed on this path
+  j->matte = _session_matte(d);
   j->distort_hash = launch_distort_hash;
 
   // both finalisation routes capture the provenance recipe. the raster
@@ -3097,7 +3583,9 @@ static gboolean _launch_native_finalize(_object_data_t *d,
   // from any output path on purpose, a recipe without a file is exactly
   // what the group trailer needs. sessions the recipe cannot hold (too
   // many clicks) proceed without provenance on either route
-  j->has_recipe = _capture_recipe(d, gui, &j->recipe);
+  // the stage resolved fourteen lines up, NOT a second reading of the
+  // preference: the recipe names the render this job is about to make
+  j->has_recipe = _capture_recipe(d, gui, &j->matte, &j->recipe);
   if(!vectorize && j->has_recipe)
   {
     j->outpath = _recipe_outpath(&j->recipe);
@@ -3262,16 +3750,25 @@ dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
     }
   }
 
-  // the matting fields are reserved: no build has the matting stage yet,
-  // so a recipe recording one cannot be reproduced -- replaying without
-  // it would write different bytes under a fingerprint that promises it.
-  // deterministic (like the boundary check below), outside the model-gap
-  // mirror: it is a capability of the build, not a model to install
-  if(recipe->matting_enabled)
+  // the matting stage the recipe records must be reproducible BY THIS
+  // BUILD: the operator is looked up by id and its algorithm revision must
+  // match the recorded one too. replaying without the stage -- or with
+  // another revision of it -- would write different bytes under a
+  // fingerprint that promises these ones, so there is no fallback here on
+  // purpose: an unreproducible stage FAILS, loudly, and the mask stays
+  // missing until a build that carries the operator opens the library.
+  // deterministic (like the boundary check below) and outside the
+  // model-gap mirror: it is a capability of the build, not a model to
+  // install, and no download can move it.
+  // ONE lookup with the session the replay runs under below, so the
+  // verdict here and the stage that then executes cannot disagree
+  if(recipe->matting_enabled && !_matte_op_recorded(recipe))
   {
     dt_print(DT_DEBUG_AI,
              "[object mask] replay: recipe records a matting stage this"
-             " build cannot reproduce -- not replaying");
+             " build cannot reproduce (id '%.*s' v'%.*s') -- not replaying",
+             DT_RF_RECIPE_MATTING_ID_LEN, recipe->matting_id,
+             DT_RF_RECIPE_MATTING_VERSION_LEN, recipe->matting_version);
     return DT_OBJECT_RECIPE_FAILED;
   }
 
@@ -3807,6 +4304,9 @@ dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
     .threshold = thresh,
     .render_target = MAX(recipe->render_size, 1024),
     .interactive = FALSE,
+    // a render being REPRODUCED: the stage is what the recipe recorded,
+    // never what this machine happens to prefer today
+    .matte = _matte_session_recorded(recipe),
   };
   alpha_full = _finalize_render_alpha(&dev, &req, keep_going, user, &pw, &ph);
   g_atomic_int_set(&_finalize_running, 0);
@@ -3952,6 +4452,52 @@ _model_gap_one(const char *model_id,
   return gap;
 }
 
+#ifdef HAVE_MATTE_VITMATTE
+// THE PERSONAL MIRROR (Q7). In a shipped build a recorded matting stage is
+// answered by one question -- does this build carry the operator? -- and
+// dt_object_recipe_matting_reproducible answers it before any model
+// verdict is asked. That is right there, because a shipped build's
+// operators need no model at all.
+//
+// A build configured with USE_MATTE_VITMATTE carries an operator that
+// does, and the two questions come apart: the operator is present, its
+// revision matches, the replay gate is satisfied -- and the render still
+// cannot run, because the weights are not on this machine. Reported as a
+// MODEL gap so the four UX surfaces say "a model is missing" instead of
+// "this build cannot reproduce that stage", which would be false and would
+// point the user away from the one action that repairs it.
+//
+// The verdict for an absent model is UNKNOWN and not INSTALLABLE, and that
+// is not an approximation: these weights are non-commercial, so they are
+// in no download catalogue and dt_ai_models_get_by_id cannot know the id
+// until the user has installed the package by hand. UNKNOWN is precisely
+// the registry's word for "no download produces this" -- the same verdict
+// a locally-packaged model gets anywhere else in this file.
+static dt_object_recipe_model_gap_t
+_matte_model_gap(const dt_matte_op_t *op, GPtrArray *missing)
+{
+  if(!op || !op->model || !(op->caps & DT_MATTE_NEEDS_MODEL))
+    return DT_OBJECT_RECIPE_MODELS_OK;
+
+  dt_ai_model_t *model = dt_ai_models_get_by_id(op->model);
+  if(!model)
+    return DT_OBJECT_RECIPE_MODELS_UNKNOWN;
+
+  // the same statuses _model_gap_one treats as "not usable yet". no
+  // version comparison: the recipe records the OPERATOR's algorithm
+  // revision, never a model version, so there is no recorded number to
+  // compare against and inventing one would refuse installs that are fine
+  const gboolean pending = model->status == DT_AI_MODEL_NOT_DOWNLOADED
+                           || model->status == DT_AI_MODEL_DOWNLOADING
+                           || model->status == DT_AI_MODEL_ERROR;
+  dt_ai_model_free(model);
+
+  if(!pending) return DT_OBJECT_RECIPE_MODELS_OK;
+  if(missing) g_ptr_array_add(missing, g_strdup(op->model));
+  return DT_OBJECT_RECIPE_MODELS_INSTALLABLE;
+}
+#endif
+
 // full diagnostic: the combined verdict plus the per-model ones (the
 // failure toast needs to name the model at fault). the public wrapper
 // below discards the details
@@ -3959,10 +4505,16 @@ static dt_object_recipe_model_gap_t
 _recipe_model_gap(const dt_rf_recipe_t *recipe,
                   gchar ***missing,
                   dt_object_recipe_model_gap_t *seg_gap_out,
-                  dt_object_recipe_model_gap_t *refine_gap_out)
+                  dt_object_recipe_model_gap_t *refine_gap_out,
+                  dt_object_recipe_model_gap_t *matte_gap_out)
 {
   dt_object_recipe_model_gap_t seg_gap = DT_OBJECT_RECIPE_MODELS_OK;
   dt_object_recipe_model_gap_t refine_gap = DT_OBJECT_RECIPE_MODELS_OK;
+  // OK in every shipped build and never assigned there: the matting
+  // operators of an upstream table need no model, so this stays the
+  // neutral element of the rank below and the verdict is the one the
+  // build without the private line computes
+  dt_object_recipe_model_gap_t matte_gap = DT_OBJECT_RECIPE_MODELS_OK;
 
   if(missing) *missing = NULL;
 
@@ -4058,6 +4610,14 @@ _recipe_model_gap(const dt_rf_recipe_t *recipe,
         }
       }
 
+#ifdef HAVE_MATTE_VITMATTE
+      // the personal mirror: an operator this build DOES carry, whose
+      // model this machine may not have. folded into the same verdict as
+      // the other two, so no surface needs a third question
+      if(recipe->matting_enabled)
+        matte_gap = _matte_model_gap(_matte_op_recorded(recipe), ids);
+#endif
+
       if(ids)
       {
         if(ids->len)
@@ -4071,9 +4631,11 @@ _recipe_model_gap(const dt_rf_recipe_t *recipe,
     }
   }
 
-  const dt_object_recipe_model_gap_t verdict
+  dt_object_recipe_model_gap_t verdict
     = _model_gap_rank(refine_gap) > _model_gap_rank(seg_gap)
       ? refine_gap : seg_gap;
+  if(_model_gap_rank(matte_gap) > _model_gap_rank(verdict))
+    verdict = matte_gap;
 
   if(valid)
   {
@@ -4085,27 +4647,49 @@ _recipe_model_gap(const dt_rf_recipe_t *recipe,
                         recipe->refine_model_version,
                         dt_ai_model_get_version(recipe->refine_model),
                         _model_gap_name(refine_gap));
+    // declared OUTSIDE the guard and filled inside it: the trace is the
+    // one diagnostic surface an upstream build also prints, and a build
+    // without the private operator must print the upstream line to the
+    // byte. Left unguarded, this states a matting cause for a recipe that
+    // same build refuses to replay at all -- one differing byte of output
+    // is contamination, whatever the option was set to
+    gchar *matte_part = NULL;
+#ifdef HAVE_MATTE_VITMATTE
+    // the matting cause states the MODEL it needs, not the operator: the
+    // operator is the other gate's subject and says so in its own words
+    if(recipe->matting_enabled)
+      matte_part = g_strdup_printf(", matting '%.*s' (%s)",
+                                   DT_RF_RECIPE_MATTING_ID_LEN,
+                                   recipe->matting_id,
+                                   _model_gap_name(matte_gap));
+#endif
     dt_print(DT_DEBUG_AI,
              "[object mask] model gap: %s -- seg '%s' recorded v%s"
-             " installed v%s (%s)%s",
+             " installed v%s (%s)%s%s",
              _model_gap_name(verdict),
              recipe->seg_model,
              recipe->seg_model_version,
              dt_ai_model_get_version(recipe->seg_model),
              _model_gap_name(seg_gap),
-             refine_part ? refine_part : "");
+             refine_part ? refine_part : "",
+             matte_part ? matte_part : "");
     g_free(refine_part);
+    g_free(matte_part);
   }
 
   if(seg_gap_out) *seg_gap_out = seg_gap;
   if(refine_gap_out) *refine_gap_out = refine_gap;
+  // OK in every build without the private line, and the surfaces that ask
+  // for it test it LAST: a caller that never mentions matting therefore
+  // behaves exactly as it did before this stage existed
+  if(matte_gap_out) *matte_gap_out = matte_gap;
   return verdict;
 }
 
 dt_object_recipe_model_gap_t
 dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing)
 {
-  return _recipe_model_gap(recipe, missing, NULL, NULL);
+  return _recipe_model_gap(recipe, missing, NULL, NULL, NULL);
 }
 
 // ------------------------ one-shot detection job ----------------------------
@@ -4255,12 +4839,19 @@ static int32_t _detect_job_run(dt_job_t *job)
     goto cleanup;
   }
 
+  // the matting stage of this render, resolved BEFORE the recipe is filled
+  // and read by nothing else afterwards: same rule as every other parameter
+  // below -- what the compute runs under is what the recipe records. reading
+  // the configuration again down at the render request would put a second
+  // dt_conf lookup between the fingerprint and the pixels it names
+  const _matte_session_t matte = _matte_session_from_conf();
+
   // ---- the recipe: the promptless v2 blob a headless replay consumes.
   // filled before the compute, so every parameter the compute reads below
   // is a parameter the recipe records -- the two cannot diverge. the
-  // decode scalars, the refinement pin and the matting block stay zero:
-  // no decode chain ran and no extension stage beyond the prompt kind is
-  // in use
+  // decode scalars and the refinement pin stay zero: no decode chain ran.
+  // this family is version EXT whatever the matting stage does, its
+  // prompt kind being an extension field in use by itself
   recipe.magic = DT_RF_RECIPE_MAGIC;
   recipe.version = DT_RF_RECIPE_VERSION_EXT;
   recipe.distort_hash = (int64_t)j->distort_hash;
@@ -4277,6 +4868,16 @@ static int32_t _detect_job_run(dt_job_t *job)
   recipe.prompt_kind = j->detector->prompt_kind;
   recipe.detect_input = dt_detect_get_side(det);
   recipe.class_bits = j->detector->class_bits;
+  // the matting stage from the session hoisted above, through the same
+  // single writer the clicked capture uses. an operator that cannot be
+  // named in the recipe is a mask with no reproducible provenance, and
+  // this route has no plain-file fallback to offer: refuse the whole job
+  // rather than write a file whose recipe describes another render
+  if(!_recipe_set_matting(&recipe, &matte))
+  {
+    dt_control_log(_("precise mask: the matting stage cannot be recorded"));
+    goto cleanup;
+  }
 
   // export render pipe at full input dimensions, as the replay builds it
   dt_mipmap_cache_get(&buf, j->imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING,
@@ -4435,6 +5036,9 @@ static int32_t _detect_job_run(dt_job_t *job)
       .threshold = thresh,
       .render_target = MAX(recipe.render_size, 1024),
       .interactive = TRUE,
+      // also a render being made: same door as the interactive job, walked
+      // above the recipe so the recorded stage and the run stage are one
+      .matte = matte,
     };
     alpha_full = _finalize_render_alpha(&dev, &req, _detect_keep_going,
                                         job, &pw, &ph);
@@ -5074,7 +5678,15 @@ static void _edit_replay_finish(dt_masks_form_gui_t *gui, _object_data_t *d)
     // everything that reaches the mask, so a parameter the user changes
     // without clicking (smoothing, cleanup, feather, refinement) is
     // covered, and so is any field a later version adds
-    d->edit_baseline_valid = _capture_recipe(d, gui, &d->edit_baseline_recipe);
+    // the baseline is "what a capture would write RIGHT NOW", so it takes
+    // the stage this SESSION runs -- the same resolution a finalisation
+    // launched from it would take. the closing comparison re-resolves it
+    // the same way, so a matting control moved during the session shows up
+    // as a changed recipe and the session commits instead of closing as a
+    // no-op
+    const _matte_session_t baseline_matte = _session_matte(d);
+    d->edit_baseline_valid
+      = _capture_recipe(d, gui, &baseline_matte, &d->edit_baseline_recipe);
     d->edit_dirty = FALSE;
 
     _update_preview(d);
@@ -5167,6 +5779,30 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
     return FALSE;
   }
 
+  // the matting stage, asked BEFORE the model gap for the reason the
+  // replay gate and the headless toast ask it first: it is a build
+  // capability, and the model verdict below would answer "models check
+  // out" while the session opened on a mask this build cannot re-finalise
+  // the way it was made. two answers, one question:
+  //  - unreproducible: refuse. the session would replay the recorded
+  //    decodes faithfully and then finalise WITHOUT the recorded stage,
+  //    handing the user a starting point that is not the mask on screen;
+  //  - reproducible: open, and SEED the session with the recorded stage
+  //    (see the pre-seed below), exactly as every other recorded parameter
+  //    is seeded. that is what this session used to be unable to do, and
+  //    what the warning it printed instead was standing in for
+  if(!_matte_op_recorded(&target->recipe) && target->recipe.matting_enabled)
+  {
+    // untrusted bytes, terminated before anything formats them
+    char id[DT_RF_RECIPE_MATTING_ID_LEN];
+    memcpy(id, target->recipe.matting_id, sizeof(id));
+    id[sizeof(id) - 1] = '\0';
+    dt_control_log(_("cannot edit this mask: it records the matting stage"
+                     " '%s', which this darktable cannot reproduce"),
+                   id);
+    return FALSE;
+  }
+
   // the model-gap verdict is taken AT OPENING and never stored: installs,
   // rebinds and edits all change it under our feet. provisional C2 policy:
   // only OK opens -- the recorded models must be installed identically for
@@ -5174,19 +5810,41 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
   // plan ("install the model" / "edit with the current model, approximate
   // starting point") lands with C6 once the download modal (D2) exists
   {
-    dt_object_recipe_model_gap_t seg_gap;
+    dt_object_recipe_model_gap_t seg_gap, refine_gap, matte_gap;
     const dt_object_recipe_model_gap_t gap
-      = _recipe_model_gap(&target->recipe, NULL, &seg_gap, NULL);
+      = _recipe_model_gap(&target->recipe, NULL, &seg_gap, &refine_gap,
+                          &matte_gap);
     if(gap != DT_OBJECT_RECIPE_MODELS_OK)
     {
+      // WHICH model the combined verdict came from. three causes now feed
+      // that verdict, so a two-way selector necessarily misnames one of
+      // them: on a matting gap `seg_gap != gap` used to elect the refine
+      // model, which is a sane model on that machine -- or the empty
+      // string when the recipe records no refinement at all. priority is
+      // the ranking's own and unchanged for the first two: seg wins ties,
+      // being the model every recipe records, then refine
+      const gboolean seg_at_fault = seg_gap == gap;
       if(gap == DT_OBJECT_RECIPE_MODELS_AI_OFF)
         dt_control_log(_("cannot edit this mask: AI processing is disabled"));
+#ifdef HAVE_MATTE_VITMATTE
+      else if(!seg_at_fault && refine_gap != gap
+              && matte_gap == gap && _matte_op_recorded(&target->recipe))
+        // its OWN words: no version is recorded for this one (the recipe
+        // pins the operator's algorithm revision, never a model version),
+        // and no download catalogue carries these weights, so neither the
+        // "does not match the recorded state" wording nor the AI models
+        // preferences would tell the truth here
+        dt_control_log(_("cannot edit this mask: its matting stage needs"
+                         " the model '%s', which is not installed on this"
+                         " machine"),
+                       _matte_op_recorded(&target->recipe)->model);
+#endif
       else
         dt_control_log(_("cannot edit this mask: model '%s' does not match"
                          " the recorded state (see the AI models"
                          " preferences, or use 'recompute mask')"),
-                       seg_gap == gap ? target->recipe.seg_model
-                                      : target->recipe.refine_model);
+                       seg_at_fault ? target->recipe.seg_model
+                                    : target->recipe.refine_model);
       return FALSE;
     }
   }
@@ -5241,6 +5899,20 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
   d->edit_refine_margin = CLAMPF(target->recipe.ai_refine_margin, 0.0f, 0.5f);
   // raw, like the recipe stores it: the MAX belongs to the use points
   d->edit_render_size = target->recipe.render_size;
+  // the matting stage, through the SAME resolver the headless replay uses,
+  // so an edit session and a regeneration of the same mask start from one
+  // reading of the recipe. it answers an off stage for a recipe that
+  // records none -- which is itself the recorded state and must be seeded
+  // too, or reopening a plain mask would silently acquire whatever stage
+  // the preferences name today. the refusal above has already rejected
+  // every recipe this could fail to resolve
+  {
+    const _matte_session_t rec = _matte_session_recorded(&target->recipe);
+    d->edit_matte_seeded = TRUE;
+    d->edit_matte_enabled = rec.enabled;
+    d->edit_matte_op = rec.op;
+    d->edit_matte_band = rec.band_scale;
+  }
   d->edit_model_pinned = TRUE;
   // the focus was dropped just above, so this session has no sink. carried
   // by the session because dev->gui_module can change under it: unfolding
@@ -5412,18 +6084,95 @@ static int32_t _recompute_job_run(dt_job_t *job)
                                        _recompute_keep_going, job);
   if(p->status == DT_OBJECT_RECIPE_OK && dt_control_running())
     g_idle_add(_recompute_landed_idle, GINT_TO_POINTER(p->imgid));
+  else if(p->status == DT_OBJECT_RECIPE_FAILED && dt_control_running()
+          && p->recipe.matting_enabled && !_matte_op_recorded(&p->recipe))
+  {
+    // diagnosed FIRST and on its own, ahead of the model gap: the matting
+    // stage is a build capability, so the verdict below would answer
+    // "models check out" and send the user to the trace for a cause that
+    // reads plainly here.
+    // the recorded strings are untrusted bytes: copied into a terminated
+    // buffer before anything formats them -- or looks them up
+    char id[DT_RF_RECIPE_MATTING_ID_LEN];
+    char ver[DT_RF_RECIPE_MATTING_VERSION_LEN];
+    memcpy(id, p->recipe.matting_id, sizeof(id));
+    memcpy(ver, p->recipe.matting_version, sizeof(ver));
+    id[sizeof(id) - 1] = '\0';
+    ver[sizeof(ver) - 1] = '\0';
+    // ONE gate, two very different causes, and the message may not merge
+    // them: an id no line carries is FINAL -- rebinding cannot bring an
+    // operator this build does not have -- while the same id at another
+    // revision is exactly what the matting branch of
+    // dt_object_recipe_rebind_models repins, so 'recompute mask' really
+    // does repair it and the message must say so. the condition mirrors
+    // that branch's own acceptance (extension version, a line the table
+    // carries); anything it would refuse is stated as the fact it is
+    const dt_matte_op_t *const carried
+      = (p->recipe.version == DT_RF_RECIPE_VERSION_EXT) ? dt_matte_find(id)
+                                                        : NULL;
+    if(carried)
+      dt_control_log(_("AI mask not regenerated: it records revision v%s of"
+                       " the matting stage '%s', this darktable carries"
+                       " v%s.\nuse 'recompute mask' in the raster masks"
+                       " module to redo it with the revision this build"
+                       " has"),
+                     ver, id, carried->version);
+    else
+      dt_control_log(_("AI mask not regenerated: it records the matting"
+                       " stage '%s' (v%s), which this darktable cannot"
+                       " reproduce.\nthe mask stays as it is until a build"
+                       " carrying that stage opens this library"),
+                     id, ver);
+  }
   else if(p->status == DT_OBJECT_RECIPE_FAILED && dt_control_running())
   {
     // the mask stays zeroed and the user needs to know WHY, and the way
     // out: diagnose the model gap the replay refused on and name both
     // the cause and the actionable place. 'recompute mask' in the raster
     // masks module rebinds the recipe to the models installed NOW
-    dt_object_recipe_model_gap_t seg_gap;
+    dt_object_recipe_model_gap_t seg_gap, refine_gap, matte_gap;
     const dt_object_recipe_model_gap_t gap
-      = _recipe_model_gap(&p->recipe, NULL, &seg_gap, NULL);
+      = _recipe_model_gap(&p->recipe, NULL, &seg_gap, &refine_gap,
+                          &matte_gap);
     // the model the combined verdict came from; the segmentation model
-    // wins ties, being the one every recipe records
+    // wins ties, being the one every recipe records, then the refinement
+    // one. THREE causes feed the verdict, so the two-way selector below
+    // needs the third one taken out first: on a matting gap it would
+    // elect the refine model -- a model that is perfectly installed, or
+    // the empty string when the recipe records no refinement at all
     const gboolean seg_at_fault = seg_gap == gap;
+#ifdef HAVE_MATTE_VITMATTE
+    if(!seg_at_fault && refine_gap != gap && matte_gap == gap
+       && _matte_op_recorded(&p->recipe))
+    {
+      // answered HERE and in its own words. the recorded/installed
+      // vocabulary below has nothing to fill in for this cause: a recipe
+      // pins the OPERATOR's algorithm revision, never a version of the
+      // model it loads, so there is no recorded number to compare. and
+      // 'recompute mask' is not the way out either -- a rebind repins the
+      // revision and keeps the stage, so the very same model would be
+      // missing on the next attempt
+      const char *const model = _matte_op_recorded(&p->recipe)->model;
+      if(gap == DT_OBJECT_RECIPE_MODELS_INSTALLABLE)
+        dt_control_log(_("AI mask not regenerated: its matting stage needs"
+                         " the model '%s', which is not installed.\ninstall"
+                         " it in the AI models preferences"),
+                       model);
+      else
+        // UNKNOWN, which for these weights is the normal state and not an
+        // accident: no catalogue offers them, so pointing at a download
+        // -- or at a .dtmodel file to install -- would be a dead end
+        dt_control_log(_("AI mask not regenerated: its matting stage needs"
+                         " the model '%s', which this machine does not"
+                         " have.\nno download provides it: install it into"
+                         " your darktable models directory yourself, or"
+                         " redo the selection with the matting stage"
+                         " switched off"),
+                       model);
+      // this branch only runs on DT_OBJECT_RECIPE_FAILED
+      return 1;
+    }
+#endif
     const char *id = seg_at_fault ? p->recipe.seg_model
                                   : p->recipe.refine_model;
     const char *recorded = seg_at_fault
@@ -5625,6 +6374,51 @@ gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe)
                 sizeof(recipe->refine_model_version));
     g_free(refine_id);
   }
+
+  // the matting stage is a build capability, not a model: no install and
+  // no activation can bring an operator this build does not carry, so an
+  // id the table does not know makes the whole rebind FAIL -- "redo it
+  // with what is here now" has no answer, and dropping the recorded stage
+  // to make the rebind succeed would hand the replay a recipe describing a
+  // render nobody asked for. an id that IS carried gets its revision
+  // repinned to the build's own, which is exactly what rebinding means and
+  // is the only reason this branch writes anything at all
+  if(recipe->matting_enabled)
+  {
+    // the extension block is only meaningful at the extension version: a
+    // version-1 blob announcing the stage is a forgery every other reader
+    // of the block already refuses (_matte_op_recorded, and
+    // dt_rf_recipe_valid for the promptless kinds). rebinding it would
+    // mint a recipe no version-1-only build replays the same way
+    if(recipe->version != DT_RF_RECIPE_VERSION_EXT)
+      return FALSE;
+    if(recipe->matting_id[DT_RF_RECIPE_MATTING_ID_LEN - 1] != '\0')
+      return FALSE;
+    const dt_matte_op_t *const op = dt_matte_find(recipe->matting_id);
+    if(!op)
+      return FALSE;
+    // the id itself is kept -- it names the very line just found -- but
+    // whatever follows its NUL is zeroed. those bytes are invisible to
+    // every strcmp and fully visible to the verbatim hash that names the
+    // cache file, so a blob carrying junk there would leave the rebound
+    // recipe under a fingerprint no writer of this build can ever produce
+    // again. the seg and refine ids get the same guarantee from the plain
+    // memsets above, which can afford to clear the whole field because
+    // they overwrite it; this one clears the tail because it must not
+    const size_t idlen = strlen(recipe->matting_id);
+    memset(recipe->matting_id + idlen, 0,
+           sizeof(recipe->matting_id) - idlen);
+    memset(recipe->matting_version, 0, sizeof(recipe->matting_version));
+    if(g_strlcpy(recipe->matting_version, op->version,
+                 sizeof(recipe->matting_version))
+       >= sizeof(recipe->matting_version))
+    {
+      // a revision that does not fit would be truncated into another
+      // one: leave the field zeroed and refuse, never half-written
+      memset(recipe->matting_version, 0, sizeof(recipe->matting_version));
+      return FALSE;
+    }
+  }
   return TRUE;
 }
 
@@ -5801,7 +6595,11 @@ _register_vectorized_forms(dt_iop_module_t *module,
   // the recipe cannot describe simply leaves the trailer zeroed
   _object_data_t *sd = gui ? _get_data(gui) : NULL;
   dt_rf_recipe_t recipe;
-  if(sd && _capture_recipe(sd, gui, &recipe))
+  // NULL stage, and it is not an omission: this classic route traces the
+  // working-grid mask straight into paths -- it never enters
+  // _finalize_render_alpha, so no band and no matting operator ran, and a
+  // recipe claiming one would describe a render nobody made
+  if(sd && _capture_recipe(sd, gui, NULL, &recipe))
     _ai_trailer_stamp(dev->forms, grp, &recipe);
 
   g_list_free(forms);
@@ -5989,8 +6787,12 @@ static gboolean _edit_recipe_unchanged(_object_data_t *d,
     return FALSE;
   dt_rf_recipe_t now;
   // a session the recipe cannot describe is never a no-op: it has no
-  // stable identity to compare, so let it commit
-  if(!_capture_recipe(d, gui, &now))
+  // stable identity to compare, so let it commit.
+  // the stage is re-resolved the way the baseline resolved it (through the
+  // session accessor, at this instant): the memcmp below then covers the
+  // matting fields like every other one, with no field named here
+  const _matte_session_t now_matte = _session_matte(d);
+  if(!_capture_recipe(d, gui, &now_matte, &now))
     return FALSE;
   return memcmp(&now, &d->edit_baseline_recipe, sizeof(now)) == 0;
 }
@@ -7031,6 +7833,94 @@ static void _object_modify_property(dt_masks_form_t *const form,
         if(d) d->preview_refine = enabled;
       }
       *sum += enabled ? 1.0f : 0.0f;
+      ++*count;
+      break;
+    }
+    // the matting stage and its band scale act ONLY on the native
+    // finalisation pass, never on the interactive preview: nothing
+    // recomputes when they move, and their labels say "at finalisation"
+    // for that reason. Outside a session they are preferences; inside one
+    // they are session parameters seeded from the replayed recipe, exactly
+    // like the threshold and the render cap -- which is what lets a
+    // reopened mask be re-finalised with the stage it was MADE with
+    // instead of whatever the preferences drifted to. Both branches go
+    // through the same accessors the render and the recipe capture use, so
+    // what these widgets report and what the finalisation runs cannot
+    // disagree.
+    //
+    // Either control still leaves *count at zero -- and so DISAPPEARS (the
+    // framework hides a property at count == 0, see the note above) -- in
+    // the one situation where showing it would be a lie: no operator to
+    // run. That is the SHIPPED state as long as the default preference
+    // names a line the table does not carry: a visible checkbox would
+    // tick, write the preference, leave the stage inert, capture a recipe
+    // recording no matting, and give the user not one word about any of
+    // it. The resolution goes through dt_matte_find, the same door the
+    // finalisation and the replay use.
+    case DT_MASKS_PROPERTY_MATTING:
+    {
+      // in a session: the operator the recipe recorded, or -- for a recipe
+      // that recorded no stage -- the one the preference names, so that
+      // turning matting ON mid-session is possible at all. outside: the
+      // preference's, as ever
+      const _matte_session_t cur = _session_matte(d);
+      const dt_matte_op_t *const op
+        = (in_session && cur.op) ? cur.op : _matte_conf_op();
+      if(!op) break;
+      gboolean enabled = in_session ? d->edit_matte_enabled
+                                    : dt_conf_get_bool(CONF_MATTE_ENABLED_KEY);
+      if(!frozen && new_val != old_val)
+      {
+        // applies to the next finalisation, nothing recomputes now
+        enabled = new_val > 0.5f;
+        if(in_session)
+        {
+          // the SESSION, never the user's persistent choice: the rule
+          // _session_threshold states for every control here. the operator
+          // is pinned at the same time, so a session that switches the
+          // stage on records the line it actually ran
+          d->edit_matte_enabled = enabled;
+          d->edit_matte_op = op;
+        }
+        else
+          dt_conf_set_bool(CONF_MATTE_ENABLED_KEY, enabled);
+      }
+      *sum += enabled ? 1.0f : 0.0f;
+      ++*count;
+      break;
+    }
+    case DT_MASKS_PROPERTY_MATTING_BAND:
+    {
+      const _matte_session_t cur = _session_matte(d);
+      const dt_matte_op_t *const op
+        = (in_session && cur.op) ? cur.op : _matte_conf_op();
+      if(!op) break;
+      // and the operator must actually READ the band scale. leaving the
+      // control up for a line that ignores it is not a harmless spare
+      // knob: the value travels in the recipe, the recipe is hashed
+      // verbatim to name a content-addressed file, so a drag would spend
+      // a model load and a full inference to file a bit-identical mask
+      // under a second name. one render, two names -- the mirror image of
+      // the defect the version field exists to prevent. counting nothing
+      // here leaves *count at 0, which is exactly how the masks panel
+      // decides a property has no widget (libs/masks.c)
+      if(!(op->caps & DT_MATTE_USES_BAND)) break;
+      float band = in_session ? d->edit_matte_band
+                              : (float)dt_conf_get_float(CONF_MATTE_BAND_KEY);
+      if(!frozen)
+      {
+        // no preview at the drag, by design: the widened band is derived
+        // by the native pass of a line that declares DT_MATTE_USES_BAND,
+        // and computing it here would either lie about the result or cost
+        // seconds per pointer event
+        band = CLAMPF(band + (new_val - old_val),
+                      DT_MATTE_BAND_SCALE_MIN, DT_MATTE_BAND_SCALE_MAX);
+        if(in_session)
+          d->edit_matte_band = band;
+        else
+          dt_conf_set_float(CONF_MATTE_BAND_KEY, band);
+      }
+      *sum += band;
       ++*count;
       break;
     }

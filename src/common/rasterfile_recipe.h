@@ -122,10 +122,17 @@ typedef struct dt_rf_recipe_t
   int32_t prompt_kind;     // DT_RF_PROMPT_*; selects the replay family
   int32_t detect_input;    // detector model input side; 0 for POINTS
   int64_t class_bits;      // semantic class set; 0 unless SEMANTIC
-  int32_t matting_enabled; // reserved for the matting stage, keep 0
-  float matting_band;      // reserved: matting band width, keep 0
-  char matting_id[DT_RF_RECIPE_MATTING_ID_LEN];          // reserved, keep 0
-  char matting_version[DT_RF_RECIPE_MATTING_VERSION_LEN]; // reserved, keep 0
+  // the matting stage. all four are written together or not at all, and
+  // only from version EXT: a session that ran the stage records enabled,
+  // the operator's table id, its ALGORITHM revision (bumped by any numeric
+  // change, because this blob is hashed verbatim to name a
+  // content-addressed file and one name may never cover two renders) and
+  // the single user scalar. a session that did not leaves all four zero,
+  // which is what keeps its recipe byte-identical to a version-1 one
+  int32_t matting_enabled; // 1 when the stage ran; 0 = no stage, all zero
+  float matting_band;      // band width scale, [0.5, 2.0]; 0 when disabled
+  char matting_id[DT_RF_RECIPE_MATTING_ID_LEN];          // NUL-terminated
+  char matting_version[DT_RF_RECIPE_MATTING_VERSION_LEN]; // NUL-terminated
 } dt_rf_recipe_t;
 
 // the layout is load-bearing twice over: the struct is embedded in module

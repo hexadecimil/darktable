@@ -749,7 +749,17 @@ static GtkTreeStore *_masks_store_new(void)
   return gtk_tree_store_newv(TREE_COUNT, types);
 }
 
-// boolean = TRUE renders as a checkbox; min/max/relative are unused
+// boolean = TRUE renders as a checkbox; min/max/relative are unused.
+//
+// `defval` is the slider's rest position -- what a reset lands on, and the
+// value read back as last_value before any shape has answered for the
+// property. It MUST lie inside [min, max]: the bauhaus constructor
+// normalises it without clamping (d->pos = (defval - min) / (max - min)),
+// so a default below the minimum leaves the widget at a negative position
+// and last_value below min, and the first drag then applies the whole gap
+// as a delta. Every property whose range starts at (or just above) zero
+// leaves it 0 by omission, which is what the shipped code passed for all
+// of them; only a range that does NOT contain zero has to say so.
 const struct
 {
   gchar *name;
@@ -757,6 +767,7 @@ const struct
   float min, max;
   gboolean relative;
   gboolean boolean;
+  float defval;
 } _masks_properties[DT_MASKS_PROPERTY_LAST]
   = { [ DT_MASKS_PROPERTY_OPACITY] = {N_("opacity"), "%", 0, 1, FALSE, FALSE },
       [ DT_MASKS_PROPERTY_SIZE] = { N_("size"), "%", 0.0001, 1, TRUE, FALSE },
@@ -768,6 +779,16 @@ const struct
       [ DT_MASKS_PROPERTY_CLEANUP] = { N_("cleanup"), "", 0, 100, FALSE, FALSE },
       [ DT_MASKS_PROPERTY_SMOOTHING] = { N_("smoothing"), "", 0, 1.3, FALSE, FALSE },
       [ DT_MASKS_PROPERTY_REFINE] = { N_("refine mask boundary"), "", 0, 1, FALSE, TRUE },
+      // both labels carry "at finalisation": these two act on the native
+      // pass that runs when the mask is finalised, never on the
+      // interactive preview, so the label is where a user learns that
+      // moving them changes nothing on screen until then
+      [ DT_MASKS_PROPERTY_MATTING] = { N_("matting at finalisation"), "", 0, 1, FALSE, TRUE },
+      // the ONE range in this table that does not contain zero, hence the
+      // only entry that has to name its default: 1.0 is the calibrated
+      // band width, the same number darktableconfig.xml gives the
+      // preference this slider edits
+      [ DT_MASKS_PROPERTY_MATTING_BAND] = { N_("matting band at finalisation"), "", 0.5, 2.0, FALSE, FALSE, 1.0 },
 };
 
 gboolean _timeout_show_all_feathers(gpointer userdata)
@@ -2972,7 +2993,14 @@ static void _set_iter_name(dt_lib_masks_t *lm,
       // is never cached: installs and rebinds move it between refreshes
       if(rpt && dt_rf_recipe_valid(&rpt->recipe))
       {
-        switch(dt_object_recipe_model_gap(&rpt->recipe, NULL))
+        // the matting stage is a build capability, not a model: asked
+        // before the model gap because that verdict would answer OK --
+        // "file missing, recomputing" -- for a replay whose matting gate
+        // refuses, and the anti-respawn table then pins the failure for
+        // the session. the row would promise a recompute that never comes
+        if(!dt_object_recipe_matting_reproducible(&rpt->recipe))
+          link = _("file missing, matting stage not supported");
+        else switch(dt_object_recipe_model_gap(&rpt->recipe, NULL))
         {
           case DT_OBJECT_RECIPE_MODELS_OK:
             link = _("file missing, recomputing");
@@ -4002,7 +4030,14 @@ static void _tree_context_menu(dt_lib_module_t *self,
       // already answers with the subsystem toast
       const char *reason = NULL;
 #ifdef HAVE_AI
-      switch(dt_object_recipe_model_gap(&rpt->recipe, NULL))
+      // the entry schedules a replay of the RECORDED recipe (it rebinds
+      // nothing), so the matting gate applies to it exactly as it applies
+      // to the automatic recompute: asked first, and for the same reason
+      // the row above asks it first -- a build capability no download can
+      // move must not be dressed as a model problem, nor left enabled
+      if(!dt_object_recipe_matting_reproducible(&rpt->recipe))
+        reason = _("matting stage not supported by this build");
+      else switch(dt_object_recipe_model_gap(&rpt->recipe, NULL))
       {
         case DT_OBJECT_RECIPE_MODELS_OK:
           break;
@@ -7087,7 +7122,7 @@ void gui_init(dt_lib_module_t *self)
       w = dt_bauhaus_slider_new_action(DT_ACTION(self),
                                        _masks_properties[i].min,
                                        _masks_properties[i].max,
-                                       0, 0.0, 2);
+                                       0, _masks_properties[i].defval, 2);
       dt_bauhaus_widget_set_label(w, N_("properties"),
                                   _masks_properties[i].name);
       dt_bauhaus_slider_set_format(w, _masks_properties[i].format);
