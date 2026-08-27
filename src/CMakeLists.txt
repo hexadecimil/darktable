@@ -71,6 +71,7 @@ FILE(GLOB SOURCE_FILES
   "common/locallaplaciancl.c"
   "common/map_locations.c"
   "common/matrices.c"
+  "common/matte_gf.c"
   "common/metadata.c"
   "common/metadata_export.c"
   "common/mipmap_cache.c"
@@ -467,6 +468,22 @@ endforeach(lib)
 if(USE_AI)
   option(USE_AI_DOWNLOAD "Enable downloading AI models from repository" ON)
 
+  # The ViTMatte line of the matting table. OFF, and it stays OFF for any
+  # build that is not somebody's own: the ViTMatte WEIGHTS are derived from
+  # the Adobe Deep Image Matting dataset, whose agreement confines them to
+  # non-commercial use, so darktable may neither ship them, nor download
+  # them, nor point a user at them. The code here is only the consumer --
+  # the model is installed by hand, by whoever accepted that agreement.
+  #
+  # A build with this OFF is the build that never had the option: the table
+  # simply carries no such line, and a recipe naming it meets the ordinary
+  # "no such operator" answer of dt_matte_find() -- the replay gate refuses
+  # it by id, exactly as it refuses any operator a build does not have. No
+  # code path is conditional on this beyond the table line itself.
+  option(USE_MATTE_VITMATTE
+         "Build the vitmatte-b-912 matting operator (NON-COMMERCIAL model weights, personal builds only -- never upstream)"
+         OFF)
+
   list(APPEND LIBS darktable_ai)
 
   FILE(GLOB SOURCE_FILES_AI
@@ -481,8 +498,19 @@ if(USE_AI)
     "develop/masks/object.c"
     "gui/preferences_ai.c"
   )
+  if(USE_MATTE_VITMATTE)
+    # appended to the AI list and not to the plain one: the operator drives
+    # an ONNX session, so it needs the backend HAVE_AI provides
+    list(APPEND SOURCE_FILES_AI "common/matte_vitmatte.c")
+  endif()
   set(SOURCES ${SOURCES} ${SOURCE_FILES_AI})
   add_definitions("-DHAVE_AI")
+  if(USE_MATTE_VITMATTE)
+    # directory-scoped, so common/matte_gf.c (globbed above, into the plain
+    # source list) sees it too -- that is where the table line lives
+    add_definitions("-DHAVE_MATTE_VITMATTE")
+    message(STATUS "matting operator vitmatte-b-912: enabled -- PERSONAL BUILD, non-commercial model weights, never for upstream")
+  endif()
   if(USE_AI_DOWNLOAD)
     add_definitions("-DHAVE_AI_DOWNLOAD")
     message(STATUS "AI features: enabled (with model download)")
