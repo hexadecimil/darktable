@@ -1873,7 +1873,12 @@ static gboolean _try_cuda_v2(OrtSessionOptions *session_opts, int device_id)
   const char *vals[4];
   int n = 0;
   keys[n] = "device_id";                vals[n++] = dev_str;
-  keys[n] = "arena_extend_strategy";    vals[n++] = "kSameAsRequested";
+  // kNextPowerOfTwo (ORT's default), NOT kSameAsRequested: measured on the
+  // subject detector at 1024x1024, the exact-size arena fragments and the
+  // 825 MB convolution buffer fails to allocate with 2 GB still free on
+  // the card, so every mask fell back to the CPU; the power-of-two arena
+  // runs it at a 6.3 GB peak
+  keys[n] = "arena_extend_strategy";    vals[n++] = "kNextPowerOfTwo";
   keys[n] = "cudnn_conv_algo_search";   vals[n++] = "HEURISTIC";
   if(cap_str) { keys[n] = "gpu_mem_limit"; vals[n++] = cap_str; }
 
@@ -1902,7 +1907,7 @@ static gboolean _try_cuda_v2(OrtSessionOptions *session_opts, int device_id)
   gchar *dev_name = _lookup_device_name(DT_AI_PROVIDER_CUDA, device_id);
   dt_print(DT_DEBUG_AI,
            "[darktable_ai] NVIDIA CUDA enabled successfully on device %d: %s "
-           "(mem_limit=%zu MB, algo=HEURISTIC, arena=kSameAsRequested)",
+           "(mem_limit=%zu MB, algo=HEURISTIC, arena=kNextPowerOfTwo)",
            device_id, dev_name ? dev_name : "?",
            cap ? cap / (1024UL * 1024UL) : 0);
   g_free(dev_name);

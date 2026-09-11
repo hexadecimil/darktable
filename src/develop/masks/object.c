@@ -3423,8 +3423,14 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
         const size_t k = (size_t)y * gw + x;
         const float refined = CLAMPF(alpha_gf[k], 0.0f, 1.0f);
         const float op_px = alpha_op ? CLAMPF(alpha_op[k], 0.0f, 1.0f) : refined;
-        alpha_gf[k]
-          = dt_matte_compose_px(hint_soft[k], refined, op_px, wband, wmatte);
+        // away from the band the binary hint has decided membership and
+        // the soft hint only leaks the network's confidence into the
+        // plateau: SAM's sigmoid sits at ~0.98 inside a subject, so the
+        // module's effect applied at 98% over the whole body. snap the
+        // plateaus; the band keeps the full composition
+        alpha_gf[k] = (wband <= 0.0f)
+          ? (f >= 0.5 ? 1.0f : 0.0f)
+          : dt_matte_compose_px(hint_soft[k], refined, op_px, wband, wmatte);
       }
     }
 
