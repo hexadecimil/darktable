@@ -1285,6 +1285,54 @@ static void _raster_get_distance(const float x,
   *inside = (crossings & 1) != 0;
 }
 
+// the properties a finalised raster form answers for in the masks panel.
+// a raster form has no anchors and no session: everything it exposes is
+// read from, and written to, the provenance recipe it carries. a change
+// rewrites the blob (the caller persists it as a history item), the
+// fingerprint names a new file, and the missing-file safety net of
+// _raster_get_mask_roi recomputes the mask -- the same road a deleted PNG
+// takes, so no second machinery. a form with no valid recipe (legacy
+// file-named raster) answers for nothing and the framework hides the
+// widgets (*count == 0, libs/masks.c)
+static void _raster_modify_property(dt_masks_form_t *const form,
+                                    const dt_masks_property_t prop,
+                                    const float old_val,
+                                    const float new_val,
+                                    float *sum,
+                                    int *count,
+                                    float *min,
+                                    float *max)
+{
+  (void)min;
+  (void)max;
+  dt_masks_point_raster_t *pt = dt_masks_raster_point(form);
+  if(!pt || !dt_rf_recipe_valid(&pt->recipe)) return;
+
+  switch(prop)
+  {
+    case DT_MASKS_PROPERTY_MATTING:
+    {
+      if(!dt_object_recipe_matting_offer(&pt->recipe)) break;
+      gboolean enabled = pt->recipe.matting_enabled != 0;
+      if(new_val != old_val)
+      {
+        const gboolean want = new_val > 0.5f;
+        if(want != enabled && dt_object_recipe_set_matting(&pt->recipe, want))
+        {
+          enabled = want;
+          dt_control_log(enabled
+                         ? _("matting switched on, the mask will be recomputed")
+                         : _("matting switched off, the mask will be recomputed"));
+        }
+      }
+      *sum += enabled ? 1.0f : 0.0f;
+      ++*count;
+      break;
+    }
+    default:;
+  }
+}
+
 static void _raster_set_form_name(dt_masks_form_t *const form,
                                   const size_t nb)
 {
@@ -1446,7 +1494,7 @@ const dt_masks_functions_t dt_masks_functions_raster = {
   .setup_mouse_actions = NULL,
   .set_form_name = _raster_set_form_name,
   .set_hint_message = NULL,
-  .modify_property = NULL,
+  .modify_property = _raster_modify_property,
   .duplicate_points = _raster_duplicate_points,
   .initial_source_pos = NULL,
   .get_distance = _raster_get_distance,

@@ -190,6 +190,23 @@ dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing);
 // operator may open the same library tomorrow
 gboolean dt_object_recipe_matting_reproducible(const dt_rf_recipe_t *recipe);
 
+// the matting stage as a PROPERTY of a finalised raster form. a form born
+// from the one-shot detector never opens a session, so the only place the
+// user can reach its matting stage is the masks panel, on the form itself.
+// _offer: TRUE when a toggle on this recipe can act -- the stage it
+// records is reproducible here, or (recording none) the preference names
+// an operator this build carries. the panel hides the checkbox otherwise,
+// exactly as it hides it for a session (libs/masks.c, *count == 0)
+gboolean dt_object_recipe_matting_offer(const dt_rf_recipe_t *recipe);
+// _set: switch the stage on (with the recorded operator, else the one the
+// preference names, band scale from the recipe else the preference) or
+// off, IN the recipe. the blob changes, so the fingerprint changes: the
+// caller persists the form and the missing-file safety net of raster.c
+// recomputes the mask under its new name. FALSE when nothing changed or
+// no operator can stand in
+gboolean dt_object_recipe_set_matting(dt_rf_recipe_t *recipe,
+                                      const gboolean enabled);
+
 // the situation changed (a model was installed, activated or removed):
 // clear the deterministic failures pinned in the anti-respawn table so
 // the next trigger may attempt those recomputes again. RUNNING slots are
@@ -299,6 +316,21 @@ static inline gboolean
 dt_object_recipe_matting_reproducible(const dt_rf_recipe_t *recipe)
 {
   return !recipe || !recipe->matting_enabled;
+}
+
+static inline gboolean
+dt_object_recipe_matting_offer(const dt_rf_recipe_t *recipe)
+{
+  (void)recipe;
+  return FALSE;
+}
+
+static inline gboolean
+dt_object_recipe_set_matting(dt_rf_recipe_t *recipe, const gboolean enabled)
+{
+  (void)recipe;
+  (void)enabled;
+  return FALSE;
 }
 
 static inline void dt_object_recipe_reset_failed(void)

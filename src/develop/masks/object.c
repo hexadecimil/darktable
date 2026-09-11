@@ -1008,6 +1008,99 @@ static gpointer _encode_thread_func(gpointer data)
 // (seed_x, seed_y), if the seed is outside any foreground region,
 // keep the largest component instead, operates in-place: non-selected
 // foreground pixels are zeroed
+// the promptless detectors' component filter: a "subject" is whatever the
+// salient-object network lit up, and a frame with two hikers, a couple or
+// a herd lights up several components of comparable size. keeping only
+// the largest (what the seeded filter falls back to without a seed) threw
+// the second person away -- measured on a two-hiker frame: two components
+// of 106k and 86k pixels on the encode grid, one kept. so every component
+// whose area reaches MIN_RATIO of the largest is a subject too; the rest
+// (specks, false positives at the frame edge) goes, as before. same
+// 4-connected labelling as _keep_seed_component, kept separate on purpose:
+// the seeded rule is a contract of the clicked session and its recipes
+static void _keep_major_components(float *mask,
+                                   const int w,
+                                   const int h,
+                                   const float threshold)
+{
+  const float MIN_RATIO = 0.05f;
+  const int npix = w * h;
+  int16_t *labels = g_try_malloc0((size_t)npix * sizeof(int16_t));
+  int *stack = labels ? g_try_malloc((size_t)npix * sizeof(int)) : NULL;
+  int *areas = stack ? g_try_malloc0((size_t)(INT16_MAX + 1) * sizeof(int))
+                     : NULL;
+  if(!areas)
+  {
+    g_free(stack);
+    g_free(labels);
+    return;
+  }
+
+  int16_t n_labels = 0;
+  int best_area = 0;
+  for(int i = 0; i < npix; i++)
+  {
+    if(mask[i] <= threshold || labels[i] != 0)
+      continue;
+    if(n_labels >= INT16_MAX)
+      break;
+    n_labels++;
+    const int16_t label = n_labels;
+    int area = 0;
+    int sp = 0;
+    stack[sp++] = i;
+    labels[i] = label;
+    while(sp > 0)
+    {
+      const int p = stack[--sp];
+      area++;
+      const int px = p % w;
+      const int py = p / w;
+      if(py > 0 && labels[p - w] == 0 && mask[p - w] > threshold)
+      {
+        labels[p - w] = label;
+        stack[sp++] = p - w;
+      }
+      if(py < h - 1 && labels[p + w] == 0 && mask[p + w] > threshold)
+      {
+        labels[p + w] = label;
+        stack[sp++] = p + w;
+      }
+      if(px > 0 && labels[p - 1] == 0 && mask[p - 1] > threshold)
+      {
+        labels[p - 1] = label;
+        stack[sp++] = p - 1;
+      }
+      if(px < w - 1 && labels[p + 1] == 0 && mask[p + 1] > threshold)
+      {
+        labels[p + 1] = label;
+        stack[sp++] = p + 1;
+      }
+    }
+    areas[label] = area;
+    if(area > best_area) best_area = area;
+  }
+
+  if(best_area > 0)
+  {
+    const int min_area = (int)ceilf(MIN_RATIO * (float)best_area);
+    int kept = 0;
+    for(int16_t l = 1; l <= n_labels; l++)
+      if(areas[l] >= min_area) kept++;
+    for(int i = 0; i < npix; i++)
+      if(mask[i] > threshold && areas[labels[i]] < min_area)
+        mask[i] = 0.0f;
+    dt_print(DT_DEBUG_AI,
+             "[object mask] detect: %d component(s) kept of %d (largest %d px,"
+             " floor %d px)",
+             kept, (int)n_labels, best_area, min_area);
+  }
+
+  g_free(areas);
+  g_free(stack);
+  g_free(labels);
+}
+
 static void _keep_seed_component(float *mask,
                                  const int w,
                                  const int h,
@@ -2763,6 +2856,39 @@ gboolean dt_object_recipe_matting_reproducible(const dt_rf_recipe_t *recipe)
   return _matte_op_recorded(recipe) != NULL;
 }
 
+gboolean dt_object_recipe_matting_offer(const dt_rf_recipe_t *recipe)
+{
+  if(!recipe) return FALSE;
+  if(recipe->matting_enabled)
+    return _matte_op_recorded(recipe) != NULL;
+  return _matte_conf_op() != NULL;
+}
+
+gboolean dt_object_recipe_set_matting(dt_rf_recipe_t *recipe,
+                                      const gboolean enabled)
+{
+  if(!recipe) return FALSE;
+  if(!enabled)
+  {
+    if(!recipe->matting_enabled) return FALSE;
+    // the stage off: the fields the finalisation reads are cleared, the
+    // version stays EXT -- a promptless recipe needs it anyway and a
+    // clicked one keeps its extension, the fingerprint changes either way
+    recipe->matting_enabled = 0;
+    memset(recipe->matting_id, 0, sizeof(recipe->matting_id));
+    memset(recipe->matting_version, 0, sizeof(recipe->matting_version));
+    recipe->matting_band = DT_MATTE_BAND_SCALE_DEFAULT;
+    return TRUE;
+  }
+  if(recipe->matting_enabled) return FALSE;
+  const dt_matte_op_t *const op = _matte_conf_op();
+  if(!op) return FALSE;
+  _matte_session_t m = { .enabled = TRUE,
+                         .band_scale = (float)dt_conf_get_float(CONF_MATTE_BAND_KEY),
+                         .op = op };
+  return _recipe_set_matting(recipe, &m);
+}
+
 // what a recipe RECORDED, for a render that is being reproduced. built
 // from the RECIPE and from nothing else: the operator is the table line
 // its id names, the band scale is the number it stored. a preference
@@ -3052,9 +3178,19 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
         dt_free_align(mask_net);
       }
       else
+      {
         dt_print(DT_DEBUG_AI,
                  "[object mask] finalise: refine model unavailable, "
                  "keeping the interactive hint");
+        // the user asked for a precise mask and gets the unrefined edge:
+        // say so, once, with the reason that is by far the most common --
+        // the refinement network refuses the CPU (refine.c), and a GPU
+        // provider that ran out of memory falls back to it silently
+        if(interactive)
+          dt_control_log(_("edge refinement skipped: the refinement model"
+                           " needs a GPU provider (not available or out of"
+                           " memory), keeping the raw AI edge"));
+      }
       if(net) dt_refine_free(net);
       if(net_env) dt_ai_env_destroy(net_env);
       if(keep_going && !keep_going(user)) goto cleanup;
@@ -4271,7 +4407,7 @@ dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
   // exists, so the filter keeps the largest component. multi-component
   // detectors (a sky between branches) skip it by their table row
   if(promptless && detector->keep_seed)
-    _keep_seed_component(hint, hint_w, hint_h, thresh, -1, -1);
+    _keep_major_components(hint, hint_w, hint_h, thresh);
   dt_seg_point_t tl, br;
   if(!_compute_bbox(hint, hint_w, hint_h, thresh, margin, &tl, &br))
   {
@@ -5013,7 +5149,7 @@ static int32_t _detect_job_run(dt_job_t *job)
     const float thresh = CLAMP(recipe.threshold, 0.3f, 0.9f);
     const float margin = CLAMPF(recipe.ai_refine_margin, 0.0f, 0.5f);
     if(j->detector->keep_seed)
-      _keep_seed_component(hint, out_w, out_h, thresh, -1, -1);
+      _keep_major_components(hint, out_w, out_h, thresh);
     dt_seg_point_t tl, br;
     if(!_compute_bbox(hint, out_w, out_h, thresh, margin, &tl, &br))
     {
@@ -6294,6 +6430,10 @@ gboolean dt_object_recipe_schedule_recompute(const dt_rf_recipe_t *recipe,
   // out of the darkroom's field of work and often folded away.
   // dt_control_log is thread-safe, so the pixelpipe trigger may use it
   dt_control_log(_("recomputing the AI mask..."));
+  // and QUEUE it: the announcement, the progress entry and the claimed
+  // slot are all promises this line keeps. same background queue as the
+  // finalisation and the detector, one heavy AI job at a time
+  dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
   return TRUE;
 }
 

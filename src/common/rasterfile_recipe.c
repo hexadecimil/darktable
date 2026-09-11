@@ -26,7 +26,15 @@
 
 gchar *dt_rasterfile_mask_root(void)
 {
-  gchar *root = dt_conf_get_string("plugins/darkroom/segments/def_path");
+  // the AI mask files have their own root, NOT the import folder of the
+  // raster mask module ("plugins/darkroom/segments/def_path"): that one
+  // defaults to the user's home directory upstream, and a content-addressed
+  // cache of 60 MB PNGs has no business landing next to the user's
+  // documents. the default is $(config)/masks; an empty or unset value
+  // (a darktablerc from before the key existed) resolves to the same
+  // folder below rather than to the current directory, which is what
+  // dt_util_normalize_path makes of an empty string
+  gchar *root = dt_conf_get_string("plugins/darkroom/masks/object/mask_root");
   if(!root || !*root)
   {
     g_free(root);

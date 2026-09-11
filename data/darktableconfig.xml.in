@@ -453,6 +453,13 @@
     <shortdescription>DirectML GPU device index</shortdescription>
     <longdescription>which DirectX 12 adapter to use when DirectML is the active execution provider. matches IDXGIFactory1::EnumAdapters1 order. defaults to 0 (first adapter). takes effect on next restart. env var DT_DML_DEVICE_ID overrides this if set.</longdescription>
   </dtconfig>
+  <dtconfig prefs="processing" section="general">
+    <name>plugins/darkroom/masks/object/mask_root</name>
+    <type>dir</type>
+    <default>$(config)/masks</default>
+    <shortdescription>AI mask files folder</shortdescription>
+    <longdescription>where the precise raster masks computed by the AI (subject selection, AI object) are stored. these files are a recomputable cache named after the mask's provenance recipe. leave empty to use the 'masks' folder of the current configuration directory.</longdescription>
+  </dtconfig>
   <dtconfig>
     <name>plugins/ai/matting_enabled</name>
     <type>bool</type>

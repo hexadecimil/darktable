@@ -96,8 +96,13 @@ G_STATIC_ASSERT(sizeof("1") <= DT_RF_RECIPE_MATTING_VERSION_LEN);
 #define MODEL_MATTE "matte-vitmatte-b912"
 
 // ImageNet statistics, as the reference preprocessing uses them
-static const float MATTE_MEAN[3] = { 0.485f, 0.456f, 0.406f };
-static const float MATTE_STD[3] = { 0.229f, 0.224f, 0.225f };
+// the normalisation of THIS model's official processor
+// (hustvl/vitmatte-base-composition-1k, preprocessor_config.json:
+// image_mean = image_std = 0.5, NOT the ImageNet constants the detectors
+// use): the export was validated against that processor, and feeding the
+// ImageNet ones stretches the input to [-2.1, 2.2] instead of [-1, 1]
+static const float MATTE_MEAN[3] = { 0.5f, 0.5f, 0.5f };
+static const float MATTE_STD[3] = { 0.5f, 0.5f, 0.5f };
 
 // tiling geometry of the reference (trimap.py:39-40). the overlap exists so
 // the inner crop below can throw away the tile border the network resolves
