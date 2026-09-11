@@ -1828,7 +1828,14 @@ static size_t _cuda_mem_limit_bytes(int device_id)
   }
   const size_t total = _cuda_total_vram_bytes(device_id);
   if(total == 0) return 0;
-  return total - total / 4;
+  // leave the display and the OpenCL pipe a fixed headroom rather than a
+  // quarter of the card: on an 8 GB laptop GPU the old 75% cap (6144 MB)
+  // made the subject detector (~7.5 GB at 1024x1024) fail its first
+  // convolution and fall back to the CPU, silently, on every mask.
+  // 512 MB, or a sixteenth on big cards. an OpenCL allocation that no
+  // longer fits falls back per module, which is the cheaper failure
+  const size_t headroom = MAX((size_t)512 * 1024 * 1024, total / 16);
+  return total > headroom ? total - headroom : 0;
 }
 
 // configure CUDA EP via V2 options API. HEURISTIC algo search and

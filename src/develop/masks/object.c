@@ -2565,6 +2565,24 @@ static gboolean _finalize_apply_idle(gpointer data)
   // through. gui NULL: the target's gui is updated explicitly below
   dt_masks_gui_form_save_creation(dev, target, rform, NULL);
 
+  // an inverted detection reads as what it selects: the raster form is
+  // the subject file (recipe and name derivation unchanged), but the
+  // panel row says "background", numbered like the others
+  if(a->detector && a->detector->invert)
+  {
+    const char *label = _(a->detector->label);
+    int nb = 0;
+    for(GList *l = dev->forms; l; l = g_list_next(l))
+    {
+      const dt_masks_form_t *f = l->data;
+      if(f != rform && g_str_has_prefix(f->name, label)) nb++;
+    }
+    if(nb == 0)
+      g_strlcpy(rform->name, label, sizeof(rform->name));
+    else
+      snprintf(rform->name, sizeof(rform->name), "%s %d", label, nb + 1);
+  }
+
   if(target && target->blend_params)
   {
     // additive, the whole point: a drawn mask already on the module is
@@ -2573,6 +2591,24 @@ static gboolean _finalize_apply_idle(gpointer data)
     // rasterfile module, and exclusivity is what this gesture ends
     target->blend_params->mask_mode
       |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+    // a "background" detection is the subject detection with its group
+    // member inverted: same recipe, same file, the complement selected.
+    // the state lives on the member the save above just created, so it
+    // is found through the module's group rather than assumed
+    if(a->detector && a->detector->invert)
+    {
+      dt_masks_form_t *mgrp
+        = dt_masks_get_from_id(dev, target->blend_params->mask_id);
+      for(GList *l = mgrp ? mgrp->points : NULL; l; l = g_list_next(l))
+      {
+        dt_masks_point_group_t *fpt = l->data;
+        if(fpt->formid == rform->formid)
+        {
+          fpt->state |= DT_MASKS_STATE_INVERSE;
+          break;
+        }
+      }
+    }
     dt_dev_add_masks_history_item(dev, target, TRUE);
     if(target->gui_data) dt_iop_gui_update(target);
     if(a->detector)

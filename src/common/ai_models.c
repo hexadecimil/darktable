@@ -2178,6 +2178,31 @@ char *dt_ai_models_get_active_for_task(const char *task)
         break;
       }
     }
+    // no flagged default: a task with exactly ONE installed model has an
+    // obvious active model, and refusing it leaves silent holes -- a
+    // hand-installed refinement model (no registry row, so no "default"
+    // flag) was never picked up, and every precise mask quietly skipped
+    // its edge refinement
+    if(!result)
+    {
+      int n_installed = 0;
+      for(GList *l = darktable.ai_registry->models; l; l = g_list_next(l))
+      {
+        dt_ai_model_t *m = (dt_ai_model_t *)l->data;
+        if(m->task && strcmp(m->task, task) == 0
+           && m->status == DT_AI_MODEL_DOWNLOADED)
+        {
+          n_installed++;
+          g_free(result);
+          result = g_strdup(m->id);
+        }
+      }
+      if(n_installed != 1)
+      {
+        g_free(result);
+        result = NULL;
+      }
+    }
     g_mutex_unlock(&darktable.ai_registry->lock);
 
     if(result)

@@ -55,10 +55,14 @@ typedef struct dt_detector_t
                        // connected component (the seed's, or the largest
                        // when no seed exists); FALSE: multi-component
                        // results are legitimate (a sky between branches)
+  gboolean invert;     // TRUE: the member joins its group INVERTED -- the
+                       // same detection, the same recipe and file, the
+                       // complement selected (Lightroom's "background")
 } dt_detector_t;
 
 static const dt_detector_t dt_detectors[] = {
-  { "mask-subject", N_("subject"), "✦", DT_RF_PROMPT_SUBJECT, 0, TRUE },
+  { "mask-subject", N_("subject"), "✦", DT_RF_PROMPT_SUBJECT, 0, TRUE, FALSE },
+  { "mask-subject", N_("background"), "✦", DT_RF_PROMPT_SUBJECT, 0, TRUE, TRUE },
 };
 
 // resolve a recipe's (prompt_kind, class_bits) to its table row; NULL
