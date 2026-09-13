@@ -1703,6 +1703,26 @@ static void _blendop_masks_add_shape(GtkGestureSingle *gesture,
     return;
   }
 
+#ifdef HAVE_AI
+  // the AI button stands for three things -- select the subject, select the
+  // background, select by clicking -- and a press cannot say which. it opens
+  // the mask manager's own AI menu instead, with this module for target: the
+  // entry picked there enables drawn masking, takes the focus and starts the
+  // creation exactly as the code below would, through the manager's one
+  // creation path. before any mutation, so a dismissed menu changes nothing
+  // -- not even the button, which stays down. ctrl has no meaning for a
+  // menu and is not read. without the manager loaded the button keeps its
+  // historical behaviour, the clicked session, straight away
+  if(bd->masks_type[this] == DT_MASKS_OBJECT
+     && darktable.develop->proxy.masks.module
+     && darktable.develop->proxy.masks.object_menu)
+  {
+    darktable.develop->proxy.masks.object_menu
+      (darktable.develop->proxy.masks.module, self, widget);
+    return;
+  }
+#endif
+
   _blendop_masks_modes_toggle(NULL, self, DEVELOP_MASK_MASK);
 
   // set all shape buttons to inactive
@@ -2862,6 +2882,12 @@ void dt_iop_gui_init_masks(GtkWidget *blendw, dt_iop_module_t *module)
                                                   G_CALLBACK(_blendop_masks_add_shape),
                                                   FALSE, 0, 0,
                                                   dtgtk_cairo_paint_masks_object, abox);
+    // the label above is the action path shortcuts are bound to and stays;
+    // the tooltip says what the button opens on today -- the AI menu of the
+    // mask manager, see _blendop_masks_add_shape
+    gtk_widget_set_tooltip_text
+      (bd->masks_shapes[5],
+       _("AI selection\nsubject, background, or an object you click"));
 #endif
 
     bd->masks_type[0] = DT_MASKS_GRADIENT;

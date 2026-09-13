@@ -352,6 +352,22 @@ typedef struct dt_lib_masks_t
   // down for the one state of the row that states a fact instead of waiting
   GtkWidget *creation_bar, *creation_label, *bt_creation_cancel;
   struct dt_iop_module_t *arm_module;
+  // ... and the same claim for a creation armed towards the shape library:
+  // there is no module to hold then, so arm_module alone could not tell
+  // "this panel armed a shape for no module" from "nothing armed". a
+  // creation in flight with form_gui->creation_module == NULL is ours
+  // exactly when this is set
+  gboolean arm_library;
+
+  // the module picked by hand in the menu of the target row, or NULL for the
+  // shape library. this is the ONLY memory the panel keeps of where the next
+  // shape goes: everything else is read at the moment of the gesture. it is
+  // compared and validated (alive, able to take a drawn mask) before every
+  // use, and forgotten with the image it was chosen on -- a module pointer
+  // of one pipe means nothing in the next, and a freed address can be handed
+  // back to a module of the next image
+  struct dt_iop_module_t *pick_target;
+  dt_imgid_t pick_imgid;
 
   // the operator bar: M2's contextual row, under both lists and above the
   // creation bar. it says how the NEXT shape will combine, before it is drawn
@@ -768,6 +784,7 @@ const struct
   gboolean relative;
   gboolean boolean;
   float defval;
+  gchar *tooltip;   // NULL: the label says it all
 } _masks_properties[DT_MASKS_PROPERTY_LAST]
   = { [ DT_MASKS_PROPERTY_OPACITY] = {N_("opacity"), "%", 0, 1, FALSE, FALSE },
       [ DT_MASKS_PROPERTY_SIZE] = { N_("size"), "%", 0.0001, 1, TRUE, FALSE },
@@ -779,16 +796,21 @@ const struct
       [ DT_MASKS_PROPERTY_CLEANUP] = { N_("cleanup"), "", 0, 100, FALSE, FALSE },
       [ DT_MASKS_PROPERTY_SMOOTHING] = { N_("smoothing"), "", 0, 1.3, FALSE, FALSE },
       [ DT_MASKS_PROPERTY_REFINE] = { N_("refine mask boundary"), "", 0, 1, FALSE, TRUE },
-      // both labels carry "at finalisation": these two act on the native
-      // pass that runs when the mask is finalised, never on the
-      // interactive preview, so the label is where a user learns that
-      // moving them changes nothing on screen until then
-      [ DT_MASKS_PROPERTY_MATTING] = { N_("matting at finalisation"), "", 0, 1, FALSE, TRUE },
+      // these two act on the full-resolution pass that computes the mask
+      // file, never on the interactive preview: the tooltip is where a
+      // user learns that the mask is recomputed when they move
+      [ DT_MASKS_PROPERTY_MATTING] = { N_("soft edges for hair and fur"), "", 0, 1, FALSE, TRUE, 0,
+        N_("recompute the mask with an alpha matting stage:\n"
+           "semi-transparent edges on hair, fur and foliage instead of a hard cut.\n"
+           "slower, and it needs the matting model") },
       // the ONE range in this table that does not contain zero, hence the
       // only entry that has to name its default: 1.0 is the calibrated
       // band width, the same number darktableconfig.xml gives the
       // preference this slider edits
-      [ DT_MASKS_PROPERTY_MATTING_BAND] = { N_("matting band at finalisation"), "", 0.5, 2.0, FALSE, FALSE, 1.0 },
+      [ DT_MASKS_PROPERTY_MATTING_BAND] = { N_("soft edge width"), "", 0.5, 2.0, FALSE, FALSE, 1.0,
+        N_("width of the band along the edge where the matting decides the transparency,\n"
+           "relative to the calibrated width: wider for long hair and fur, narrower for clean edges.\n"
+           "the mask is recomputed") },
 };
 
 gboolean _timeout_show_all_feathers(gpointer userdata)
@@ -1221,14 +1243,15 @@ static void _lib_masks_get_values(GtkTreeModel *model,
 }
 
 /* -------------------------------------------------------------------------
-   "new mask": one entry point that names the module the shape is for.
+   "new mask": one entry point that names where the shape is going.
 
-   until now a shape created from this panel took its target from whatever row
-   happened to be selected, silently, and got NO target at all when nothing was
-   selected -- that is where an orphan shape comes from on this side. that rule
-   is kept and extended until it always answers; what changes is that the
+   a shape created from this panel takes its target from the row that is
+   selected, or from the module picked by hand in the target row's menu, and
+   goes to the shape library -- upstream's behaviour, a shape linked to no
+   module -- when neither said anything. what this panel adds is that the
    answer is written down before anything is drawn, next to the way to change
-   it, and that a creation with no target is refused instead of performed.
+   it: the line above the shape buttons, the header of the catalogue and the
+   hint row all read the same rule.
    ------------------------------------------------------------------------- */
 
 // a module whose mask gui is actually there. blend_data is only allocated for
@@ -1497,28 +1520,47 @@ static dt_iop_module_t *_mask_selected_target(dt_lib_masks_t *lm)
     ? module : NULL;
 }
 
-// where a new shape goes when nothing said otherwise, in decreasing order of
-// evidence:
-//   1. the module of the selected row -- this is the rule _tree_add_shape has
-//      always applied, it was simply never said out loud;
-//   2. the module open in the right panel (dev->gui_module);
-//   3. the last module of the pipe that already carries a drawn mask (dev->iop
-//      is sorted, so the last match is the latest one);
-//   4. exposure, switched on or not. the first three rules are all empty on an
-//      image that was just opened -- dt_dev_change_image() drops the focus --
-//      and a rule that answers nothing there leaves the one button of this
-//      panel opening on a menu with nothing to click. exposure is the module
-//      every image has, the one darktable already singles out (the histogram
-//      drags it through dev->proxy.exposure), and a drawn mask on it is what
-//      dodging and burning is;
-//   5. failing even that -- exposure carrying a raster mask -- the last module
-//      of the pipe that is switched on and could take the shape. no rule falls
-//      back to a module that is off and unnamed: on a jpeg not one switched-on
-//      module supports blending, which is why rule 4 comes first and does not
-//      ask whether exposure is on.
-// nothing here is decided silently: the menu prints the answer and offers to
-// change it before a shape is drawn. NULL only when no module of this pipe can
-// take a drawn mask at all.
+// the module picked by hand in the target row's menu, if it still stands:
+// same image, still in the pipe, still able to take a drawn mask. the pick is
+// forgotten -- not merely ignored -- the moment any of the three fails, so a
+// module that comes back to life later does not silently come back as the
+// target with it, and so the panel never dereferences a pointer of a pipe
+// that has been torn down. the image test is what forgets it on an image
+// change: the panel hears of one through the list_change proxy, which lands
+// here through _update_all_properties() -> _target_row_update(), before any
+// gesture can read the stale pick
+static dt_iop_module_t *_mask_picked_target(dt_lib_masks_t *lm)
+{
+  if(!lm->pick_target) return NULL;
+
+  if(lm->pick_imgid != darktable.develop->image_storage.id
+     || !_mask_target_alive(lm->pick_target)
+     || !_mask_target_ok(lm->pick_target))
+  {
+    lm->pick_target = NULL;
+    lm->pick_imgid = NO_IMGID;
+    return NULL;
+  }
+  return lm->pick_target;
+}
+
+// where a new shape goes, from the two things the photographer actually said
+// and nothing else:
+//   1. the module of the selected row -- the rule _tree_add_shape has always
+//      applied, now said out loud on the target row;
+//   2. the module picked by hand in the menu of that row;
+//   3. failing both, NULL: the shape library. the shape is saved on its own,
+//      linked to no module, as upstream's mask manager has always done it
+//      (_tree_add_shape with creation_module = NULL), and it can be sent to
+//      a module afterwards from its row's context menu.
+// nothing is inferred any more. this used to fall back on the focused module,
+// then on the last masked one, then on exposure, then on the last module
+// switched on -- and a "select subject" launched from this panel landed on
+// exposure without anyone having asked for it. an implicit target is a
+// surprise, and a surprise that writes history: the library is the one
+// answer that does nothing behind the photographer's back. the target row,
+// the catalogue header and the hint row all print this answer before a shape
+// is drawn, and the target row's menu is where to change it
 static dt_iop_module_t *_mask_default_target(dt_lib_module_t *self)
 {
   dt_lib_masks_t *lm = self->data;
@@ -1526,29 +1568,7 @@ static dt_iop_module_t *_mask_default_target(dt_lib_module_t *self)
   dt_iop_module_t *module = _mask_selected_target(lm);
   if(module) return module;
 
-  module = darktable.develop->gui_module;
-  if(_mask_target_ok(module)) return module;
-
-  // rules 3 to 5 read the pipe once. `preferred` is the exposure instance
-  // darktable itself works through, so a multi-instance edit answers the same
-  // module here as it does everywhere else; without it the first instance in
-  // pipe order does
-  const dt_iop_module_t *preferred = darktable.develop->proxy.exposure.module;
-  dt_iop_module_t *masked = NULL, *exposure = NULL, *switched_on = NULL;
-
-  for(const GList *l = darktable.develop->iop; l; l = g_list_next(l))
-  {
-    dt_iop_module_t *m = l->data;
-    if(!_mask_target_listed(m) || !_mask_target_ok(m)) continue;
-
-    if(_mask_target_shapes(m) > 0) masked = m;
-    if(m->enabled) switched_on = m;
-    if(!g_strcmp0(m->op, "exposure") && (!exposure || m == preferred))
-      exposure = m;
-  }
-
-  if(masked) return masked;
-  return exposure ? exposure : switched_on;
+  return _mask_picked_target(lm);
 }
 
 /* -------------------------------------------------------------------------
@@ -1595,11 +1615,16 @@ static void _creation_bar_update(dt_lib_masks_t *d)
   // canvas stopped listening. the two halves take turns instead:
   //   `creation` alone, target still to be filled in, is where a continuous
   //   run sits while it chains the next shape; `creation_module` alone is
-  //   where a shape sits between being saved and that chain restarting
+  //   where a shape sits between being saved and that chain restarting.
+  // a creation armed for the library has only the first half to show:
+  // creation_module stays NULL from start to end, which is what makes the
+  // shape land in dev->forms alone -- see library_gap below for the moment
+  // between two of its shapes
   const gboolean pending = fg && (fg->creation || fg->creation_module);
 
   // ... and it is ours until someone else names a target, which is what a
-  // module's own blending panel does a moment after taking the focus
+  // module's own blending panel does a moment after taking the focus. for a
+  // library creation any module named at all is someone else
   const gboolean stolen =
     fg && fg->creation_module && fg->creation_module != d->arm_module;
 
@@ -1616,6 +1641,30 @@ static void _creation_bar_update(dt_lib_masks_t *d)
     if(fg && fg->creation_continuous_module == d->arm_module)
       _creation_end_continuous();
     d->arm_module = NULL;
+  }
+
+  // the library claim goes down by the same two of those three ways -- there
+  // is no module to lose -- plus one moment it has to survive. a module run
+  // sits between two shapes with `creation_module` alone set, see above; a
+  // library run has no module to leave there, so between the save and the
+  // chain restarting form_gui carries neither half. what it does carry, and
+  // only there, is the id the save just wrote (dt_masks_gui_form_save_
+  // creation sets formid, dt_masks_clear_form_gui() zeroes it) beside a run
+  // naming no module. the formid is what tells that gap from a run left
+  // standing after the form was dropped: a focus change, a row click or a
+  // new image all go through clear_form_gui, and the id goes with them.
+  // read under our own claim only -- a run naming no module is also what a
+  // run that never started looks like, and the claim is the proof it did
+  const gboolean library_gap =
+    fg && !fg->creation && !fg->creation_module
+    && fg->creation_continuous && !fg->creation_continuous_module
+    && dt_is_valid_maskid(fg->formid);
+
+  if(d->arm_library && ((!pending && !library_gap) || stolen))
+  {
+    if(fg && fg->creation_continuous && !fg->creation_continuous_module)
+      _creation_end_continuous();
+    d->arm_library = FALSE;
   }
 
   if(d->arm_module)
@@ -1637,6 +1686,14 @@ static void _creation_bar_update(dt_lib_masks_t *d)
     g_free(text);
     g_free(name);
   }
+  else if(d->arm_library)
+  {
+    // the same sentence, the library where the module name goes: the bracket
+    // is the one place of the row that says where the shape lands
+    const gchar *text = _("draw the shape on the photograph (shape library)");
+    gtk_label_set_text(GTK_LABEL(d->creation_label), text);
+    gtk_widget_set_tooltip_text(d->creation_label, text);
+  }
 
   // and the six toggles follow the very same answer: lit while this panel's
   // creation is in flight, and only the type actually being drawn. upstream
@@ -1647,7 +1704,7 @@ static void _creation_bar_update(dt_lib_masks_t *d)
   // togglebutton wires "toggled" to gtk_widget_queue_draw and nothing else,
   // its click living in the gesture controller gui_init installs
   const dt_masks_form_t *drawn =
-    d->arm_module ? darktable.develop->form_visible : NULL;
+    (d->arm_module || d->arm_library) ? darktable.develop->form_visible : NULL;
   for(int i = 0; i < (int)G_N_ELEMENTS(_new_mask_shapes); i++)
     gtk_toggle_button_set_active
       (GTK_TOGGLE_BUTTON(d->bt_shape[i]),
@@ -1659,14 +1716,12 @@ static void _creation_bar_update(dt_lib_masks_t *d)
 // cannot contradict each other.
 //
 // refreshed from _update_all_properties(), so from all four refresh paths of
-// this panel -- which covers every change of focus that had a module in focus
-// before: dt_iop_request_focus() calls dt_masks_reset_form_gui(), landing in
-// dt_dev_masks_selection_change() with dev->gui_module already set to the new
-// module. what it does not cover is a focus taken while nothing was focused,
-// the first module opened after an image change: darktable raises no signal
-// for a focus change and nothing else here can hear it. the line is then one
-// rule behind until anything at all moves, and both the menu and the creation
-// itself re-read the rule at the moment of the gesture
+// this panel: the selection change that moves rule 1, the refresh
+// _target_set_cb() asks for when rule 2 moves, and the list rebuild an image
+// change goes through, which is where a pick of the previous image is
+// forgotten (_mask_picked_target). the focus is no longer part of the rule,
+// so the one event this panel cannot hear -- a focus taken while nothing was
+// focused -- no longer moves the answer either
 static void _target_row_update(dt_lib_masks_t *d)
 {
   dt_lib_module_t *self = darktable.develop->proxy.masks.module;
@@ -1692,10 +1747,16 @@ static void _target_row_update(dt_lib_masks_t *d)
   }
   else
   {
-    gtk_label_set_text(GTK_LABEL(d->target_label),
-                       _("no module can take a shape"));
-    gtk_widget_set_tooltip_text(d->target_label,
-                                _("where the next shape goes"));
+    // no module was named: the shape goes to the library, on its own. the
+    // same arrow, so the line reads the same way whichever answer it gives.
+    // the tooltip says both what will happen and the two ways to a module,
+    // since this is the state a fresh image opens in
+    gtk_label_set_text(GTK_LABEL(d->target_label), _("→ shape library"));
+    gtk_widget_set_tooltip_text
+      (d->target_label,
+       _("the next shape goes to the shape library, linked to no module\n"
+         "pick a module here, or right-click the shape afterwards to add it"
+         " to a module"));
   }
 }
 
@@ -1706,10 +1767,9 @@ static void _target_row_update(dt_lib_masks_t *d)
 // the three buttons are insensitive there rather than the whole row gone.
 //
 // the selection and not _mask_default_target(): M2 draws this bar only on the
-// panel where a mask is selected, and four of that function's five rules are
-// inferences -- an open module, the last masked one, exposure. under them the
-// bar would be up on a panel where the photographer pointed at nothing, naming
-// a mask they never chose.
+// panel where a mask is selected. a module picked in the target row's menu
+// names where the NEXT shape goes, not a mask to combine into -- its group
+// may not exist yet -- and the library has no operator to arm at all.
 //
 // refreshed from _update_all_properties(), so from all four refresh paths of
 // this panel, the selection change included -- which is the one that matters
@@ -1801,7 +1861,7 @@ static void _arm_bar_update(dt_lib_masks_t *d)
   // -- see the reset above -- and would otherwise be pointing at three buttons
   // that went away with their target
   const gboolean armed = armable && d->arm_op != DT_MASKS_STATE_NONE;
-  if(!d->arm_module)
+  if(!d->arm_module && !d->arm_library)
   {
     const gchar *hint = NULL;
     if(armed)
@@ -1890,7 +1950,11 @@ static void _creation_bar_cancel(GtkButton *button, dt_lib_masks_t *d)
     dt_masks_set_edit_mode(module, DT_MASKS_EDIT_FULL);
     dt_masks_iop_update(module);
   }
-  else if(module)
+  else if(module || d->arm_library)
+    // a module gone from the pipe, or a shape armed for the library: there is
+    // no module whose mask could come back on screen, so the form in flight
+    // is simply dropped. the library claim goes down in _creation_bar_update,
+    // reached through the selection proxy this call ends on
     dt_masks_change_form_gui(NULL);
   else
     // nothing was being drawn, so there is no form to drop -- and dropping one
@@ -1902,9 +1966,14 @@ static void _creation_bar_cancel(GtkButton *button, dt_lib_masks_t *d)
   dt_control_queue_redraw_center();
 }
 
-// the one creation path of this panel. the catalogue, the tree context menu
-// and the shape shortcuts all land here, so none of them can produce a shape
-// with no module behind it and all of them refuse with the same words.
+// the one creation path of this panel. the catalogue, the tree context menu,
+// the six buttons and the shape shortcuts all land here, so all of them put
+// a module in listening state the same way -- and all of them save a shape
+// for no module the same way. `module` NULL is the shape library: nothing is
+// enabled, nothing takes the focus, and the shape is saved on its own by
+// dt_masks_gui_form_save_creation(dev, NULL, ...), the path upstream's mask
+// manager has always taken. a module that is named but cannot take a drawn
+// mask is refused, not demoted to the library: the photographer pointed at it
 static gboolean _start_creation(dt_lib_module_t *self,
                                 dt_iop_module_t *module,
                                 const dt_masks_type_t type,
@@ -1930,29 +1999,39 @@ static gboolean _start_creation(dt_lib_module_t *self,
 #endif
 
   // the module may have gone away between the click that opened a menu and the
-  // click that picked a shape
-  if(!_mask_target_alive(module) || !_mask_target_ok(module))
+  // click that picked a shape, or be on a raster mask by now
+  if(module && (!_mask_target_alive(module) || !_mask_target_ok(module)))
   {
-    // a shape with no module is a shape nothing renders: it lands in the
-    // library, in no pipe, and stays there until "delete unused shapes" is
-    // found. do not create it -- and say what to do rather than what failed,
-    // since both halves of the sentence are a way out: a selected mask answers
-    // for its module, an open module answers for itself
-    dt_control_log
-      (_("select a mask or open a module to choose where the shape goes"));
+    dt_control_log(_("this module cannot take a drawn shape"));
     return FALSE;
   }
 
-  // the target has to be listening. this is what a module's own shape button
-  // does before creating anything, and it is not decoration: nothing in
-  // develop/masks/*.c ever writes mask_mode, so a shape attached to a module
-  // still on DEVELOP_MASK_DISABLED would be drawn and do nothing. the call
-  // takes the focus, sets the mask indicator and adds the history item that
-  // enables the module -- all of it inside blend_gui.c, where it belongs
-  dt_iop_gui_enable_drawn_mask(module);
-  // enable_drawn_mask is a no-op when drawn masking is already on, and the
-  // focus has to be taken in that case too
-  dt_iop_request_focus(module);
+  if(module)
+  {
+    // the target has to be listening. this is what a module's own shape
+    // button does before creating anything, and it is not decoration:
+    // nothing in develop/masks/*.c ever writes mask_mode, so a shape
+    // attached to a module still on DEVELOP_MASK_DISABLED would be drawn
+    // and do nothing. the call takes the focus, sets the mask indicator and
+    // adds the history item that enables the module -- all of it inside
+    // blend_gui.c, where it belongs
+    dt_iop_gui_enable_drawn_mask(module);
+    // enable_drawn_mask is a no-op when drawn masking is already on, and the
+    // focus has to be taken in that case too
+    dt_iop_request_focus(module);
+  }
+#ifdef HAVE_AI
+  else if(type == DT_MASKS_OBJECT)
+    // the one shape whose destination is not creation_module: the clicked
+    // session closes into the module the canvas hands its handlers, which is
+    // dev->gui_module at that moment (masks.c dt_masks_events_button_pressed,
+    // object.c's closing gesture). a module left focused would therefore
+    // receive a mask the photographer sent to the library. dropping the focus
+    // is what object.c's own edit path does before opening a session for no
+    // sink, and it is the one focus change this path makes -- the drawn
+    // shapes read creation_module and need none of it
+    dt_iop_request_focus(NULL);
+#endif
 
   // we create the new form
   dt_masks_form_t *spot = dt_masks_create(type);
@@ -1972,12 +2051,14 @@ static gboolean _start_creation(dt_lib_module_t *self,
 
   // the one place the armament is recorded, and all it records is that this
   // panel is what armed the canvas: where the shape goes is form_gui's answer
-  // just above, read back by _creation_bar_update().
+  // just above, read back by _creation_bar_update(). one claim or the other,
+  // never both: a library creation has no module to hold, so it holds a flag
   // the whole refresh and not that call alone: the hint row is raised by
   // _arm_bar_update(), which runs after it, and the change_form_gui() above
-  // already went round the proxy while arm_module was still unset
+  // already went round the proxy while both claims were still unset
   dt_lib_masks_t *d = self->data;
   d->arm_module = module;
+  d->arm_library = module == NULL;
   _update_all_properties(d);
 
   dt_control_queue_redraw_center();
@@ -2046,8 +2127,9 @@ static void _bt_add_shape_cb(GtkGestureSingle *gesture,
 }
 
 // menu-item adapter. the catalogue and the context menu write the module they
-// mean on the item; an item without one falls back to the default rule, so a
-// path that forgets to set it degrades to today's behaviour minus the orphan
+// mean on the item; an item without one -- which is also what an item FOR the
+// library carries, a NULL being unset -- falls back to the default rule, and
+// that rule answers the library when nothing was pointed at
 static void _tree_add_shape(GtkWidget *widget, gpointer shape)
 {
   dt_lib_module_t *self = darktable.develop->proxy.masks.module;
@@ -2068,7 +2150,10 @@ static void _tree_add_shape(GtkWidget *widget, gpointer shape)
 // every one of them BEFORE the target is touched. the target is then put
 // in listening state exactly as _start_creation puts it -- the apply
 // idle rewrites mask_mode when the shape lands, but the job's result
-// must land on a module that renders it, visibly armed for the wait
+// must land on a module that renders it, visibly armed for the wait.
+// no target is the library, as everywhere in this panel: the job is
+// launched for no module and the apply idle files the raster shape on
+// its own, selected in the library so it shows on the photograph
 static void _detect_activate(GtkWidget *widget, gpointer detector)
 {
   dt_lib_module_t *self = darktable.develop->proxy.masks.module;
@@ -2097,10 +2182,9 @@ static void _detect_activate(GtkWidget *widget, gpointer detector)
   dt_iop_module_t *module = g_object_get_data(G_OBJECT(widget), "target");
   if(!module) module = _mask_default_target(self);
 
-  if(!_mask_target_alive(module) || !_mask_target_ok(module))
+  if(module && (!_mask_target_alive(module) || !_mask_target_ok(module)))
   {
-    dt_control_log
-      (_("select a mask or open a module to choose where the shape goes"));
+    dt_control_log(_("this module cannot take a drawn shape"));
     return;
   }
 
@@ -2108,9 +2192,13 @@ static void _detect_activate(GtkWidget *widget, gpointer detector)
   // captures the distort hash, so the item that enables the module must
   // exist by then -- reversed, arming a disabled distort module
   // (liquify) would change the geometry after the capture and the apply
-  // would discard the finished mask as a geometry change
-  dt_iop_gui_enable_drawn_mask(module);
-  dt_iop_request_focus(module);
+  // would discard the finished mask as a geometry change. nothing of it
+  // for the library: no module is enabled and none takes the focus
+  if(module)
+  {
+    dt_iop_gui_enable_drawn_mask(module);
+    dt_iop_request_focus(module);
+  }
 
   dt_masks_object_detect_launch(detector, module);
 }
@@ -2121,12 +2209,11 @@ static void _detect_activate(GtkWidget *widget, gpointer detector)
 // every refusal in this panel's menus. READY detects; DOWNLOAD stays
 // sensitive too, because the click can act -- it downloads the model and
 // the detection follows on the same job; everything else states why it
-// is inert
+// is inert. `target` NULL is the library, and the entries are built for
+// it all the same: the NULL rides on the item like a module would
 static gboolean _detect_menu_items(GtkMenuShell *menu,
                                    dt_iop_module_t *target)
 {
-  if(!target) return FALSE;
-
   gboolean any = FALSE;
   for(size_t i = 0; i < G_N_ELEMENTS(dt_detectors); i++)
   {
@@ -2180,10 +2267,9 @@ static gboolean _detect_menu_items(GtkMenuShell *menu,
 // context menu
 static void _new_mask_shape_items(GtkMenuShell *menu, dt_iop_module_t *target)
 {
-  // a shape list without a target is a list of dead ends, so there is no such
-  // list: every caller resolves one first. what is left below is written per
-  // entry because it really is per entry -- one model that is not installed
-  if(!target) return;
+  // `target` NULL is the library: the same list, the drawn shape saved on
+  // its own. what is written per entry below really is per entry -- one
+  // model that is not installed
 
 #ifdef HAVE_AI
   // the automatic selections head the catalogue (M2.1): a detection is
@@ -2246,9 +2332,11 @@ static void _new_mask_shape_items(GtkMenuShell *menu, dt_iop_module_t *target)
   // the raster masks, in the same catalogue: assigning one is choosing
   // a mask for the target, minus the drawing. only sources before the
   // target exist for the pipe, so only they appear -- and none, no
-  // section, like the missing ctrl lines: absence over noise
+  // section, like the missing ctrl lines: absence over noise. no section
+  // either for the library: a raster mask is wired INTO a module's
+  // blending, there is nothing to wire it into here
   GtkWidget *rsub = gtk_menu_new();
-  if(_raster_source_items(GTK_MENU_SHELL(rsub), target))
+  if(target && _raster_source_items(GTK_MENU_SHELL(rsub), target))
   {
     gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
     GtkWidget *ritem = gtk_menu_item_new_with_label(_("use a raster mask"));
@@ -2263,21 +2351,21 @@ static void _new_mask_shape_items(GtkMenuShell *menu, dt_iop_module_t *target)
 }
 
 #ifdef HAVE_AI
-// the object button's menu: the automatic selections and the clicked
-// session side by side -- the two behaviours the button stands for,
-// distinguished by their labels since an icon cannot say which one a
-// press means. same target resolution and the same refusal words as the
-// catalogue; the clicked entry rides _tree_add_shape, so every guard of
-// _start_creation applies unchanged
-static void _object_button_menu(dt_lib_module_t *self, GtkWidget *button)
+// the AI menu: the automatic selections and the clicked session side by
+// side -- the two behaviours the ✦ button stands for, distinguished by
+// their labels since an icon cannot say which one a press means. `target`
+// is where whatever is picked lands, NULL being the library; the entries
+// carry it exactly as the catalogue's do, and the clicked entry rides
+// _tree_add_shape, so every guard of _start_creation applies unchanged.
+//
+// the ✦ of a module's own blending panel opens this very menu through
+// dev->proxy.masks.object_menu, with that module for target: one menu, one
+// set of words, whichever of the two buttons was pressed
+static void _object_menu_popup(dt_lib_module_t *self,
+                               dt_iop_module_t *target,
+                               GtkWidget *anchor)
 {
-  dt_iop_module_t *target = _mask_default_target(self);
-  if(!target)
-  {
-    dt_control_log
-      (_("select a mask or open a module to choose where the shape goes"));
-    return;
-  }
+  if(!self) return;
 
   GtkMenuShell *menu = GTK_MENU_SHELL(gtk_menu_new());
   _detect_menu_items(menu, target);
@@ -2301,32 +2389,80 @@ static void _object_button_menu(dt_lib_module_t *self, GtkWidget *button)
   gtk_menu_shell_append(menu, item);
 
   // dt_gui_menu_popup takes the floating ref and drops it on "deactivate"
-  dt_gui_menu_popup(GTK_MENU(menu), button,
+  dt_gui_menu_popup(GTK_MENU(menu), anchor,
                     GDK_GRAVITY_SOUTH_WEST, GDK_GRAVITY_NORTH_WEST);
+}
+
+// the panel's own ✦: the menu above, for where the next shape goes
+static void _object_button_menu(dt_lib_module_t *self, GtkWidget *button)
+{
+  _object_menu_popup(self, _mask_default_target(self), button);
+}
+
+// ... and a module's ✦, through the proxy: the same menu for that module.
+// the module is checked the way every entry point of this panel checks the
+// module it is handed -- blend_gui.c only calls with its own live module,
+// but a proxy is a public door and the guard costs one list walk
+static void _object_menu_proxy(dt_lib_module_t *self,
+                               dt_iop_module_t *module,
+                               GtkWidget *anchor)
+{
+  if(!_mask_target_alive(module) || !_mask_target_ok(module))
+  {
+    // a module on a raster mask, reached through its shortcut: the
+    // blending panel hides the button, and _blendop_masks_modes_toggle()
+    // would refuse the switch to drawn masking. said, not swallowed
+    dt_control_log(_("this module cannot take a drawn shape"));
+    return;
+  }
+  _object_menu_popup(self, module, anchor);
 }
 #endif
 
-// picking a module from the "..." of the target row: it says where the next
-// shape goes, and stops there. taking the focus IS the answer, rule 2 of
-// _mask_default_target() being dev->gui_module, so the line re-reads what this
-// just set instead of being told twice.
+// picking an entry from the "..." of the target row: it says where the next
+// shape goes, and stops there. the pick is written down, rule 2 of
+// _mask_default_target(), and nothing else moves: no focus is taken -- the
+// focus used to BE the answer, and a module focused for other reasons then
+// became the target without a word -- and no form is dropped, since what a
+// selected row put on the photograph is not this line's to take away.
 //
-// two calls and not one. dt_iop_request_focus() notifies nothing when the
-// module asked for is the one already focused, and nothing either when nothing
-// was focused before -- it only resets the mask gui on the way OUT of a
-// module. and rule 1, the module of a selected mask row, outranks the focus:
-// left alone it would keep answering for this line and the menu would look
-// inert. the second call is the reset the first one makes when it does change
-// focus, so making it unconditionally settles all three cases the same way,
-// and leaves the canvas and the two lists agreeing as a focus change does
+// rule 1, the module of a selected mask row, still outranks the pick: with a
+// row selected the line would keep answering for that row and the menu would
+// look inert, so the selection is cleared through the two lists first --
+// _tree_selection_change() then rebuilds the canvas from an empty selection,
+// which is the one thing this does take off the photograph, and it is what
+// the photographer asked for by naming another destination. `module` NULL is
+// the library entry
 static void _target_set_cb(GtkMenuItem *item, gpointer module)
 {
+  dt_lib_module_t *self = darktable.develop->proxy.masks.module;
+  dt_lib_masks_t *d = self ? self->data : NULL;
+  if(!d) return;
+
   // a menu outlives nothing, but the pipe under it can be rebuilt while it is
   // open -- same guard _start_creation() puts on the module it is handed
-  if(!_mask_target_alive(module)) return;
+  if(module && !_mask_target_alive(module)) return;
 
-  dt_iop_request_focus(module);
-  dt_masks_change_form_gui(NULL);
+  d->pick_target = module;
+  d->pick_imgid = module ? darktable.develop->image_storage.id : NO_IMGID;
+
+  gboolean cleared = FALSE;
+  for(int v = 0; v < DT_MASKS_NVIEWS; v++)
+  {
+    GtkWidget *view = _masks_view(d, v);
+    GtkTreeSelection *sel =
+      view ? gtk_tree_view_get_selection(GTK_TREE_VIEW(view)) : NULL;
+    if(sel && gtk_tree_selection_count_selected_rows(sel) > 0)
+    {
+      cleared = TRUE;
+      gtk_tree_selection_unselect_all(sel);
+    }
+  }
+
+  // the unselect above refreshed the panel on its way through
+  // _tree_selection_change(); with nothing selected nothing did, and the
+  // target row has to be told
+  if(!cleared) _update_all_properties(d);
 }
 
 // send an existing shape to a module, wherever the gesture came from: the
@@ -2463,13 +2599,27 @@ static gboolean _new_mask_other_modules(GtkMenuShell *menu,
 static void _new_mask_target_header(GtkMenuShell *menu,
                                     const dt_iop_module_t *target)
 {
-  gchar *name = _mask_target_label(target);
-  gchar *header = g_strdup_printf(_("apply to: %s"), name);
-  g_free(name);
+  // the library is named the way the target row names it: the arrow and
+  // the same two words, so the menu and the line above the buttons cannot
+  // be read as two different places. the arrow already says "goes to", so
+  // it takes no "apply to" in front
+  gchar *header;
+  if(target)
+  {
+    gchar *name = _mask_target_label(target);
+    header = g_strdup_printf(_("apply to: %s"), name);
+    g_free(name);
+  }
+  else
+    header = g_strdup(_("→ shape library"));
 
   GtkWidget *item = gtk_menu_item_new_with_label(header);
   g_free(header);
 
+  // the modules, each carrying the shapes one level down. the library needs
+  // no entry of its own here: the shapes at the top level of this very menu
+  // are already the library's when the header says so, and with a module
+  // named, the "..." of the target row is where the library is picked
   GtkWidget *others = gtk_menu_new();
   if(_new_mask_other_modules(GTK_MENU_SHELL(others), target, FALSE,
                              INVALID_MASKID))
@@ -2495,19 +2645,10 @@ static void _new_mask_target_header(GtkMenuShell *menu,
 // menu built there would show a stale target after a mere change of focus
 static void _new_mask_clicked(GtkButton *button, dt_lib_module_t *self)
 {
+  // NULL is the library, and the menu opens on it like on any module: this
+  // is the button of the empty state, an image just opened, and the library
+  // is exactly where a shape drawn before any module was named belongs
   dt_iop_module_t *target = _mask_default_target(self);
-
-  // this is the button of the empty state, and a menu with nothing to click is
-  // what it must never open on. _mask_default_target() answers for any pipe
-  // holding a module that can take a drawn mask, so getting here means this
-  // one holds none: say it once and open nothing, the way darkroom.c and
-  // export.c refuse a style list with no style in it
-  if(!target)
-  {
-    dt_control_log
-      (_("select a mask or open a module to choose where the shape goes"));
-    return;
-  }
 
   GtkMenuShell *menu = GTK_MENU_SHELL(gtk_menu_new());
 
@@ -2523,27 +2664,45 @@ static void _new_mask_clicked(GtkButton *button, dt_lib_module_t *self)
                     GDK_GRAVITY_SOUTH_WEST, GDK_GRAVITY_NORTH_WEST);
 }
 
-// the "..." of the target row: send the next shape somewhere else. the modules
-// and only the modules, one level, no shapes -- the row of six sits right
-// under the line this hangs from, so an entry per shape here would be the same
-// six targets reached the slow way. picking a module is the whole gesture, and
-// the shape after it is one click on the row.
+// the "..." of the target row: send the next shape somewhere else. the
+// library first -- the one destination that is not a module, and the way
+// back from a picked module -- then the modules and only the modules, one
+// level, no shapes: the row of six sits right under the line this hangs
+// from, so an entry per shape here would be the same targets reached the
+// slow way. picking an entry is the whole gesture, and the shape after it is
+// one click on the row.
 //
-// built at click for the same reason the catalogue is: the answer moves with
-// the focus and nothing signals a focus change to this panel
+// the entry already on the line is greyed rather than left out -- the
+// convention _new_mask_other_modules() applies to an entry that cannot act,
+// the reason being readable in the menu itself. it leaves the modules out
+// instead, being shared with the catalogue, where the current one heads the
+// menu; here the header is the line above, so the list is complete.
+//
+// built at click for the same reason the catalogue is: the pipe moves, and
+// the module list is read from it
 static void _target_menu_clicked(GtkButton *button, dt_lib_module_t *self)
 {
   const dt_iop_module_t *target = _mask_default_target(self);
 
   GtkMenuShell *menu = GTK_MENU_SHELL(gtk_menu_new());
-  if(!_new_mask_other_modules(menu, target, TRUE, INVALID_MASKID))
+
+  GtkWidget *item =
+    gtk_menu_item_new_with_label(_("shape library (no module)"));
+  if(target)
+    g_signal_connect(item, "activate", G_CALLBACK(_target_set_cb), NULL);
+  else
+    gtk_widget_set_sensitive(item, FALSE);
+  gtk_menu_shell_append(menu, item);
+  gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+
+  if(!_new_mask_other_modules(menu, target, TRUE, INVALID_MASKID) && !target)
   {
-    // one module in the whole pipe can hold a drawn mask and it is the one
-    // already on the line: nothing to open. sink the floating reference first,
-    // as dt_gui_menu_popup would have
+    // the library is on the line and not one module of the pipe can hold a
+    // drawn mask: a menu with one greyed entry is nothing to open. sink the
+    // floating reference first, as dt_gui_menu_popup would have
     g_object_ref_sink(menu);
     g_object_unref(menu);
-    dt_control_log(_("no other module can take a shape"));
+    dt_control_log(_("no module of this image can take a shape"));
     return;
   }
 
@@ -3003,6 +3162,17 @@ static void _set_iter_name(dt_lib_masks_t *lm,
         else switch(dt_object_recipe_model_gap(&rpt->recipe, NULL))
         {
           case DT_OBJECT_RECIPE_MODELS_OK:
+            // the render path schedules the repair only when a module
+            // renders the shape: a shape sitting in the library, or in a
+            // group no module wears, is never asked for and would say
+            // "recomputing" forever. ask from here then -- the schedule
+            // is idempotent (anti-respawn table), and it declines while
+            // a finalisation legitimately holds the file absent. the row
+            // keeps its word: a recompute really is on its way
+            if(_shape_scope(form->formid, NULL, 0) != DT_MASKS_SCOPE_MODULE
+               && !dt_object_mask_finalize_running())
+              dt_object_recipe_schedule_recompute
+                (&rpt->recipe, darktable.develop->image_storage.id);
             link = _("file missing, recomputing");
             break;
           case DT_OBJECT_RECIPE_MODELS_INSTALLABLE:
@@ -3668,10 +3838,16 @@ static void _tree_cell_edited(GtkCellRendererText *cell,
   dt_dev_add_masks_history_item(darktable.develop, NULL, FALSE);
 }
 
-static void _tree_selection_change(GtkTreeSelection *selection, dt_lib_masks_t *self)
+// the body of the selection handler, apart from its guard: what a click on a
+// row does to the canvas -- the selected rows become the group on screen.
+// called by hand from gui_update() for a shape that landed on a row carrying
+// no module -- the library, or a group nothing owns -- while nothing was
+// being drawn: the row is selected there under the gui update guard, so the
+// handler itself stays silent, and such a shape has no module whose edit
+// mode would put it on the photograph instead
+static void _tree_selection_apply(GtkTreeSelection *selection,
+                                  dt_lib_masks_t *self)
 {
-  DT_GUARD_GUI_UPDATE();
-
   // gtk_tree_selection_get_tree_view() is the getter: no side table needed
   GtkWidget *view = GTK_WIDGET(gtk_tree_selection_get_tree_view(selection));
   const int nb = gtk_tree_selection_count_selected_rows(selection);
@@ -3766,6 +3942,13 @@ static void _tree_selection_change(GtkTreeSelection *selection, dt_lib_masks_t *
   _update_all_properties(self);
 }
 
+static void _tree_selection_change(GtkTreeSelection *selection,
+                                   dt_lib_masks_t *self)
+{
+  DT_GUARD_GUI_UPDATE();
+  _tree_selection_apply(selection, self);
+}
+
 // number of modules that would actually lose the shape if it was deleted
 // from the mask manager. this walks exactly like dt_masks_form_remove()
 // does: same IOP_FLAGS_SUPPORTS_BLENDING filter, same two ways a module
@@ -3844,7 +4027,7 @@ static void _tree_raster_recompute(GtkMenuItem *item, gpointer user_data)
   if(!rpt || !dt_rf_recipe_valid(&rpt->recipe)) return;
   if(dt_object_recipe_schedule_recompute(&rpt->recipe,
                                          darktable.develop->image_storage.id))
-    dt_control_log(_("recomputing the precise mask file"));
+    dt_control_log(_("recomputing the mask file"));
   else
     // the stub of a build without AI declines, and so does a job system
     // gone away: either way nothing will be recomputed
@@ -5572,11 +5755,11 @@ static void _lib_masks_list_recurs(GtkTreeStore *treestore,
   const char *click_line = (form->type & DT_MASKS_GROUP)
     ? _("click to edit these shapes on the photograph")
     : (form->type & DT_MASKS_RASTER)
-      ? _("precise mask: this shape renders a raster mask file\n"
+      ? _("AI mask: this shape renders a mask file computed from the image\n"
           "it has no anchors to edit on the photograph; it combines,\n"
           "inverts and takes opacity like any other shape.\n"
-          "if its file is missing the row says so; a valid recipe\n"
-          "recomputes it, or right-click to ask again")
+          "if its file is missing the row says so; right-click to\n"
+          "recompute it")
       : _("click to edit this shape on the photograph");
   snprintf(str2, sizeof(str2), "%s%s%s",
            click_line, *state ? "\n\n" : "", state);
@@ -5993,13 +6176,40 @@ void gui_update(dt_lib_module_t *self)
         holder = view;
         lm->active_view = view;
 
+        // a shape that landed in the library has no module to show it: a
+        // module's shape comes back on screen through dt_masks_set_edit_mode
+        // on that module, a library shape only through its row. the select
+        // above ran under this update's guard, so the handler said nothing;
+        // this is the click on the row it stands for, provided the canvas is
+        // free -- a creation in flight is somebody's, and a run between two
+        // shapes (creation_continuous, see _creation_bar_update) is about to
+        // put its next form up and must not find it dropped from under it.
+        // the raster shape of an automatic selection is the case this exists
+        // for: nothing else ever puts it on the photograph. the same for a
+        // group nothing owns -- the paths of an automatic selection sent to
+        // no module -- which is a root row of the masks list carrying no
+        // module: TREE_MODULE says which rows have one, a module's own
+        // shapes carry it down to the leaves. before the id below on
+        // purpose: rebuilding the canvas clears the form gui, and the
+        // selected id with it
+        GList *rows = gtk_tree_selection_get_selected_rows(selection, NULL);
+        dt_iop_module_t *owner = NULL;
+        GtkTreeIter sel_iter;
+        if(rows && gtk_tree_model_get_iter(model, &sel_iter, rows->data))
+          _lib_masks_get_values(model, &sel_iter, &owner, NULL, NULL);
+
+        const dt_masks_form_gui_t *fg = darktable.develop->form_gui;
+        const gboolean busy = fg && (fg->creation || fg->creation_module
+                                     || fg->creation_continuous);
+        if(!owner && !busy)
+          _tree_selection_apply(selection, lm);
+
         // make the just-created shape the active one so the properties reflect
         // it, rather than the previously selected shape: mask_form_selected_id
         // is otherwise only set once a shape is clicked on the canvas.
         darktable.develop->mask_form_selected_id = lm->pending_selectid;
         _update_all_properties(lm);
 
-        GList *rows = gtk_tree_selection_get_selected_rows(selection, NULL);
         if(rows)
         {
           // a genuinely new shape: reveal its row
@@ -7133,6 +7343,8 @@ void gui_init(dt_lib_module_t *self)
       g_signal_connect(G_OBJECT(w), "value-changed",
                        G_CALLBACK(_property_changed), GINT_TO_POINTER(i));
     }
+    if(_masks_properties[i].tooltip)
+      gtk_widget_set_tooltip_text(w, _(_masks_properties[i].tooltip));
     d->property[i] = w;
     dt_gui_box_add(d->cs.container, w);
   }
@@ -7203,6 +7415,13 @@ void gui_init(dt_lib_module_t *self)
   darktable.develop->proxy.masks.list_update = _lib_masks_update_list;
   darktable.develop->proxy.masks.list_remove = _lib_masks_remove_item;
   darktable.develop->proxy.masks.selection_change = _lib_masks_selection_change;
+  // the AI menu, for the ✦ of every blending panel: one menu for both
+  // buttons, built here where the detectors and the session entry live
+#ifdef HAVE_AI
+  darktable.develop->proxy.masks.object_menu = _object_menu_proxy;
+#else
+  darktable.develop->proxy.masks.object_menu = NULL;
+#endif
 }
 
 void gui_cleanup(dt_lib_module_t *self)

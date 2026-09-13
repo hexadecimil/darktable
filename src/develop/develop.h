@@ -300,6 +300,15 @@ typedef struct dt_develop_t
       void (*selection_change)(struct dt_lib_module_t *self,
                                struct dt_iop_module_t *module,
                                const dt_mask_id_t selectid);
+      /* the AI selection menu of the mask manager (select subject,
+         select background, select by clicking), opened under `anchor`
+         with `module` as the target of whatever entry is picked. a
+         blending panel's own AI button goes through this so both
+         buttons open the very same menu; NULL when the panel is not
+         loaded, and the caller then falls back to its own behaviour */
+      void (*object_menu)(struct dt_lib_module_t *self,
+                          struct dt_iop_module_t *module,
+                          GtkWidget *anchor);
     } masks;
   } proxy;
 
