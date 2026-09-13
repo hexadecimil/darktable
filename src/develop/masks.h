@@ -305,7 +305,7 @@ typedef struct dt_masks_point_raster_t
 {
   uint32_t magic;      // DT_MASKS_RASTER_POINT_MAGIC
   uint32_t version;    // DT_MASKS_RASTER_POINT_VERSION
-  uint32_t flags;      // reserved, keep zeroed
+  uint32_t flags;      // DT_MASKS_RASTER_FLAG_*, zero for a plain file
   int32_t _pad;        // explicit, keep zeroed (the blob is hashed)
   char file[256];      // fallback leaf name when recipe.magic == 0
   dt_rf_recipe_t recipe;
@@ -313,6 +313,15 @@ typedef struct dt_masks_point_raster_t
 
 // 16 + 256 + 1072: any drift breaks every stored history of this type
 G_STATIC_ASSERT(sizeof(dt_masks_point_raster_t) == 1344);
+
+// the shape renders the COMPLEMENT of its file: a "background" is the
+// subject detection, same recipe and same content-addressed file, read
+// the other way round. carried by the shape itself and not by a group
+// member's DT_MASKS_STATE_INVERSE, so it holds in the shape library, in
+// every group the shape is later added to, and through a duplicate --
+// the member state stays available on top of it, as for any shape.
+// older blobs have the field zeroed: a plain file, unchanged
+#define DT_MASKS_RASTER_FLAG_INVERT (1u << 0)
 
 /** structure used to store pointers to the functions implementing operations on a mask shape */
 /** plus a few per-class descriptive data items */

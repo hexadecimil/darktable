@@ -537,7 +537,12 @@ static inline float _raster_sample(const _raster_cache_entry_t *const entry,
 //
 // no thresholding anywhere: the graded penumbra of the file is the
 // whole point of this shape, every value passes through as read
-static int _raster_get_mask_roi(const dt_iop_module_t *const restrict module,
+// the file as stored, into the roi: zeros plus the sampled bounding box.
+// the side the shape renders (DT_MASKS_RASTER_FLAG_INVERT) is applied by
+// the caller below, over the WHOLE buffer, so every early return of this
+// function -- empty file, shape outside the roi, nothing landed -- yields
+// the complement too: an inverted shape selecting all of the roi
+static int _raster_get_file_roi(const dt_iop_module_t *const restrict module,
                                 const dt_dev_pixelpipe_iop_t *const restrict piece,
                                 dt_masks_form_t *const form,
                                 const dt_iop_roi_t *const roi,
@@ -844,6 +849,29 @@ static int _raster_get_mask_roi(const dt_iop_module_t *const restrict module,
            "[masks %s] raster total render took %0.04f sec",
            form->name, dt_get_lap_time(&start1));
 
+  return 1;
+}
+
+static int _raster_get_mask_roi(const dt_iop_module_t *const restrict module,
+                                const dt_dev_pixelpipe_iop_t *const restrict piece,
+                                dt_masks_form_t *const form,
+                                const dt_iop_roi_t *const roi,
+                                float *const restrict buffer)
+{
+  const int ok = _raster_get_file_roi(module, piece, form, roi, buffer);
+  if(ok != 1) return ok;
+
+  // a "background": the complement of the file, everywhere in the roi.
+  // the file values are graded (matting, guided filter): 1 - alpha is
+  // exactly the alpha of what the detection left out
+  const dt_masks_point_raster_t *pt = _raster_point(form);
+  if(pt && (pt->flags & DT_MASKS_RASTER_FLAG_INVERT))
+  {
+    const size_t npixels = (size_t)roi->width * roi->height;
+    DT_OMP_FOR(if(npixels > 100000))
+    for(size_t k = 0; k < npixels; k++)
+      buffer[k] = 1.0f - buffer[k];
+  }
   return 1;
 }
 
@@ -1348,7 +1376,8 @@ static void _raster_set_form_name(dt_masks_form_t *const form,
   const dt_detector_t *detector =
     (pt && dt_rf_recipe_valid(&pt->recipe)
      && pt->recipe.prompt_kind != DT_RF_PROMPT_POINTS)
-    ? dt_detector_find(pt->recipe.prompt_kind, pt->recipe.class_bits)
+    ? dt_detector_find_side(pt->recipe.prompt_kind, pt->recipe.class_bits,
+                            (pt->flags & DT_MASKS_RASTER_FLAG_INVERT) != 0)
     : NULL;
   if(detector)
   {
@@ -1370,7 +1399,7 @@ static void _raster_set_form_name(dt_masks_form_t *const form,
                (int)label_nb);
   }
   else
-    snprintf(form->name, sizeof(form->name), _("precise mask #%d"),
+    snprintf(form->name, sizeof(form->name), _("object %d"),
              (int)nb);
 }
 

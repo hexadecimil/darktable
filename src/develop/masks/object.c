@@ -2369,9 +2369,9 @@ static gboolean _finalize_apply_idle(gpointer data)
      || !dev->form_gui)
   {
     if(a->vectorize)
-      dt_control_log(_("image changed, precise paths discarded"));
+      dt_control_log(_("image changed, the mask paths were discarded"));
     else
-      dt_control_log(_("precise raster mask saved (image changed, not applied)"));
+      dt_control_log(_("mask file saved (image changed, not applied)"));
     return G_SOURCE_REMOVE;
   }
 
@@ -2379,7 +2379,7 @@ static gboolean _finalize_apply_idle(gpointer data)
   // like with like, and covers the whole job lifetime (queue wait included)
   if(_compute_distort_hash(dev) != a->distort_hash)
   {
-    dt_control_log(_("image geometry changed while the precise mask was"
+    dt_control_log(_("image geometry changed while the mask was"
                      " computed, result discarded"));
     return G_SOURCE_REMOVE;
   }
@@ -2488,7 +2488,7 @@ static gboolean _finalize_apply_idle(gpointer data)
         |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
       dt_dev_add_masks_history_item(dev, target, TRUE);
       if(target->gui_data) dt_iop_gui_update(target);
-      dt_control_log(_("precise paths applied to %s"), target->name());
+      dt_control_log(_("mask paths applied to %s"), target->name());
       // entering edit mode clears any form_gui in creation -- if the user
       // started a new mask session while the job ran, leave their session
       // alone, the group is attached and committed either way
@@ -2500,8 +2500,19 @@ static gboolean _finalize_apply_idle(gpointer data)
     }
     else
     {
+      // no module asked for it: the group stands on its own, linked to no
+      // module, the way the mask manager files every shape drawn for no
+      // module. the history item rebuilds the manager's lists; the
+      // selection then lands on the new row once the rebuild has run,
+      // which is what puts the paths on the photograph -- nothing else
+      // would, there being no module whose edit mode could show them.
+      // a group is a mask row and not a library shape, so the way to a
+      // module is the one every group has: "add existing shape" on the
+      // mask that should take it, and the toast says so
       dt_dev_add_masks_history_item(dev, NULL, TRUE);
-      dt_control_log(_("precise paths created"));
+      dt_dev_masks_selection_change(dev, NULL, grp->formid);
+      dt_control_log(_("mask paths created, linked to no module"
+                       " (a mask's 'add existing shape' takes them)"));
     }
 
     g_list_free(a->forms);   // cells only: ownership moved to dev->forms
@@ -2523,11 +2534,18 @@ static gboolean _finalize_apply_idle(gpointer data)
   if(!pt)
   {
     dt_masks_free_form(rform);
-    dt_control_log(_("precise raster mask saved (out of memory)"));
+    dt_control_log(_("mask file saved (out of memory)"));
     return G_SOURCE_REMOVE;
   }
   pt->magic = DT_MASKS_RASTER_POINT_MAGIC;
   pt->version = DT_MASKS_RASTER_POINT_VERSION;
+  // a "background" is the subject detection read the other way round:
+  // same recipe, same content-addressed file, the complement rendered.
+  // on the shape itself, so it stays a background in the shape library,
+  // in any group it is later added to and through a duplicate -- and the
+  // name derivation reads the flag, so the row says so too
+  if(a->detector && a->detector->invert)
+    pt->flags |= DT_MASKS_RASTER_FLAG_INVERT;
   if(a->has_recipe)
     pt->recipe = a->recipe;  // content-addressed reference
   else
@@ -2558,30 +2576,13 @@ static gboolean _finalize_apply_idle(gpointer data)
   // unattached then, exactly as with no target at all
   if(target && !target->blend_params) target = NULL;
 
-  // registers the form (unique name "precise mask #n"), appends it to
-  // dev->forms, creates or joins the module's blend group with the armed
-  // or default operator and the conf opacity, and commits the masks
-  // history -- the one type-agnostic door every created shape goes
-  // through. gui NULL: the target's gui is updated explicitly below
+  // registers the form (named from its recipe: "subject", "background",
+  // or "object #n" for a clicked session), appends it to dev->forms,
+  // creates or joins the module's blend group with the armed or default
+  // operator and the conf opacity, and commits the masks history -- the
+  // one type-agnostic door every created shape goes through. gui NULL:
+  // the target's gui is updated explicitly below
   dt_masks_gui_form_save_creation(dev, target, rform, NULL);
-
-  // an inverted detection reads as what it selects: the raster form is
-  // the subject file (recipe and name derivation unchanged), but the
-  // panel row says "background", numbered like the others
-  if(a->detector && a->detector->invert)
-  {
-    const char *label = _(a->detector->label);
-    int nb = 0;
-    for(GList *l = dev->forms; l; l = g_list_next(l))
-    {
-      const dt_masks_form_t *f = l->data;
-      if(f != rform && g_str_has_prefix(f->name, label)) nb++;
-    }
-    if(nb == 0)
-      g_strlcpy(rform->name, label, sizeof(rform->name));
-    else
-      snprintf(rform->name, sizeof(rform->name), "%s %d", label, nb + 1);
-  }
 
   if(target && target->blend_params)
   {
@@ -2591,31 +2592,13 @@ static gboolean _finalize_apply_idle(gpointer data)
     // rasterfile module, and exclusivity is what this gesture ends
     target->blend_params->mask_mode
       |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
-    // a "background" detection is the subject detection with its group
-    // member inverted: same recipe, same file, the complement selected.
-    // the state lives on the member the save above just created, so it
-    // is found through the module's group rather than assumed
-    if(a->detector && a->detector->invert)
-    {
-      dt_masks_form_t *mgrp
-        = dt_masks_get_from_id(dev, target->blend_params->mask_id);
-      for(GList *l = mgrp ? mgrp->points : NULL; l; l = g_list_next(l))
-      {
-        dt_masks_point_group_t *fpt = l->data;
-        if(fpt->formid == rform->formid)
-        {
-          fpt->state |= DT_MASKS_STATE_INVERSE;
-          break;
-        }
-      }
-    }
     dt_dev_add_masks_history_item(dev, target, TRUE);
     if(target->gui_data) dt_iop_gui_update(target);
     if(a->detector)
       dt_control_log(_("'%s' applied to %s"),
                      _(a->detector->label), target->name());
     else
-      dt_control_log(_("precise mask applied to %s"), target->name());
+      dt_control_log(_("object mask applied to %s"), target->name());
     // entering edit mode clears any form_gui in creation -- if the user
     // started a new mask session while the job ran, leave their session
     // alone, the shape is attached and committed either way
@@ -2626,11 +2609,22 @@ static gboolean _finalize_apply_idle(gpointer data)
     }
   }
   else if(a->detector)
-    dt_control_log(_("'%s' mask created"), _(a->detector->label));
+    dt_control_log(_("'%s' added to the shape library, right-click it to"
+                     " add it to a module"), _(a->detector->label));
   else
-    dt_control_log(_("precise mask created"));
+    dt_control_log(_("object mask added to the shape library, right-click it to"
+                     " add it to a module"));
 
   dt_dev_masks_list_change(dev);
+
+  // no module asked for it: the raster shape sits in the shape library on
+  // its own, and only its row can put it on the photograph -- a module's
+  // shape comes back through that module's edit mode, this one has none.
+  // the selection is filed as pending by the manager, the list_change
+  // above having only queued the rebuild, and applied when the row exists
+  if(!target)
+    dt_dev_masks_selection_change(dev, NULL, rform->formid);
+
   dt_dev_reprocess_all(dev);
   dt_control_queue_redraw_center();
   return G_SOURCE_REMOVE;
@@ -2735,8 +2729,8 @@ static gboolean _finalize_keep_going(void *p)
   dt_job_t *job = p;
   const _finalize_job_t *j = job ? dt_control_job_get_params(job) : NULL;
   return _job_step(job, (j && j->vectorize)
-                        ? _("computing precise paths...")
-                        : _("computing precise raster mask..."));
+                        ? _("tracing the mask paths...")
+                        : _("refining the mask at full resolution..."));
 }
 
 // the stage is off unless an operator is actually there to run it. an
@@ -3038,7 +3032,7 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
   {
     dt_print(DT_DEBUG_AI, "[object mask] finalise: cannot get the image buffer");
     if(interactive)
-      dt_control_log(_("precise mask: cannot get the image buffer"));
+      dt_control_log(_("AI mask: cannot get the image buffer"));
     goto cleanup;
   }
 
@@ -3047,7 +3041,7 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
   {
     dt_print(DT_DEBUG_AI, "[object mask] finalise: cannot init the render pipe");
     if(interactive)
-      dt_control_log(_("precise mask: cannot init the render pipe"));
+      dt_control_log(_("AI mask: cannot init the render pipe"));
     goto cleanup;
   }
   pipe_ready = TRUE;
@@ -3131,7 +3125,7 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
     {
       dt_print(DT_DEBUG_AI, "[object mask] finalise: native render failed");
       if(interactive)
-        dt_control_log(_("precise mask: native render failed"));
+        dt_control_log(_("AI mask: native render failed"));
       goto cleanup;
     }
 
@@ -3144,7 +3138,7 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
     {
       dt_print(DT_DEBUG_AI, "[object mask] finalise: out of memory");
       if(interactive)
-        dt_control_log(_("precise mask: out of memory"));
+        dt_control_log(_("AI mask: out of memory"));
       goto cleanup;
     }
 
@@ -3273,7 +3267,7 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
     {
       dt_print(DT_DEBUG_AI, "[object mask] finalise: band filter failed");
       if(interactive)
-        dt_control_log(_("precise mask: band filter failed"));
+        dt_control_log(_("AI mask: band filter failed"));
       goto cleanup;
     }
 
@@ -3300,7 +3294,7 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
         dt_print(DT_DEBUG_AI,
                  "[object mask] finalise: out of memory for the matting stage");
         if(interactive)
-          dt_control_log(_("precise mask: out of memory for the matting stage"));
+          dt_control_log(_("AI mask: out of memory for the matting stage"));
         goto cleanup;
       }
 
@@ -3320,7 +3314,7 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
           dt_print(DT_DEBUG_AI,
                    "[object mask] finalise: out of memory for the band view");
           if(interactive)
-            dt_control_log(_("precise mask: out of memory for the matting stage"));
+            dt_control_log(_("AI mask: out of memory for the matting stage"));
           goto cleanup;
         }
         DT_OMP_FOR()
@@ -3378,7 +3372,7 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
         // core's own FALSE (see the DT_OBJECT_RECIPE_RETRY branch of
         // dt_object_recipe_compute)
         if(interactive && !(keep_going && !keep_going(user)))
-          dt_control_log(_("precise mask: the matting stage failed"));
+          dt_control_log(_("AI mask: the matting stage failed"));
         goto cleanup;
       }
       wmatte = op->wmatte;
@@ -3449,7 +3443,7 @@ static float *_finalize_render_alpha(dt_develop_t *dev,
     {
       dt_print(DT_DEBUG_AI, "[object mask] finalise: out of memory");
       if(interactive)
-        dt_control_log(_("precise mask: out of memory"));
+        dt_control_log(_("AI mask: out of memory"));
       goto cleanup;
     }
     for(int y = 0; y < gny; y++)
@@ -3568,7 +3562,7 @@ static int32_t _finalize_job_run(dt_job_t *job)
     float *inv = g_try_malloc((size_t)pw * ph * sizeof(float));
     if(!inv)
     {
-      dt_control_log(_("precise mask: out of memory"));
+      dt_control_log(_("AI mask: out of memory"));
       goto cleanup;
     }
     for(size_t k = 0; k < (size_t)pw * ph; k++)
@@ -3661,7 +3655,7 @@ static int32_t _finalize_job_run(dt_job_t *job)
              "%.3f%% soft, %.1fs)",
              outpath, pw, ph, mo, 100.0 * soft / ((double)pw * ph),
              dt_get_wtime() - t_start);
-    dt_control_log(_("precise raster mask saved (%.1f MB, %.1fs)"),
+    dt_control_log(_("mask file saved (%.1f MB, %.1fs)"),
                    mo, dt_get_wtime() - t_start);
 
     // hand over to the GUI thread to wire the mask into the pipeline
@@ -3680,7 +3674,7 @@ static int32_t _finalize_job_run(dt_job_t *job)
     ok = TRUE;
   }
   else
-    dt_control_log(_("failed to save the precise raster mask"));
+    dt_control_log(_("failed to save the mask file"));
 
 cleanup:
   g_free(outpath);
@@ -3698,7 +3692,7 @@ static gboolean _launch_native_finalize(_object_data_t *d,
 {
   if(!g_atomic_int_compare_and_exchange(&_finalize_running, 0, 1))
   {
-    dt_control_log(_("precise mask finalisation already running"));
+    dt_control_log(_("a mask is still being refined, try again in a moment"));
     return FALSE;
   }
 
@@ -3791,11 +3785,11 @@ static gboolean _launch_native_finalize(_object_data_t *d,
     return FALSE;
   }
   dt_control_job_set_params(job, j, _finalize_job_destroy);
-  dt_control_job_add_progress(job, _("precise mask finalisation"), TRUE);
+  dt_control_job_add_progress(job, _("AI mask refinement"), TRUE);
   // announce before queueing: a worker may pick the job up at once and
   // report a failure, and that report must not be overwritten by this
-  dt_control_log(vectorize ? _("computing precise paths...")
-                           : _("computing precise raster mask..."));
+  dt_control_log(vectorize ? _("tracing the mask paths...")
+                           : _("refining the mask at full resolution..."));
   dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
   return TRUE;
 }
@@ -5053,7 +5047,7 @@ static int32_t _detect_job_run(dt_job_t *job)
   // rather than write a file whose recipe describes another render
   if(!_recipe_set_matting(&recipe, &matte))
   {
-    dt_control_log(_("precise mask: the matting stage cannot be recorded"));
+    dt_control_log(_("AI mask: the matting stage cannot be recorded"));
     goto cleanup;
   }
 
@@ -5063,7 +5057,7 @@ static int32_t _detect_job_run(dt_job_t *job)
   buf_ready = TRUE;
   if(!buf.buf || !buf.width || !buf.height)
   {
-    dt_control_log(_("precise mask: cannot get the image buffer"));
+    dt_control_log(_("AI mask: cannot get the image buffer"));
     goto cleanup;
   }
   const int iw = dev.image_storage.width;
@@ -5071,7 +5065,7 @@ static int32_t _detect_job_run(dt_job_t *job)
   if(!dt_dev_pixelpipe_init_export(&pipe, iw, ih,
                                    IMAGEIO_RGB | IMAGEIO_INT8, FALSE))
   {
-    dt_control_log(_("precise mask: cannot init the render pipe"));
+    dt_control_log(_("AI mask: cannot init the render pipe"));
     goto cleanup;
   }
   pipe_ready = TRUE;
@@ -5086,7 +5080,7 @@ static int32_t _detect_job_run(dt_job_t *job)
                                   &pipe.processed_height);
   if(pipe.processed_width <= 0 || pipe.processed_height <= 0)
   {
-    dt_control_log(_("precise mask: cannot init the render pipe"));
+    dt_control_log(_("AI mask: cannot init the render pipe"));
     goto cleanup;
   }
 
@@ -5104,7 +5098,7 @@ static int32_t _detect_job_run(dt_job_t *job)
   }
   if(out_w < 8 || out_h < 8)
   {
-    dt_control_log(_("precise mask: cannot init the render pipe"));
+    dt_control_log(_("AI mask: cannot init the render pipe"));
     goto cleanup;
   }
   recipe.encode_w = out_w;
@@ -5149,7 +5143,7 @@ static int32_t _detect_job_run(dt_job_t *job)
   rgb = _replay_render_rgb8(&dev, &pipe, &recipe, out_w, out_h);
   if(!rgb)
   {
-    dt_control_log(_("precise mask: native render failed"));
+    dt_control_log(_("AI mask: native render failed"));
     goto cleanup;
   }
 
@@ -5165,7 +5159,7 @@ static int32_t _detect_job_run(dt_job_t *job)
   hint = g_try_malloc((size_t)out_w * out_h * sizeof(float));
   if(!hint)
   {
-    dt_control_log(_("precise mask: out of memory"));
+    dt_control_log(_("AI mask: out of memory"));
     goto cleanup;
   }
   if(!dt_detect_run(det, rgb, out_w, out_h, hint))
@@ -5229,7 +5223,7 @@ static int32_t _detect_job_run(dt_job_t *job)
 
   if(!_write_mask_png16_atomic(outpath, alpha_full, pw, ph))
   {
-    dt_control_log(_("failed to save the precise raster mask"));
+    dt_control_log(_("failed to save the mask file"));
     goto cleanup;
   }
   dt_print(DT_DEBUG_AI,

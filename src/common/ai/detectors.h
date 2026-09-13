@@ -55,9 +55,10 @@ typedef struct dt_detector_t
                        // connected component (the seed's, or the largest
                        // when no seed exists); FALSE: multi-component
                        // results are legitimate (a sky between branches)
-  gboolean invert;     // TRUE: the member joins its group INVERTED -- the
-                       // same detection, the same recipe and file, the
-                       // complement selected (Lightroom's "background")
+  gboolean invert;     // TRUE: the shape renders the COMPLEMENT of the
+                       // detection (DT_MASKS_RASTER_FLAG_INVERT on its
+                       // point) -- same recipe, same file, the other side
+                       // selected (Lightroom's "background")
 } dt_detector_t;
 
 static const dt_detector_t dt_detectors[] = {
@@ -68,6 +69,9 @@ static const dt_detector_t dt_detectors[] = {
 // resolve a recipe's (prompt_kind, class_bits) to its table row; NULL
 // when no detector matches -- the caller treats that as an unusable
 // recipe, never as "pick a default"
+// the row a recipe replays through: the task and the post-processing.
+// "subject" and "background" share one -- same detection, same file --
+// so this answers the first of the two, which is all a replay needs
 static inline const dt_detector_t *
 dt_detector_find(const int32_t prompt_kind, const int64_t class_bits)
 {
@@ -76,6 +80,23 @@ dt_detector_find(const int32_t prompt_kind, const int64_t class_bits)
        && dt_detectors[i].class_bits == class_bits)
       return &dt_detectors[i];
   return NULL;
+}
+
+// the row a shape is NAMED after: the same pair, but the side the shape
+// renders tells "subject" from "background" (DT_MASKS_RASTER_FLAG_INVERT
+// on the raster point). falls back to the replay row when no row of the
+// table renders that side, so a name is always found for a known pair
+static inline const dt_detector_t *
+dt_detector_find_side(const int32_t prompt_kind,
+                      const int64_t class_bits,
+                      const gboolean inverted)
+{
+  for(size_t i = 0; i < G_N_ELEMENTS(dt_detectors); i++)
+    if(dt_detectors[i].prompt_kind == prompt_kind
+       && dt_detectors[i].class_bits == class_bits
+       && dt_detectors[i].invert == inverted)
+      return &dt_detectors[i];
+  return dt_detector_find(prompt_kind, class_bits);
 }
 
 G_END_DECLS
