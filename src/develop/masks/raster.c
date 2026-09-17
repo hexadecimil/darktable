@@ -1400,7 +1400,7 @@ static void _raster_set_form_name(dt_masks_form_t *const form,
   const dt_masks_point_raster_t *pt = dt_masks_raster_point(form);
   const dt_detector_t *detector =
     (pt && dt_rf_recipe_valid(&pt->recipe)
-     && pt->recipe.prompt_kind != DT_RF_PROMPT_POINTS)
+     && dt_rf_prompt_detected(pt->recipe.prompt_kind))
     ? dt_detector_find_side(pt->recipe.prompt_kind, pt->recipe.class_bits,
                             (pt->flags & DT_MASKS_RASTER_FLAG_INVERT) != 0)
     : NULL;

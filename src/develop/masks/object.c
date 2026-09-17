@@ -5995,6 +5995,22 @@ static int32_t _detect_job_run(dt_job_t *job)
     }
     od.env = env;
     od.seg = seg;
+    // the box is a prompt only the SAM family reads (labels 2 and 3):
+    // with another active segmentation model the two corners are dropped
+    // from the prompts AND from the recipe, and the decode boundary moves
+    // back onto the last point -- what is recorded is exactly what runs
+    if(!dt_seg_supports_box(seg) && n1 >= 2
+       && pts[n1 - 2].label == 2 && pts[n1 - 1].label == 3)
+    {
+      memset(&recipe.points[n1 - 2], 0, 2 * sizeof(recipe.points[0]));
+      n1 -= 2;
+      recipe.n_points = n1;
+      recipe.points[n1 - 1].decode_after = 1;
+      recipe.points[n1 - 1].threshold = SKY_THRESHOLD;
+      dt_print(DT_DEBUG_AI,
+               "[object mask] sky: the segmentation model takes no box,"
+               " %d point(s) kept", n1);
+    }
     gboolean encoded = FALSE;
     if(dt_seg_disk_cache_load(seg, j->imgid, j->distort_hash))
     {
