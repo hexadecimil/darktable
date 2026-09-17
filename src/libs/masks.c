@@ -5105,15 +5105,83 @@ static gboolean _drop_shape(dt_lib_module_t *self,
   return TRUE;
 }
 
+// the instances of a module that can take a shape, top of the panel down:
+// dev->iop is in pipe order, and the panel is stacked from its end
+static GList *_mask_target_instances(const dt_iop_module_t *module)
+{
+  GList *instances = NULL;
+  for(const GList *l = g_list_last(darktable.develop->iop);
+      l;
+      l = g_list_previous(l))
+  {
+    dt_iop_module_t *m = l->data;
+    if(dt_iop_module_is(m, module->op) && m->iop_order != INT_MAX
+       && _mask_target_ok(m))
+      instances = g_list_append(instances, m);
+  }
+  return instances;
+}
+
+// the wait answered: the shape goes to `module`, or to a new instance of
+// it. the wait is over before anything is written: the new instance and
+// the add both rebuild the lists, and a rebuild finding the shape still
+// waiting would call it off under us. the panel stays as it is until the
+// module is open: _panel_drag_end() opens it last, so it is the one the
+// panel scrolls to
+static void _pending_shape_land(dt_lib_module_t *self,
+                                dt_iop_module_t *module,
+                                const gboolean fresh)
+{
+  dt_lib_masks_t *lm = self->data;
+  const dt_mask_id_t formid = lm->pending_formid;
+  _pending_shape_clear(lm);
+
+  if(fresh)
+  {
+    dt_iop_module_t *copy = dt_iop_gui_duplicate(module, FALSE);
+    if(copy) module = copy;
+  }
+
+  if(_shape_land(lm, module, formid))
+    lm->drop_module = module;
+  _panel_drag_end(lm);
+  // the search box may still hold the keyboard, from the name typed into
+  // it: the module has the focus now, the keys go back to the darkroom
+  gtk_widget_grab_focus(dt_ui_center(darktable.gui->ui));
+  dt_control_queue_redraw_center();
+}
+
+// an entry of the menu _pending_shape_take() puts up: an instance, or --
+// "new" set -- a new instance of the module the entry carries. the wait
+// can have ended under the open menu (image changed, escape), and the
+// module can be gone: then the pick is nothing
+static void _pending_menu_pick(GtkMenuItem *item, dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
+  dt_iop_module_t *module = g_object_get_data(G_OBJECT(item), "module");
+  const gboolean fresh =
+    GPOINTER_TO_INT(g_object_get_data(G_OBJECT(item), "new")) != 0;
+  if(!dt_is_valid_maskid(lm->pending_formid)
+     || lm->pending_imgid != darktable.develop->image_storage.id
+     || !dt_masks_get_from_id(darktable.develop, lm->pending_formid))
+    return;
+  if(!_mask_target_alive(module) || !_mask_target_ok(module))
+  {
+    dt_control_log(_("this module cannot take a drawn shape"));
+    return;
+  }
+  _pending_shape_land(self, module, fresh);
+}
+
 // a module named for the shape waiting since the "create" zone: clicked in
 // the list, or -- `module` NULL, enter in the search box -- the first one
-// on screen that can take a shape. a module whose mask already holds
-// shapes gets a new instance, default parameters, and the shape goes
-// there: "create" is the word on the zone. TRUE whenever a shape was
-// waiting: the gesture is answered, and the caller does nothing more with
-// it. a refusal says why and leaves the shape waiting -- the wrong name
-// typed is retyped, a header that cannot take it opens nothing, the
-// banner still says what to do
+// on screen that can take a shape. the shape goes to it when it is the
+// only instance and holds no mask; otherwise a menu offers its instances
+// and a new one, see below. TRUE whenever a shape was waiting: the
+// gesture is answered, and the caller does nothing more with it. a
+// refusal says why and leaves the shape waiting -- the wrong name typed
+// is retyped, a header that cannot take it opens nothing, the banner
+// still says what to do
 static gboolean _pending_shape_take(dt_lib_module_t *self,
                                     dt_iop_module_t *module)
 {
@@ -5158,23 +5226,49 @@ static gboolean _pending_shape_take(dt_lib_module_t *self,
     return TRUE;
   }
 
-  // the wait is over before anything is written: the new instance and the
-  // add both rebuild the lists, and a rebuild finding the shape still
-  // waiting would call it off under us. the panel stays as it is until
-  // the module is open: _panel_drag_end() opens it last, so it is the one
-  // the panel scrolls to
-  _pending_shape_clear(lm);
-
-  if(_mask_target_shapes(module) > 0)
+  // one instance, no mask yet: nothing to choose, the shape goes there.
+  // otherwise the choice is the photographer's -- the instances of that
+  // module, each with what its mask holds, and a new one -- from a menu
+  // under the header, the wait going on until an entry is picked or the
+  // menu dismissed. the named instance alone, a click on its header or
+  // the first one on screen, is a hint and not an answer: the same name
+  // stands over every instance, and the one already carrying a mask is
+  // the one a new mask must not be poured into unasked
+  GList *instances = _mask_target_instances(module);
+  if(!g_list_next(instances) && _mask_target_shapes(module) == 0)
   {
-    dt_iop_module_t *copy = dt_iop_gui_duplicate(module, FALSE);
-    if(copy) module = copy;
+    g_list_free(instances);
+    _pending_shape_land(self, module, FALSE);
+    return TRUE;
   }
 
-  if(_shape_land(lm, module, formid))
-    lm->drop_module = module;
-  _panel_drag_end(lm);
-  dt_control_queue_redraw_center();
+  GtkMenuShell *menu = GTK_MENU_SHELL(gtk_menu_new());
+  for(const GList *l = instances; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *m = l->data;
+    gchar *label = _mask_target_label(m);
+    GtkWidget *item = gtk_menu_item_new_with_label(label);
+    g_free(label);
+    g_object_set_data(G_OBJECT(item), "module", m);
+    g_signal_connect(item, "activate", G_CALLBACK(_pending_menu_pick), self);
+    gtk_menu_shell_append(menu, item);
+  }
+  gtk_menu_shell_append(menu, gtk_separator_menu_item_new());
+  gchar *label = g_strdup_printf(_("new instance of %s"),
+                                 dt_iop_get_localized_name(module->op));
+  GtkWidget *item = gtk_menu_item_new_with_label(label);
+  g_free(label);
+  g_object_set_data(G_OBJECT(item), "module", module);
+  g_object_set_data(G_OBJECT(item), "new", GINT_TO_POINTER(1));
+  g_signal_connect(item, "activate", G_CALLBACK(_pending_menu_pick), self);
+  gtk_menu_shell_append(menu, item);
+  g_list_free(instances);
+
+  // under the named module's header, where the click was or where the
+  // typed name led; dt_gui_menu_popup falls back to the pointer without
+  // a widget
+  dt_gui_menu_popup(GTK_MENU(menu), module->header,
+                    GDK_GRAVITY_SOUTH_WEST, GDK_GRAVITY_NORTH_WEST);
   return TRUE;
 }
 

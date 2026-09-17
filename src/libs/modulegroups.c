@@ -252,9 +252,15 @@ static void _text_entry_changed_callback(GtkEntry *entry, dt_lib_module_t *self)
 static void _text_entry_activate_callback(GtkEntry *entry, dt_lib_module_t *self)
 {
   dt_develop_t *dev = darktable.develop;
-  if(dev->proxy.masks.module
-     && dev->proxy.masks.pending_shape_take
-     && dev->proxy.masks.pending_shape_take(dev->proxy.masks.module, NULL)
+  if(!dev->proxy.masks.module || !dev->proxy.masks.pending_shape_take
+     || !dt_dev_masks_pending_shape(dev))
+    return;
+  // "the first module on screen" has to be the first module the typed
+  // name leaves on screen: GtkSearchEntry reports a change some 150 ms
+  // after the keys, and enter right behind the name would find the list
+  // as the previous letters left it
+  _lib_modulegroups_update_iop_visibility(self);
+  if(dev->proxy.masks.pending_shape_take(dev->proxy.masks.module, NULL)
      && !dt_dev_masks_pending_shape(dev))
     gtk_widget_grab_focus(dt_ui_center(darktable.gui->ui));
 }
@@ -1249,6 +1255,10 @@ static void _lib_modulegroups_shape_pending(dt_lib_module_t *self,
   {
     gtk_entry_set_placeholder_text(GTK_ENTRY(d->text_entry),
                                    _("search modules by name or tag"));
+    // the name was typed for the wait: with the wait over, the list is
+    // the group's again and not the few modules the name left on it
+    if(gtk_widget_get_visible(d->shape_drop))
+      gtk_entry_set_text(GTK_ENTRY(d->text_entry), "");
     gtk_label_set_text(GTK_LABEL(d->shape_drop_label),
                        _("create: drop here, then type the module"));
     gtk_widget_hide(d->shape_drop_cancel);
@@ -3237,6 +3247,12 @@ void gui_init(dt_lib_module_t *self)
     gtk_widget_set_name(label, "modulegroups-shape-drop");
     gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
     gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+    // wrapped to the panel and never the other way round: a wrapping label
+    // still asks for its whole sentence as natural width, and the banner's
+    // is long enough to widen the panel under the pointer -- which cost
+    // the search box its focus, and the typed name went to the shortcuts
+    gtk_label_set_width_chars(GTK_LABEL(label), 8);
+    gtk_label_set_max_width_chars(GTK_LABEL(label), 24);
     d->shape_drop_label = label;
     d->shape_drop_cancel = gtk_button_new_with_label(_("cancel"));
     gtk_widget_set_tooltip_text(d->shape_drop_cancel,
