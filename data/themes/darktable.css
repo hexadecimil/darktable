@@ -1909,11 +1909,19 @@ treeview#delete-dialog:selected
 /* mask manager: the shape library stands on its own ground, one shade below the
    masks above it. derived from the theme's background, like the dialog just
    above, so light and dark follow -- and so do the four elegant-* themes, which
-   @import this file. :selected is deliberately not overridden: a selection must
-   keep looking like a selection here as it does everywhere else. */
+   @import this file. the id rule carries no state, so it would paint the
+   selected row too -- and an id outranks the theme's own :selected rule --
+   hence the second rule: a selection must keep looking like a selection
+   here as it does everywhere else. */
 treeview#masks-library
 {
   background-color: shade(@bg_color, 0.9);
+}
+
+treeview#masks-library:selected
+{
+  background-color: @field_selected_bg;
+  color: @field_selected_fg;
 }
 
 /* mask manager: the row a drag is about to drop on or between. since gtk

@@ -87,7 +87,7 @@
 // the recipe records these verbatim in fixed-size fields; a line that did
 // not fit would be silently truncated into another line's id
 G_STATIC_ASSERT(sizeof("vitmatte-b-912") <= DT_RF_RECIPE_MATTING_ID_LEN);
-G_STATIC_ASSERT(sizeof("1") <= DT_RF_RECIPE_MATTING_VERSION_LEN);
+G_STATIC_ASSERT(sizeof("2") <= DT_RF_RECIPE_MATTING_VERSION_LEN);
 
 // the registry task and the model installed under it. the directory name
 // IS the id, following every other model of this tree
@@ -108,7 +108,12 @@ static const float MATTE_STD[3] = { 0.5f, 0.5f, 0.5f };
 // the inner crop below can throw away the tile border the network resolves
 // worst, and the step is what is left of the tile after it
 #define MATTE_OVERLAP 64
-#define MATTE_CROP 32
+// the reference crops 32 px and keeps the tiles disjoint: every pixel is
+// one tile's answer and the seams show as steps in the alpha. 16 px are
+// cropped here, and the 32 px the neighbouring tiles then share are
+// fused with a linear ramp (MATTE_RAMP): the seam becomes a crossfade
+#define MATTE_CROP 16
+#define MATTE_RAMP (MATTE_OVERLAP - 2 * MATTE_CROP)
 
 typedef struct dt_matte_context_t
 {
@@ -397,9 +402,9 @@ static gboolean _vitmatte_run(const dt_matte_op_t *const op,
   // the fused accumulator IS `out`: the operator owns that plane for the
   // duration of the call, so accumulating in place saves a full-region
   // buffer on a stage that already holds the guide, two hints, the trimap
-  // and a summed-area table. the weight is a per-pixel tile COUNT, and a
-  // byte holds it -- a pixel lies under at most four tiles of a 2D grid
-  uint8_t *weight = g_try_malloc0(npix);
+  // and a summed-area table. the weight is the sum of the ramps of the
+  // tiles that covered a pixel -- a float plane, one crossfade per seam
+  float *weight = g_try_malloc0(npix * sizeof(float));
   int *tile_xs = g_try_malloc(sizeof(int) * (size_t)(W / MAX(step, 1) + 2));
   int *tile_ys = g_try_malloc(sizeof(int) * (size_t)(H / MAX(step, 1) + 2));
   if(!weight || !tile_xs || !tile_ys)
@@ -518,7 +523,7 @@ restart:
         // outright rather than looping.
         restarted = TRUE;
         memset(out, 0, npix * sizeof(float));
-        memset(weight, 0, npix);
+        memset(weight, 0, npix * sizeof(float));
         done = skipped = 0;
         dt_print(DT_DEBUG_AI,
                  "[matte] %s: restarting the region on the CPU, the tiles"
@@ -539,16 +544,27 @@ restart:
       if(x1 != W) ax1 -= MATTE_CROP;
       if(y1 != H) ay1 -= MATTE_CROP;
 
+      // the ramp: 0 at the kept edge, 1 MATTE_RAMP pixels in, on the
+      // edges a neighbouring tile shares; an edge on the region's own
+      // border keeps full weight, nothing takes it over
+      const gboolean rl = x0 != 0, rt = y0 != 0, rr = x1 != W, rb = y1 != H;
       for(int y = ay0; y < ay1; y++)
       {
         const float *const src
           = ctx->o_alpha + (size_t)(py0 + y - ay0) * s + px0;
         float *const dst = out + (size_t)y * W;
-        uint8_t *const wgt = weight + (size_t)y * W;
+        float *const wgt = weight + (size_t)y * W;
+        float wy = 1.0f;
+        if(rt) wy = MIN(wy, (float)(y - ay0 + 1) / (float)MATTE_RAMP);
+        if(rb) wy = MIN(wy, (float)(ay1 - y) / (float)MATTE_RAMP);
         for(int x = ax0; x < ax1; x++)
         {
-          dst[x] += src[x - ax0];
-          if(wgt[x] < 255) wgt[x]++;
+          float w = wy;
+          if(rl) w = MIN(w, (float)(x - ax0 + 1) / (float)MATTE_RAMP);
+          if(rr) w = MIN(w, (float)(ax1 - x) / (float)MATTE_RAMP);
+          w = CLAMPF(w, 0.0f, 1.0f);
+          dst[x] += w * src[x - ax0];
+          wgt[x] += w;
         }
       }
     }
@@ -570,8 +586,8 @@ restart:
   DT_OMP_FOR()
   for(size_t k = 0; k < npix; k++)
   {
-    const float fused = (weight[k] > 0)
-                        ? out[k] / (float)weight[k]
+    const float fused = (weight[k] > 1e-6f)
+                        ? out[k] / weight[k]
                         : trimap[k];
     out[k] = (trimap[k] > 0.25f && trimap[k] < 0.75f)
              ? CLAMPF(fused, 0.0f, 1.0f)
@@ -598,7 +614,7 @@ const dt_matte_op_t dt_matte_op_vitmatte =
   // to name a content-addressed file, and one name may never cover two
   // renders. the model's own version is the registry's business and is
   // checked at load
-  .version = "1",
+  .version = "2",
   .task = TASK_MATTE,
   .model = MODEL_MATTE,
   .caps = DT_MATTE_NEEDS_TRIMAP | DT_MATTE_TILED | DT_MATTE_NEEDS_MODEL
