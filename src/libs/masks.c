@@ -291,6 +291,7 @@ typedef struct dt_lib_masks_t
   GtkTreeViewColumn *power_col;
   // and the show-mask column, hit-tested exactly like the two before it
   GtkTreeViewColumn *show_col;
+  GtkTreeViewColumn *lib_show_col;  // the library's eye, per shape
   // caption under the library, shown only when at least one shape is not
   // linked to a module: it names exactly the set the cleanup is about
   GtkWidget *lib_unlinked;
@@ -307,6 +308,7 @@ typedef struct dt_lib_masks_t
   // holding the space open under the message
   GtkWidget *masks_box, *lib_box;
   GtkWidget *lib_label;    // the "shape library" heading, above its list
+  GtkWidget *matting_box;  // the matting controls, above the properties section
   // the empty-state sentences, shown only while both lists are empty. two
   // widgets and not one box because M1 reads sentence, button, sentence and
   // the button between them is the one at the top of the panel
@@ -478,6 +480,7 @@ static void _empty_state_update(dt_lib_masks_t *lm)
   // M1 is a screen with one action on it, and with nothing to select the
   // section can say nothing but "no shapes selected"
   gtk_widget_set_visible(lm->cs.expander, !empty);
+  if(lm->matting_box) gtk_widget_set_visible(lm->matting_box, !empty);
 }
 
 const char *name(dt_lib_module_t *self)
@@ -3284,10 +3287,22 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   // has it cannot light a row. that is what makes the cell a radio -- at most
   // one row lit, because at most one module has the focus -- without this
   // panel having to enforce one
-  const gboolean show_on = show
+  gboolean show_on = show
     && live->enabled
     && dt_iop_has_focus(live)
     && (live->request_mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK);
+
+  // a shape row -- a library shape, a member of a mask -- carries the same
+  // eye, for the shape alone: it puts THIS shape on the photograph the way
+  // its library row does when clicked (outline and tint), and takes it
+  // off again. lit while the shape is the one visible on its own, which
+  // is what the click toggles (_tree_button_pressed_cb). a mask row keeps
+  // the module's own display above
+  const gboolean shape_eye = !show && !(form->type & DT_MASKS_GROUP);
+  if(shape_eye)
+    show_on = darktable.develop->form_visible == form
+              && darktable.develop->form_gui
+              && !darktable.develop->form_gui->creation;
 
   // the glyph is drawn exactly where the shape HAS an operator: inside a
   // group, past the base, with an operator bit set. that is the very test
@@ -3331,7 +3346,7 @@ static void _set_iter_name(dt_lib_masks_t *lm,
                      TREE_MODULE_OFF, moff,
                      TREE_MODULE_ON, !moff,
                      TREE_POWER, power,
-                     TREE_SHOW, show,
+                     TREE_SHOW, show || shape_eye,
                      TREE_SHOW_ON, show_on,
                      -1);
 
@@ -5199,7 +5214,8 @@ typedef enum dt_masks_op_hit_t
   DT_MASKS_OP_HIT_OPERATOR,  // an operator a click may change
   DT_MASKS_OP_HIT_POWER,     // the module switch of a mask row
   DT_MASKS_OP_HIT_SHOW,      // the show-mask cell of a mask row
-  DT_MASKS_OP_HIT_SHOW_OFF   // ... whose module is off: says so, not clickable
+  DT_MASKS_OP_HIT_SHOW_OFF,  // ... whose module is off: says so, not clickable
+  DT_MASKS_OP_HIT_SHOW_SHAPE // the eye of a shape row: this shape alone
 } dt_masks_op_hit_t;
 
 // the module a row's cell hands over, or nothing. `live` is the model column
@@ -5262,7 +5278,7 @@ static dt_masks_op_hit_t _op_cell_at_bin(dt_lib_masks_t *lm,
                                          dt_masks_state_t *state_out,
                                          dt_iop_module_t **module_out)
 {
-  if(!lm->op_col && !lm->power_col && !lm->show_col)
+  if(!lm->op_col && !lm->power_col && !lm->show_col && !lm->lib_show_col)
     return DT_MASKS_OP_HIT_NONE;
 
   GtkTreeView *tv = GTK_TREE_VIEW(view);
@@ -5310,10 +5326,24 @@ static dt_masks_op_hit_t _op_cell_at_bin(dt_lib_masks_t *lm,
       hit = DT_MASKS_OP_HIT_POWER;
     }
   }
-  else if(model && path && column == lm->show_col)
+  else if(model && path
+          && (column == lm->show_col || column == lm->lib_show_col))
   {
+    GtkTreeIter it;
+    gboolean has_eye = FALSE;
+    dt_mask_id_t fid = NO_MASKID;
+    if(gtk_tree_model_get_iter(model, &it, path))
+    {
+      gtk_tree_model_get(model, &it, TREE_SHOW, &has_eye, -1);
+      if(has_eye) _lib_masks_get_values(model, &it, NULL, NULL, &fid);
+    }
+    const dt_masks_form_t *f = dt_is_valid_maskid(fid)
+      ? dt_masks_get_from_id(darktable.develop, fid) : NULL;
     dt_iop_module_t *m = _row_cell_module(model, path, TREE_SHOW);
-    if(m)
+    if(has_eye && f && !(f->type & DT_MASKS_GROUP))
+      // the eye of a shape row: the shape alone, see _set_iter_name
+      hit = DT_MASKS_OP_HIT_SHOW_SHAPE;
+    else if(m)
     {
       if(module_out) *module_out = m;
       // a module that is switched off renders no blend, so its mask cannot be
@@ -5387,7 +5417,8 @@ static void _tree_motion_cb(GtkEventControllerMotion *controller,
   const dt_masks_op_hit_t hit = _op_cell_at_bin(lm, view, bx, by, NULL, NULL);
   const gboolean over = (hit == DT_MASKS_OP_HIT_OPERATOR)
                      || (hit == DT_MASKS_OP_HIT_POWER)
-                     || (hit == DT_MASKS_OP_HIT_SHOW);
+                     || (hit == DT_MASKS_OP_HIT_SHOW)
+                     || (hit == DT_MASKS_OP_HIT_SHOW_SHAPE);
   if(over == (gdk_window_get_cursor(bin) != NULL)) return;
 
   if(over)
@@ -5601,6 +5632,32 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
       dt_iop_set_mask_display
         (row_module,
          !(row_module->request_mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK));
+    }
+    else if(hit == DT_MASKS_OP_HIT_SHOW_SHAPE && mouse_path)
+    {
+      // the eye of a shape row: the row's own click, or its undoing, and
+      // the row's selection follows -- one lit eye, one selected row, one
+      // shape on the photograph. claimed, so the treeview's own gesture
+      // does not select the row back after the undoing
+      GtkTreeIter it;
+      dt_mask_id_t fid = NO_MASKID;
+      if(gtk_tree_model_get_iter(model, &it, mouse_path))
+        _lib_masks_get_values(model, &it, NULL, NULL, &fid);
+      const dt_masks_form_t *f = dt_is_valid_maskid(fid)
+        ? dt_masks_get_from_id(darktable.develop, fid) : NULL;
+      if(f && darktable.develop->form_visible == f)
+      {
+        gtk_tree_selection_unselect_all(selection);
+        dt_masks_change_form_gui(NULL);
+        dt_control_queue_redraw_center();
+      }
+      else if(f)
+      {
+        gtk_tree_selection_unselect_all(selection);
+        gtk_tree_selection_select_path(selection, mouse_path);
+      }
+      dt_dev_masks_list_update(darktable.develop);
+      dt_gui_claim(gesture);
     }
     // if click on a blank space, then deselect all
     else if(!on_row)
@@ -5857,6 +5914,10 @@ static gboolean _tree_query_tooltip(GtkWidget *widget,
     else if(hit == DT_MASKS_OP_HIT_SHOW_OFF)
       gtk_tooltip_set_text(tooltip,
                            _("switch the module on to see its mask"));
+    else if(hit == DT_MASKS_OP_HIT_SHOW_SHAPE)
+      gtk_tooltip_set_text(tooltip,
+                           _("see this shape alone over the photograph\n"
+                             "click again to take it off"));
 
     if(hit != DT_MASKS_OP_HIT_NONE)
     {
@@ -5865,6 +5926,9 @@ static gboolean _tree_query_tooltip(GtkWidget *widget,
       if(hit == DT_MASKS_OP_HIT_POWER) hit_col = lm->power_col;
       else if(hit == DT_MASKS_OP_HIT_SHOW
               || hit == DT_MASKS_OP_HIT_SHOW_OFF) hit_col = lm->show_col;
+      else if(hit == DT_MASKS_OP_HIT_SHOW_SHAPE)
+        hit_col = (tree_view == GTK_TREE_VIEW(lm->library))
+                  ? lm->lib_show_col : lm->show_col;
       gtk_tree_view_set_tooltip_cell(tree_view, tooltip, path,
                                      hit_col, NULL);
       gtk_tree_path_free(path);
@@ -7247,6 +7311,25 @@ static void _build_masks_view(dt_lib_module_t *self,
     gtk_tree_view_column_set_cell_data_func(d->show_col, renderer,
                                             _show_cell_data, NULL, NULL);
   }
+  else
+  {
+    // the library's eye: the same glyph, for the shape alone -- see the
+    // shape_eye of _set_iter_name and DT_MASKS_OP_HIT_SHOW_SHAPE
+    d->lib_show_col = gtk_tree_view_column_new();
+    gtk_tree_view_column_set_title(d->lib_show_col, "show shape");
+    // appended: at the right of the name, before the link words the
+    // caller packs last -- where the masks list draws its own eye
+    gtk_tree_view_append_column(GTK_TREE_VIEW(view), d->lib_show_col);
+    renderer = dtgtk_paint_cell_new(dtgtk_cairo_paint_showmask, 0, NULL);
+    g_object_set(renderer, "xpad", (guint)DT_PIXEL_APPLY_DPI(1), NULL);
+    dtgtk_paint_cell_set_active_color(DTGTK_PAINT_CELL(renderer),
+                                      "masks_row_on_fg");
+    gtk_tree_view_column_pack_start(d->lib_show_col, renderer, FALSE);
+    gtk_tree_view_column_add_attribute(d->lib_show_col, renderer,
+                                       "visible", TREE_SHOW);
+    gtk_tree_view_column_set_cell_data_func(d->lib_show_col, renderer,
+                                            _show_cell_data, NULL, NULL);
+  }
 
   // a row that reaches no module says so in words, on BOTH lists and for a
   // different row of each: in the library, what the badge could never say --
@@ -7316,6 +7399,17 @@ static void _build_masks_view(dt_lib_module_t *self,
     g_signal_connect(view, "drag-drop",
                      G_CALLBACK(_tree_drag_drop_cb), self);
   }
+}
+
+// the index of `child` among the box's children, for gtk_box_reorder_child
+static gint _child_position(GtkBox *box, GtkWidget *child)
+{
+  gint pos = 0;
+  GList *children = gtk_container_get_children(GTK_CONTAINER(box));
+  for(GList *l = children; l; l = g_list_next(l), pos++)
+    if(l->data == child) break;
+  g_list_free(children);
+  return pos;
 }
 
 void gui_init(dt_lib_module_t *self)
@@ -7737,7 +7831,28 @@ void gui_init(dt_lib_module_t *self)
     if(_masks_properties[i].tooltip)
       gtk_widget_set_tooltip_text(w, _(_masks_properties[i].tooltip));
     d->property[i] = w;
-    dt_gui_box_add(d->cs.container, w);
+    // the two matting controls change what the mask IS, not how it is
+    // drawn: they sit in the open, above the folding section, where a
+    // user who never unfolds "properties" still meets them. the same
+    // show/hide rule applies to them (_property_changed), only the box
+    // differs -- created on first use, packed right before the section
+    if(i == DT_MASKS_PROPERTY_MATTING || i == DT_MASKS_PROPERTY_MATTING_BAND)
+    {
+      if(!d->matting_box)
+      {
+        d->matting_box = dt_gui_vbox();
+        gtk_box_pack_start(GTK_BOX(self->widget), d->matting_box,
+                           FALSE, FALSE, 0);
+        gtk_box_reorder_child(GTK_BOX(self->widget), d->matting_box,
+                              _child_position(GTK_BOX(self->widget),
+                                              d->cs.expander));
+        gtk_widget_show(d->matting_box);
+        gtk_widget_set_no_show_all(d->matting_box, TRUE);
+      }
+      dt_gui_box_add(d->matting_box, w);
+    }
+    else
+      dt_gui_box_add(d->cs.container, w);
   }
 
   d->pressure = dt_gui_preferences_enum(DT_ACTION(self), "pressure_sensitivity");
