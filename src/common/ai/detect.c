@@ -66,6 +66,13 @@ struct dt_detect_context_t
   int side;             // attributes.input_sizes[0]
   gboolean letterbox;   // attributes.letterbox: keep aspect, pad with 0
   gboolean sigmoid;     // output_activation != "none": logits -> sigmoid
+  int crop_border;      // attributes.crop_border: rows and columns of
+                        // the network output discarded on each side
+                        // before the resample back (CLIPSeg's edge
+                        // roll-off); 0 = the whole map is trusted
+  int out_ndim;         // rank of the model's declared output: the
+                        // output tensor is bound with that rank, the
+                        // count is side x side either way
   float mean[3];
   float stdv[3];
 
@@ -158,6 +165,24 @@ dt_detect_context_t *dt_detect_load(dt_ai_environment_t *env,
   char *act = dt_ai_model_attribute_string(info, "output_activation");
   ctx->sigmoid = !act || strcmp(act, "none") != 0;
   g_free(act);
+
+  // the untrusted manifest again: a border that would eat the whole map
+  // is clamped to leave at least one usable row and column
+  ctx->crop_border
+    = CLAMP(dt_ai_model_attribute_int(info, "crop_border", 0), 0,
+            (side - 1) / 2);
+
+  // the family shares the element count (side x side) but not the rank
+  // of its output: BiRefNet emits [1,1,S,S], CLIPSeg [1,S,S]. the runtime
+  // verifies a pre-bound output against the model's declared shape, so
+  // the tensor must be bound with the rank the model declares; an
+  // undeclarable rank falls back to the 4-D convention, and the count
+  // check after the run stays the arbiter either way
+  {
+    int64_t shape[16];
+    const int ndim = dt_ai_get_output_shape(ai, 0, shape, 16);
+    ctx->out_ndim = (ndim == 2 || ndim == 3) ? ndim : 4;
+  }
 
   for(int c = 0; c < 3; c++)
   {
@@ -360,14 +385,25 @@ gboolean dt_detect_run(dt_detect_context_t *ctx,
            rgb_w, rgb_h, s, s, uw, uh);
 
   int64_t shape_img[4] = { 1, 3, s, s };
+  // the output bound at the model's own rank (see dt_detect_load): the
+  // trailing dimensions are the map, the leading ones are 1
   int64_t shape_1c[4] = { 1, 1, s, s };
+  const int out_ndim = ctx->out_ndim;
+  if(out_ndim == 3)
+  {
+    shape_1c[0] = 1; shape_1c[1] = s; shape_1c[2] = s;
+  }
+  else if(out_ndim == 2)
+  {
+    shape_1c[0] = s; shape_1c[1] = s;
+  }
   dt_ai_tensor_t input = {
     .data = (void *)ctx->t_image,
     .shape = shape_img, .ndim = 4, .type = DT_AI_FLOAT
   };
   dt_ai_tensor_t output = {
     .data = ctx->o_mask,
-    .shape = shape_1c, .ndim = 4, .type = DT_AI_FLOAT
+    .shape = shape_1c, .ndim = out_ndim, .type = DT_AI_FLOAT
   };
   if(dt_ai_run(ctx->ai_ctx, &input, 1, &output, 1) != 0)
   {
@@ -420,9 +456,19 @@ gboolean dt_detect_run(dt_detect_context_t *ctx,
   }
 
   // back onto the caller's grid: sample only the used area, the exact
-  // inverse of the mapping above (pixel-centre both ways)
-  const float fx_back = (float)uw / (float)rgb_w;
-  const float fy_back = (float)uh / (float)rgb_h;
+  // inverse of the mapping above (pixel-centre both ways). a manifest
+  // crop_border narrows the used area further: the outermost rows and
+  // columns of the map are dropped and the rest is stretched over the
+  // whole frame, so the frame edge reads the first TRUSTED row of the
+  // map, never the unreliable one -- zeroing the border instead would
+  // print a rim of "no detection" along a sky that reaches the top of
+  // the frame. the margin is a whole percent of the frame (4 of 352),
+  // the map's own resolution (22x22 patches) is far coarser than that
+  const int cb = MIN(ctx->crop_border, (MIN(uw, uh) - 1) / 2);
+  const int cw = uw - 2 * cb, ch = uh - 2 * cb;
+  const float *const inner = ctx->o_mask + (size_t)cb * s + cb;
+  const float fx_back = (float)cw / (float)rgb_w;
+  const float fy_back = (float)ch / (float)rgb_h;
 
   DT_OMP_FOR()
   for(int y = 0; y < rgb_h; y++)
@@ -432,8 +478,7 @@ gboolean dt_detect_run(dt_detect_context_t *ctx,
     for(int x = 0; x < rgb_w; x++)
     {
       const float sx = ((float)x + 0.5f) * fx_back - 0.5f;
-      out[x] = CLAMPF(_sample_1c(ctx->o_mask, s, uw, uh, sx, sy),
-                      0.0f, 1.0f);
+      out[x] = CLAMPF(_sample_1c(inner, s, cw, ch, sx, sy), 0.0f, 1.0f);
     }
   }
 

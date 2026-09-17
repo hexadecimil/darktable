@@ -46,7 +46,10 @@ gboolean dt_detect_available(const char *task);
  * input_sizes (square input side), letterbox (aspect-preserving pad vs
  * plain stretch), output_activation ("sigmoid" over logits, the family
  * default, or "none"), mean/std (normalisation statistics on the [0,1]
- * scale, ImageNet by default).
+ * scale, ImageNet by default), crop_border (rows and columns dropped
+ * on each side of the map before the resample back, 0 by default).
+ * The model output may be declared [1,1,S,S] or [1,S,S]: the rank is
+ * read from the session, the element count is what is checked.
  *
  * No provider restriction and no warmup inference: a detection is a
  * single call on a background job, so a CPU fallback is slow but blocks

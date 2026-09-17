@@ -62,6 +62,33 @@
 #define DT_RF_PROMPT_POINTS 0    // clicked prompts; points[] replay
 #define DT_RF_PROMPT_SUBJECT 1   // one-shot salient subject; no points
 #define DT_RF_PROMPT_SEMANTIC 2  // semantic classes (class_bits); no points
+// the sky selection: a detector's coarse map chose the prompts, the
+// interactive segmentation model drew the mask from them. the recipe is
+// a POINTS recipe in every mechanical respect -- seg_model is the
+// segmentation model, points[] are the derived prompts with their decode
+// boundaries, the replay is the clicked replay -- and a DETECTOR row for
+// everything the user sees (creation entry, form name). the map itself
+// is not recorded: it served once, to choose the points, and the points
+// alone regenerate the file
+#define DT_RF_PROMPT_SKY 3       // detector-derived prompts; points[] replay
+
+// the two families a prompt kind can belong to, each asked at its own
+// call sites. a kind may belong to both (SKY does), so neither is the
+// negation of the other -- test the one that names the question
+// the mask was drawn from points[]: the replay decodes the recorded
+// boundaries through the segmentation model named by seg_model, the
+// model gap and the rebind read seg_model as a "mask"-task model
+static inline gboolean dt_rf_prompt_replays_points(const int32_t kind)
+{
+  return kind == DT_RF_PROMPT_POINTS || kind == DT_RF_PROMPT_SKY;
+}
+
+// the mask was made by a detector row of dt_detectors[] (no click
+// session to reopen, the form takes the row's label)
+static inline gboolean dt_rf_prompt_detected(const int32_t kind)
+{
+  return kind != DT_RF_PROMPT_POINTS;
+}
 
 typedef struct dt_rf_recipe_point_t
 {
@@ -106,8 +133,8 @@ typedef struct dt_rf_recipe_t
   int32_t cleanup;
   float smoothing;
   float feather;
-  // prompt count: 1..DT_RF_RECIPE_MAX_POINTS when prompt_kind is POINTS,
-  // exactly 0 for the promptless kinds
+  // prompt count: 1..DT_RF_RECIPE_MAX_POINTS when prompt_kind replays
+  // points (POINTS, SKY), exactly 0 for the promptless kinds
   int32_t n_points;
   int32_t _pad0;         // explicit, keep zeroed
   dt_rf_recipe_point_t points[DT_RF_RECIPE_MAX_POINTS];
@@ -157,14 +184,14 @@ G_STATIC_ASSERT(G_STRUCT_OFFSET(dt_rf_recipe_t, matting_version)
 
 // a recipe is only acted upon when fully understood: an unknown version is
 // deliberately NOT valid, the embedding module then falls back to plain
-// path/file resolution without touching the recipe bytes. clicked recipes
-// carry their prompt points; promptless ones carry none -- a blob mixing
-// the two families describes no session anybody could have recorded. a
-// promptless kind IS an extension field in use, so the version contract
-// above applies: version EXT is mandatory for it, and a version-1 blob
-// claiming one marks a writer that forgot the bump -- refused here, so
-// the mistake surfaces on the new builds instead of silently degrading
-// on the version-1-only ones
+// path/file resolution without touching the recipe bytes. clicked and sky
+// recipes carry their prompt points; promptless ones carry none -- a blob
+// mixing the two families describes no session anybody could have
+// recorded. any kind but POINTS IS an extension field in use, so the
+// version contract above applies: version EXT is mandatory for it, and a
+// version-1 blob claiming one marks a writer that forgot the bump --
+// refused here, so the mistake surfaces on the new builds instead of
+// silently degrading on the version-1-only ones
 static inline gboolean dt_rf_recipe_valid(const dt_rf_recipe_t *r)
 {
   if(!r || r->magic != DT_RF_RECIPE_MAGIC)
@@ -174,6 +201,9 @@ static inline gboolean dt_rf_recipe_valid(const dt_rf_recipe_t *r)
     return FALSE;
   if(r->prompt_kind == DT_RF_PROMPT_POINTS)
     return r->n_points > 0 && r->n_points <= DT_RF_RECIPE_MAX_POINTS;
+  if(r->prompt_kind == DT_RF_PROMPT_SKY)
+    return r->version == DT_RF_RECIPE_VERSION_EXT
+           && r->n_points > 0 && r->n_points <= DT_RF_RECIPE_MAX_POINTS;
   return r->version == DT_RF_RECIPE_VERSION_EXT
          && (r->prompt_kind == DT_RF_PROMPT_SUBJECT
              || r->prompt_kind == DT_RF_PROMPT_SEMANTIC)

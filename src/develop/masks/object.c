@@ -62,6 +62,7 @@ typedef struct dt_iop_rasterfile_params_t
 #include <setjmp.h>
 #include "views/view.h"
 
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <string.h>
@@ -1008,22 +1009,28 @@ static gpointer _encode_thread_func(gpointer data)
 // (seed_x, seed_y), if the seed is outside any foreground region,
 // keep the largest component instead, operates in-place: non-selected
 // foreground pixels are zeroed
-// the promptless detectors' component filter: a "subject" is whatever the
+// the detectors' component filter: a "subject" is whatever the
 // salient-object network lit up, and a frame with two hikers, a couple or
 // a herd lights up several components of comparable size. keeping only
 // the largest (what the seeded filter falls back to without a seed) threw
 // the second person away -- measured on a two-hiker frame: two components
 // of 106k and 86k pixels on the encode grid, one kept. so every component
-// whose area reaches MIN_RATIO of the largest is a subject too; the rest
-// (specks, false positives at the frame edge) goes, as before. same
+// whose area reaches `ratio` of the reference is a subject too; the rest
+// (specks, false positives at the frame edge) goes, as before. the
+// reference is the largest component (`of_largest`, the subject's rule:
+// a second subject is comparable to the first) or the whole image area
+// (the sky's rule: a patch of sky between branches is kept whatever the
+// main sky measures, at 0.5 % of the frame a speck is not). the ratio
+// and the reference come from the detector's table row. same
 // 4-connected labelling as _keep_seed_component, kept separate on purpose:
 // the seeded rule is a contract of the clicked session and its recipes
 static void _keep_major_components(float *mask,
                                    const int w,
                                    const int h,
-                                   const float threshold)
+                                   const float threshold,
+                                   const float ratio,
+                                   const gboolean of_largest)
 {
-  const float MIN_RATIO = 0.05f;
   const int npix = w * h;
   int16_t *labels = g_try_malloc0((size_t)npix * sizeof(int16_t));
   int *stack = labels ? g_try_malloc((size_t)npix * sizeof(int)) : NULL;
@@ -1083,7 +1090,8 @@ static void _keep_major_components(float *mask,
 
   if(best_area > 0)
   {
-    const int min_area = (int)ceilf(MIN_RATIO * (float)best_area);
+    const int min_area
+      = (int)ceilf(ratio * (float)(of_largest ? best_area : npix));
     int kept = 0;
     for(int16_t l = 1; l <= n_labels; l++)
       if(areas[l] >= min_area) kept++;
@@ -1330,6 +1338,14 @@ struct _decode_job_t
   int n_prompt_points;
   int n_passes;
   int seed_x, seed_y;        // unclamped; clamped against the mask dims
+  // the component filter of the decoded mask. a clicked session (seed_x
+  // >= 0, cc_ratio 0) keeps the seed's component, the largest without a
+  // seed. a detector-driven decode has no seed and names its rule
+  // instead: cc_ratio > 0 keeps every component of at least that
+  // fraction of the image area (the sky's multi-component rule); cc_ratio
+  // < 0 keeps the raw decode, for a caller that reads the mask to derive
+  // its own corrections before the final decode
+  float cc_ratio;
   gboolean reset_prev_mask;  // snapshotted; see _launch_decode
   float threshold;
   gboolean do_crf;
@@ -1411,10 +1427,17 @@ static gpointer _decode_thread_func(gpointer data)
 
   if(mask)
   {
-    // remove disconnected blobs: keep only the component at the seed point
-    const int seed_x = CLAMP(job->seed_x, 0, mw - 1);
-    const int seed_y = CLAMP(job->seed_y, 0, mh - 1);
-    _keep_seed_component(mask, mw, mh, threshold, seed_x, seed_y);
+    // remove disconnected blobs: keep only the component at the seed
+    // point -- or, for a seedless detector-driven decode, the components
+    // its table row keeps (see cc_ratio), or nothing at all
+    if(job->seed_x >= 0 || job->cc_ratio == 0.0f)
+    {
+      const int seed_x = CLAMP(job->seed_x, 0, mw - 1);
+      const int seed_y = CLAMP(job->seed_y, 0, mh - 1);
+      _keep_seed_component(mask, mw, mh, threshold, seed_x, seed_y);
+    }
+    else if(job->cc_ratio > 0.0f)
+      _keep_major_components(mask, mw, mh, threshold, job->cc_ratio, FALSE);
 
     // optional DenseCRF edge refinement using the encoded RGB as guide
     if(job->do_crf)
@@ -3900,15 +3923,17 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
   if(!dt_rf_recipe_valid(recipe) || !dt_is_valid_imgid(imgid))
     return DT_OBJECT_RECIPE_FAILED;
 
-  // the two replay families part here: a clicked recipe replays its
-  // recorded decode boundaries through the segmentation stack, a
-  // promptless one replays a single detector inference. the detectors
-  // table is the single authority mapping the recorded prompt kind to a
-  // registry task and its post-processing; a pair it does not know is an
+  // the two replay families part here: a recipe with points replays its
+  // recorded decode boundaries through the segmentation stack -- the
+  // clicked selection, and the sky whose points a detector's map chose
+  // -- a promptless one replays a single detector inference. the
+  // detectors table is the single authority mapping a recorded detector
+  // kind to a registry task and its post-processing (for the sky, the
+  // component rule of its decodes); a pair it does not know is an
   // unusable recipe, not a "pick a default"
-  const gboolean promptless = recipe->prompt_kind != DT_RF_PROMPT_POINTS;
+  const gboolean promptless = !dt_rf_prompt_replays_points(recipe->prompt_kind);
   const dt_detector_t *detector = NULL;
-  if(promptless)
+  if(dt_rf_prompt_detected(recipe->prompt_kind))
   {
     detector = dt_detector_find(recipe->prompt_kind, recipe->class_bits);
     if(!detector)
@@ -3944,8 +3969,8 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
     return DT_OBJECT_RECIPE_FAILED;
   }
 
-  // the recorded decode boundaries drive the clicked replay; the last one
-  // produced the mask the finalisation worked from. a clicked recipe
+  // the recorded decode boundaries drive the points replay; the last one
+  // produced the mask the finalisation worked from. a points recipe
   // without any boundary defines no refinement chain and cannot be
   // replayed. stays -1 for a promptless recipe: the decode loop below
   // then never iterates
@@ -3969,8 +3994,9 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
   // failure on any deviation: it is retryable once the right models are
   // installed, and a mask-to-0 in the meantime beats silent divergence.
   // the seg_model slot of a promptless recipe carries the recorded
-  // DETECTOR -- the same pin applies unchanged, and the model gap
-  // diagnostic below stays its exact mirror for both families
+  // DETECTOR, that of a sky recipe the segmentation model its points
+  // were decoded with -- the same pin applies unchanged, and the model
+  // gap diagnostic below stays its exact mirror for every family
   const char *seg_ver = dt_ai_model_get_version(recipe->seg_model);
   if(g_strcmp0(seg_ver, recipe->seg_model_version) != 0)
   {
@@ -4363,17 +4389,22 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
       djob->points[k].y = enc_pts[k * 2 + 1];
       djob->points[k].label = (int)recipe->points[k].label;
     }
-    // seed for the connected-component filter: last positive point, as in
-    // _launch_decode
+    // the component filter: the seed of a clicked session is its last
+    // positive point, as in _launch_decode; a detector's points have no
+    // seed, its table row names the rule (the sky keeps every component
+    // above its floor)
     djob->seed_x = -1;
     djob->seed_y = -1;
-    for(int k = n_prompt - 1; k >= 0; k--)
-      if(recipe->points[k].label == 1)
-      {
-        djob->seed_x = (int)enc_pts[k * 2 + 0];
-        djob->seed_y = (int)enc_pts[k * 2 + 1];
-        break;
-      }
+    if(detector)
+      djob->cc_ratio = detector->cc_ratio;
+    else
+      for(int k = n_prompt - 1; k >= 0; k--)
+        if(recipe->points[k].label == 1)
+        {
+          djob->seed_x = (int)enc_pts[k * 2 + 0];
+          djob->seed_y = (int)enc_pts[k * 2 + 1];
+          break;
+        }
     djob->threshold = CLAMP(recipe->points[i].threshold, 0.3f, 0.9f);
     djob->do_crf = recipe->crf_enabled != 0;
     djob->crf_iter = CLAMP(recipe->crf_iterations, 1, 10);
@@ -4440,10 +4471,12 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
   const float thresh = CLAMP(recipe->threshold, 0.3f, 0.9f);
   const float margin = CLAMPF(recipe->ai_refine_margin, 0.0f, 0.5f);
   // the component filter of a single-object detection: no clicked seed
-  // exists, so the filter keeps the largest component. multi-component
-  // detectors (a sky between branches) skip it by their table row
+  // exists, so the filter keeps the largest component and its peers. a
+  // detector whose points were decoded above already had its row's rule
+  // applied inside the last decode
   if(promptless && detector->keep_seed)
-    _keep_major_components(hint, hint_w, hint_h, thresh);
+    _keep_major_components(hint, hint_w, hint_h, thresh,
+                           detector->cc_ratio, TRUE);
   dt_seg_point_t tl, br;
   if(!_compute_bbox(hint, hint_w, hint_h, thresh, margin, &tl, &br))
   {
@@ -4729,12 +4762,15 @@ _recipe_model_gap(const dt_rf_recipe_t *recipe,
       seg_gap = _model_gap_one(recipe->seg_model,
                                recipe->seg_model_version, ids);
 
-      // the promptless replay additionally resolves its detector row
-      // and loads BY ID with a task check and an input-side pin (the
-      // gates of dt_object_recipe_compute and dt_detect_load): registry
-      // and manifest properties, so OK must consult them too or it
-      // would promise a replay those gates refuse
-      if(recipe->prompt_kind != DT_RF_PROMPT_POINTS)
+      // a detector-made replay additionally resolves its detector row,
+      // and a promptless one loads BY ID with a task check and an
+      // input-side pin (the gates of dt_object_recipe_compute and
+      // dt_detect_load): registry and manifest properties, so OK must
+      // consult them too or it would promise a replay those gates
+      // refuse. a sky recipe loads no detector: its recorded model is
+      // the segmentation model and must serve the "mask" task, the one
+      // the points replay decodes through
+      if(dt_rf_prompt_detected(recipe->prompt_kind))
       {
         const dt_detector_t *detector
           = dt_detector_find(recipe->prompt_kind, recipe->class_bits);
@@ -4748,12 +4784,13 @@ _recipe_model_gap(const dt_rf_recipe_t *recipe,
           // replay then refuses the load and no download repairs it --
           // "redo with the current models" is the only repair, the
           // DRIFT_AHEAD offer (the refine active-check precedent)
+          const char *task = detector->via_points ? "mask" : detector->task;
           dt_ai_model_t *m = dt_ai_models_get_by_id(recipe->seg_model);
-          if(m && g_strcmp0(m->task, detector->task) != 0)
+          if(m && g_strcmp0(m->task, task) != 0)
             seg_gap = DT_OBJECT_RECIPE_MODELS_DRIFT_AHEAD;
           dt_ai_model_free(m);
 
-          if(seg_gap == DT_OBJECT_RECIPE_MODELS_OK)
+          if(seg_gap == DT_OBJECT_RECIPE_MODELS_OK && !detector->via_points)
           {
             // the input-side pin: a model repackaged locally at another
             // side under the same (id, version). only checkable once
@@ -4881,21 +4918,671 @@ dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing)
   return _recipe_model_gap(recipe, missing, NULL, NULL, NULL);
 }
 
+// ------------------------- sky prompt derivation ----------------------------
+//
+// the sky detector's map (CLIPSeg frozen on the word "sky", 352x352, ~22
+// patches across) is not a mask: its edges are 2-4x halos, a thin mast
+// or a wire vanishes in it, a pale horizon band drops below any
+// threshold. what it IS reliable about is where the sky certainly is
+// (p > 0.7) and certainly is not (p < 0.05). so the map chooses the
+// prompts and the interactive segmentation model draws the edge, exactly
+// as it does for a clicked selection -- with these prompts standing in
+// for the clicks. two decodes, both recorded in the recipe as decode
+// boundaries so the replay reproduces them from the points alone:
+//
+//  pass 1  positives: in each cell of a 3x3 grid whose map peak exceeds
+//          0.7, the pixel maximising (distance to the cell's p <= 0.7
+//          pixels) x p -- the centre of the cell's surely-sky zone, not
+//          its bare peak; topped up to 5 by farthest-point sampling
+//          among p > 0.7 when fewer cells qualify; 9 at most. negatives:
+//          as many as the positives (5 at least) among p < 0.05, taken
+//          in a band along the frontier of p > 0.4 (3 % of the long
+//          side, widened by 1.5x until it holds 50 candidates per
+//          point), farthest-point sampled with a bias toward the
+//          frontier. a box around p > 0.4 with a 2 % margin. the guard
+//          before anything: no pixel above 0.7 means no sky, no decode.
+//  pass 2  the first mask, read against the map: where it overflows onto
+//          p < 0.05 a negative at the centre of each such region, where
+//          it misses p > 0.5 a positive at the centre of each such
+//          region (regions of at least 0.05 % of the frame, largest
+//          first, 9 of each at most, fewer when the recipe is short of
+//          room). one more decode with every point of pass 1 plus
+//          these, on the first decode's mask feedback. nothing to add
+//          means pass 1 stands.
+//
+// the thresholds and counts are those of the study that validated the
+// chain (16 of 18 skies covered, no leak, none of the 5 skyless frames
+// prompted): they are the contract of the recorded recipes, and a
+// change to any of them changes what a recipe replays to. every
+// function below is pure and deterministic -- ties resolve in raster
+// order, no sampling is random -- so a replay's pass-2 points are the
+// creation's, byte for byte
+
+#define SKY_P_POS 0.7f        // surely sky: positives, and the guard
+#define SKY_P_NEG 0.05f       // surely not sky: negatives, pass-2 overflow
+#define SKY_P_BOX 0.4f        // the sky's extent: box, negative frontier
+#define SKY_P_MISS 0.5f       // pass 2: map sky the first mask missed
+#define SKY_K_MIN 5           // positives topped up to this many
+#define SKY_K_MAX 9           // per label and per pass
+#define SKY_BAND 0.03f        // negative band, fraction of the long side
+#define SKY_BAND_GROW 1.5f
+#define SKY_BAND_PER_POINT 50 // candidates the band must hold, per point
+#define SKY_BOX_MARGIN 0.02f  // box margin, fraction of the box extent
+#define SKY_FIX_MIN_AREA 0.0005f // pass-2 region floor, fraction of the frame
+#define SKY_THRESHOLD 0.5f    // decode threshold of both passes
+
+// exact euclidean distance transform of a prepared plane: `d` holds
+// DT_DISTANCE_TRANSFORM_MAX on the pixels to measure and 0 on the
+// pixels they measure to (the darktable convention, in place). the
+// callers prepare the plane themselves because their inside tests
+// differ (p > thr, p <= thr, a component label) and because the shared
+// MASK mode tests `< clip`, one side off the study's strict comparisons
+static inline void _sky_edt(float *const d, const int w, const int h)
+{
+  dt_image_distance_transform(NULL, d, (size_t)w, (size_t)h, 0.0f,
+                              DT_DISTANCE_TRANSFORM_NONE);
+}
+
+// first raster-order argmax of `score` over the pixels where `cand` is
+// set; -1 when none is. the raster order IS the tie rule of every
+// selection below
+static int _sky_argmax(const float *const score,
+                       const uint8_t *const cand,
+                       const int npix)
+{
+  int best = -1;
+  float best_v = -FLT_MAX;
+  for(int i = 0; i < npix; i++)
+    if((!cand || cand[i]) && score[i] > best_v)
+    {
+      best_v = score[i];
+      best = i;
+    }
+  return best;
+}
+
+// farthest-point sampling among the candidate pixels, weighted: each
+// pick maximises (distance to every point already chosen) x (0.5 +
+// weight), so the points spread out AND sit where the map is sure. the
+// points already in pts[0..n) seed the distances (the grid positives,
+// which the sampling then complements); with no seed the first pick is
+// the best-weighted candidate. appends to pts until `k` points are
+// there or the candidates are exhausted; returns the new count
+// fold one chosen point into the candidates' squared distances
+static inline void _sky_fps_take(const int *const idx,
+                                 float *const dist,
+                                 const int n_cand,
+                                 const int w,
+                                 const dt_seg_point_t *const pt)
+{
+  for(int c = 0; c < n_cand; c++)
+  {
+    const float dx = (float)(idx[c] % w) - pt->x;
+    const float dy = (float)(idx[c] / w) - pt->y;
+    dist[c] = MIN(dist[c], dx * dx + dy * dy);
+  }
+}
+
+static int _sky_fps(const uint8_t *const cand,
+                    const float *const weight,
+                    const int w,
+                    const int h,
+                    const int k,
+                    const int label,
+                    dt_seg_point_t *const pts,
+                    int n)
+{
+  const int npix = w * h;
+  int n_cand = 0;
+  for(int i = 0; i < npix; i++) n_cand += cand[i] != 0;
+  if(n_cand == 0 || n >= k) return n;
+
+  int *idx = g_try_malloc((size_t)n_cand * sizeof(int));
+  float *dist = g_try_malloc((size_t)n_cand * sizeof(float));
+  if(!idx || !dist)
+  {
+    g_free(idx);
+    g_free(dist);
+    return n;
+  }
+  for(int i = 0, c = 0; i < npix; i++)
+    if(cand[i]) idx[c++] = i;
+
+  // squared distance of every candidate to the nearest chosen point
+  for(int c = 0; c < n_cand; c++) dist[c] = FLT_MAX;
+  for(int s = 0; s < n; s++) _sky_fps_take(idx, dist, n_cand, w, &pts[s]);
+
+  if(n == 0)
+  {
+    int best = 0;
+    for(int c = 1; c < n_cand; c++)
+      if(weight[idx[c]] > weight[idx[best]]) best = c;
+    pts[n].x = (float)(idx[best] % w);
+    pts[n].y = (float)(idx[best] / w);
+    pts[n].label = label;
+    _sky_fps_take(idx, dist, n_cand, w, &pts[n]);
+    n++;
+  }
+
+  while(n < k)
+  {
+    int best = -1;
+    float best_v = -FLT_MAX;
+    for(int c = 0; c < n_cand; c++)
+    {
+      const float v = sqrtf(dist[c]) * (0.5f + weight[idx[c]]);
+      if(v > best_v)
+      {
+        best_v = v;
+        best = c;
+      }
+    }
+    // the farthest candidate coincides with a chosen point: nothing left
+    if(best < 0 || dist[best] <= 0.0f) break;
+    pts[n].x = (float)(idx[best] % w);
+    pts[n].y = (float)(idx[best] / w);
+    pts[n].label = label;
+    _sky_fps_take(idx, dist, n_cand, w, &pts[n]);
+    n++;
+  }
+
+  g_free(dist);
+  g_free(idx);
+  return n;
+}
+
+// pass-1 positives: the grid centres, topped up by sampling. `pts` holds
+// at least SKY_K_MAX entries; returns the count, 0 only when the map
+// has no pixel above SKY_P_POS (the caller's guard has already said so)
+static int _sky_positives(const float *const p,
+                          const int w,
+                          const int h,
+                          dt_seg_point_t *const pts)
+{
+  int n = 0;
+  for(int gy = 0; gy < 3 && n < SKY_K_MAX; gy++)
+    for(int gx = 0; gx < 3 && n < SKY_K_MAX; gx++)
+    {
+      const int y0 = gy * h / 3, y1 = (gy + 1) * h / 3;
+      const int x0 = gx * w / 3, x1 = (gx + 1) * w / 3;
+      const int cw = x1 - x0, ch = y1 - y0;
+      if(cw <= 0 || ch <= 0) continue;
+
+      float cell_max = 0.0f;
+      for(int y = y0; y < y1; y++)
+        for(int x = x0; x < x1; x++)
+          cell_max = MAX(cell_max, p[(size_t)y * w + x]);
+      if(cell_max <= SKY_P_POS) continue;
+
+      // the distance transform of the cell's surely-sky zone, measured to
+      // the cell's own uncertain pixels only (a neighbouring cell's do
+      // not count, the study's per-cell transform). a cell that is sky
+      // through and through has none to measure to: its edge then stands
+      // in, which puts the point at the cell's centre of mass
+      float *d = dt_alloc_align_float((size_t)cw * ch);
+      if(!d) continue;
+      gboolean any_out = FALSE;
+      for(int y = 0; y < ch; y++)
+        for(int x = 0; x < cw; x++)
+        {
+          const gboolean in = p[(size_t)(y0 + y) * w + x0 + x] > SKY_P_POS;
+          d[(size_t)y * cw + x] = in ? DT_DISTANCE_TRANSFORM_MAX : 0.0f;
+          any_out |= !in;
+        }
+      if(!any_out)
+        for(int y = 0; y < ch; y++)
+          for(int x = 0; x < cw; x++)
+            if(x == 0 || y == 0 || x == cw - 1 || y == ch - 1)
+              d[(size_t)y * cw + x] = 0.0f;
+      _sky_edt(d, cw, ch);
+
+      int best = -1;
+      float best_v = -FLT_MAX;
+      for(int y = 0; y < ch; y++)
+        for(int x = 0; x < cw; x++)
+        {
+          const float v = d[(size_t)y * cw + x] * p[(size_t)(y0 + y) * w + x0 + x];
+          if(v > best_v)
+          {
+            best_v = v;
+            best = y * cw + x;
+          }
+        }
+      dt_free_align(d);
+      if(best < 0) continue;
+      pts[n].x = (float)(x0 + best % cw);
+      pts[n].y = (float)(y0 + best / cw);
+      pts[n].label = 1;
+      n++;
+    }
+
+  if(n < SKY_K_MIN)
+  {
+    const int npix = w * h;
+    uint8_t *cand = g_try_malloc((size_t)npix);
+    if(cand)
+    {
+      for(int i = 0; i < npix; i++) cand[i] = p[i] > SKY_P_POS;
+      n = _sky_fps(cand, p, w, h, SKY_K_MIN, 1, pts, n);
+      g_free(cand);
+    }
+  }
+  return MIN(n, SKY_K_MAX);
+}
+
+// pass-1 negatives: `k` points among p < SKY_P_NEG, close to the sky's
+// frontier. appended at pts[0..); returns the count
+static int _sky_negatives(const float *const p,
+                          const int w,
+                          const int h,
+                          const int k,
+                          dt_seg_point_t *const pts)
+{
+  const int npix = w * h;
+  float *dist = dt_alloc_align_float((size_t)npix);
+  uint8_t *cand = g_try_malloc((size_t)npix);
+  uint8_t *band_cand = g_try_malloc((size_t)npix);
+  float *weight = g_try_malloc((size_t)npix * sizeof(float));
+  int n = 0;
+  if(!dist || !cand || !band_cand || !weight) goto done;
+
+  // distance of every non-sky pixel to the nearest pixel of the sky's
+  // extent (p > SKY_P_BOX); zero on the sky itself
+  gboolean any_sky = FALSE;
+  for(int i = 0; i < npix; i++)
+  {
+    const gboolean sky = p[i] > SKY_P_BOX;
+    dist[i] = sky ? 0.0f : DT_DISTANCE_TRANSFORM_MAX;
+    any_sky |= sky;
+  }
+  if(any_sky)
+    _sky_edt(dist, w, h);
+  else
+    for(int i = 0; i < npix; i++) dist[i] = 0.0f;
+
+  int n_cand = 0;
+  for(int i = 0; i < npix; i++)
+  {
+    cand[i] = p[i] < SKY_P_NEG;
+    n_cand += cand[i];
+  }
+  if(n_cand == 0) goto done;
+
+  // the band along the frontier, widened until it holds enough
+  // candidates for a spread-out sample; the whole candidate set when
+  // even the widest band is empty
+  const float side = (float)MAX(w, h);
+  float band = SKY_BAND * side;
+  int in_band = 0;
+  for(;;)
+  {
+    in_band = 0;
+    for(int i = 0; i < npix; i++)
+    {
+      band_cand[i] = cand[i] && dist[i] <= band && dist[i] > 0.0f;
+      in_band += band_cand[i];
+    }
+    if(in_band >= SKY_BAND_PER_POINT * k || band > 2.0f * side) break;
+    band *= SKY_BAND_GROW;
+  }
+  if(in_band == 0) memcpy(band_cand, cand, (size_t)npix);
+
+  // closer to the frontier is better ranked
+  const float inv_band = 1.0f / MAX(band, 1.0f);
+  for(int i = 0; i < npix; i++)
+    weight[i] = 1.0f - CLAMPF(dist[i] * inv_band, 0.0f, 1.0f);
+
+  n = _sky_fps(band_cand, weight, w, h, k, 0, pts, 0);
+
+done:
+  g_free(weight);
+  g_free(band_cand);
+  g_free(cand);
+  dt_free_align(dist);
+  return n;
+}
+
+// the box around the sky's extent, with its margin, as the two corner
+// prompts the segmentation decoder takes. p > SKY_P_BOX is never empty
+// past the guard; the surely-sky set stands in should it ever be
+static void _sky_box(const float *const p,
+                     const int w,
+                     const int h,
+                     dt_seg_point_t *const tl,
+                     dt_seg_point_t *const br)
+{
+  int min_x = INT_MAX, min_y = INT_MAX, max_x = INT_MIN, max_y = INT_MIN;
+  for(int pass = 0; pass < 2 && max_x == INT_MIN; pass++)
+  {
+    const float thr = pass == 0 ? SKY_P_BOX : SKY_P_POS;
+    for(int y = 0; y < h; y++)
+      for(int x = 0; x < w; x++)
+        if(p[(size_t)y * w + x] > thr)
+        {
+          min_x = MIN(min_x, x);
+          min_y = MIN(min_y, y);
+          max_x = MAX(max_x, x);
+          max_y = MAX(max_y, y);
+        }
+  }
+  if(max_x == INT_MIN)
+  {
+    min_x = min_y = 0;
+    max_x = w - 1;
+    max_y = h - 1;
+  }
+  const float mx = SKY_BOX_MARGIN * (float)(max_x - min_x);
+  const float my = SKY_BOX_MARGIN * (float)(max_y - min_y);
+  tl->x = MAX(0.0f, (float)min_x - mx);
+  tl->y = MAX(0.0f, (float)min_y - my);
+  tl->label = 2;
+  br->x = MIN((float)(w - 1), (float)max_x + mx);
+  br->y = MIN((float)(h - 1), (float)max_y + my);
+  br->label = 3;
+}
+
+// the pass-1 prompts in encode-grid pixels: positives, then negatives,
+// then the box corners, in that order in `pts` (at least SKY_K_MAX * 2
+// + 2 entries). returns the count, 0 when the guard refuses (no pixel
+// of the map above SKY_P_POS: no sky in this frame)
+static int _sky_prompts_pass1(const float *const p,
+                              const int w,
+                              const int h,
+                              dt_seg_point_t *const pts,
+                              float *const max_p)
+{
+  const int npix = w * h;
+  float pmax = 0.0f;
+  for(int i = 0; i < npix; i++) pmax = MAX(pmax, p[i]);
+  if(max_p) *max_p = pmax;
+  if(pmax <= SKY_P_POS) return 0;
+
+  int n = _sky_positives(p, w, h, pts);
+  if(n == 0) return 0;
+  const int k = MAX(SKY_K_MIN, n);
+  n += _sky_negatives(p, w, h, k, pts + n);
+  _sky_box(p, w, h, &pts[n], &pts[n + 1]);
+  return n + 2;
+}
+
+// a region's centre for the pass-2 corrections: the peak of the region's
+// own distance transform (measured to everything outside it, the other
+// regions included -- the study's per-region transform). `d` is a
+// w x h scratch plane the caller owns
+static gboolean _sky_region_centre(const int32_t *const labels,
+                                   const int32_t label,
+                                   const int w,
+                                   const int h,
+                                   float *const d,
+                                   dt_seg_point_t *const out)
+{
+  const int npix = w * h;
+  for(int i = 0; i < npix; i++)
+    d[i] = labels[i] == label ? DT_DISTANCE_TRANSFORM_MAX : 0.0f;
+  _sky_edt(d, w, h);
+  const int best = _sky_argmax(d, NULL, npix);
+  if(best < 0) return FALSE;
+  out->x = (float)(best % w);
+  out->y = (float)(best / w);
+  return TRUE;
+}
+
+typedef struct _sky_region_t
+{
+  int32_t label;
+  int area;
+} _sky_region_t;
+
+// largest first; equal areas in labelling (raster) order
+static int _sky_region_cmp(const void *a, const void *b)
+{
+  const _sky_region_t *ra = a, *rb = b;
+  if(ra->area != rb->area) return rb->area - ra->area;
+  return ra->label - rb->label;
+}
+
+// one point at the centre of each 4-connected region of `bin`, largest
+// regions first, regions below `min_area` pixels and beyond `k` left
+// out. appended at pts[0..); returns the count
+static int _sky_region_centres(const uint8_t *const bin,
+                               const int w,
+                               const int h,
+                               const int min_area,
+                               const int k,
+                               const int label,
+                               dt_seg_point_t *const pts)
+{
+  const int npix = w * h;
+  int32_t *labels = g_try_malloc0((size_t)npix * sizeof(int32_t));
+  int *stack = g_try_malloc((size_t)npix * sizeof(int));
+  GArray *regions = g_array_new(FALSE, FALSE, sizeof(_sky_region_t));
+  float *d = dt_alloc_align_float((size_t)npix);
+  int n = 0;
+  if(!labels || !stack || !d) goto done;
+
+  for(int i = 0; i < npix; i++)
+  {
+    if(!bin[i] || labels[i] != 0) continue;
+    const int32_t lab = (int32_t)regions->len + 1;
+    int area = 0;
+    int sp = 0;
+    stack[sp++] = i;
+    labels[i] = lab;
+    while(sp > 0)
+    {
+      const int q = stack[--sp];
+      area++;
+      const int qx = q % w, qy = q / w;
+      if(qy > 0 && !labels[q - w] && bin[q - w])
+      {
+        labels[q - w] = lab;
+        stack[sp++] = q - w;
+      }
+      if(qy < h - 1 && !labels[q + w] && bin[q + w])
+      {
+        labels[q + w] = lab;
+        stack[sp++] = q + w;
+      }
+      if(qx > 0 && !labels[q - 1] && bin[q - 1])
+      {
+        labels[q - 1] = lab;
+        stack[sp++] = q - 1;
+      }
+      if(qx < w - 1 && !labels[q + 1] && bin[q + 1])
+      {
+        labels[q + 1] = lab;
+        stack[sp++] = q + 1;
+      }
+    }
+    const _sky_region_t r = { .label = lab, .area = area };
+    g_array_append_val(regions, r);
+  }
+  if(regions->len == 0) goto done;
+
+  g_array_sort(regions, _sky_region_cmp);
+  for(guint r = 0; r < regions->len && n < k; r++)
+  {
+    const _sky_region_t *reg = &g_array_index(regions, _sky_region_t, r);
+    if(reg->area < min_area) break;
+    if(_sky_region_centre(labels, reg->label, w, h, d, &pts[n]))
+    {
+      pts[n].label = label;
+      n++;
+    }
+  }
+
+done:
+  dt_free_align(d);
+  g_array_free(regions, TRUE);
+  g_free(stack);
+  g_free(labels);
+  return n;
+}
+
+// the pass-2 corrections from the first mask read against the map:
+// positives at the centres of the map sky the mask missed, negatives at
+// the centres of the mask's overflow onto surely-not-sky, largest
+// regions first. `room` caps the total (the recipe holds
+// DT_RF_RECIPE_MAX_POINTS in all): when both lists together exceed it
+// each keeps its largest regions, the room split evenly with the odd
+// slot to the positives -- the clouds the first pass tends to carve out
+// are what the positives repair. positives first in `pts`; returns the
+// count, 0 when pass 1 stands
+static int _sky_prompts_pass2(const float *const p,
+                              const float *const mask,
+                              const int w,
+                              const int h,
+                              const int room,
+                              dt_seg_point_t *const pts,
+                              int *const n_pos_out,
+                              int *const n_neg_out)
+{
+  const int npix = w * h;
+  const int min_area = (int)ceilf(SKY_FIX_MIN_AREA * (float)npix);
+  dt_seg_point_t neg[SKY_K_MAX], pos[SKY_K_MAX];
+  int n_neg = 0, n_pos = 0;
+  uint8_t *bin = g_try_malloc((size_t)npix);
+  if(!bin || room <= 0)
+  {
+    g_free(bin);
+    if(n_pos_out) *n_pos_out = 0;
+    if(n_neg_out) *n_neg_out = 0;
+    return 0;
+  }
+
+  for(int i = 0; i < npix; i++)
+    bin[i] = mask[i] > SKY_THRESHOLD && p[i] < SKY_P_NEG;
+  n_neg = _sky_region_centres(bin, w, h, min_area, SKY_K_MAX, 0, neg);
+  for(int i = 0; i < npix; i++)
+    bin[i] = p[i] > SKY_P_MISS && !(mask[i] > SKY_THRESHOLD);
+  n_pos = _sky_region_centres(bin, w, h, min_area, SKY_K_MAX, 1, pos);
+  g_free(bin);
+
+  if(n_pos + n_neg > room)
+  {
+    int keep_pos = MIN(n_pos, (room + 1) / 2);
+    const int keep_neg = MIN(n_neg, room - keep_pos);
+    keep_pos = MIN(n_pos, room - keep_neg);
+    dt_print(DT_DEBUG_AI,
+             "[object mask] sky: pass 2 wants %d+/%d- points, %d slots left"
+             " in the recipe, keeping %d+/%d-",
+             n_pos, n_neg, room, keep_pos, keep_neg);
+    n_pos = keep_pos;
+    n_neg = keep_neg;
+  }
+  for(int i = 0; i < n_pos; i++) pts[i] = pos[i];
+  for(int i = 0; i < n_neg; i++) pts[n_pos + i] = neg[i];
+  if(n_pos_out) *n_pos_out = n_pos;
+  if(n_neg_out) *n_neg_out = n_neg;
+  return n_pos + n_neg;
+}
+
+// record prompts pts[from..to) in the recipe and hand back, in the same
+// slots, the coordinates the REPLAY will decode with. the recipe stores
+// normalised input-space coordinates (encode pixels -> processed frame
+// -> backtransformed through the pipe -> divided by the pipe's input
+// dims, the inverse of the mapping in _recipe_compute_locked); the
+// float round trip is not exact to the last bit, so the creation
+// decodes with the round-tripped points rather than the derived ones --
+// the two decodes then see identical prompt tensors, and the file the
+// job writes is the one its recipe regenerates. FALSE on allocation
+// failure only
+static gboolean _sky_record_points(dt_develop_t *dev,
+                                   dt_dev_pixelpipe_t *pipe,
+                                   const int enc_w,
+                                   const int enc_h,
+                                   dt_seg_point_t *const pts,
+                                   const int from,
+                                   const int to,
+                                   dt_rf_recipe_t *recipe)
+{
+  const int n = to - from;
+  if(n <= 0) return TRUE;
+  float *buf = g_try_malloc((size_t)n * 2 * sizeof(float));
+  if(!buf) return FALSE;
+
+  const float psx = (float)enc_w / (float)pipe->processed_width;
+  const float psy = (float)enc_h / (float)pipe->processed_height;
+  for(int k = 0; k < n; k++)
+  {
+    buf[k * 2 + 0] = pts[from + k].x / psx;
+    buf[k * 2 + 1] = pts[from + k].y / psy;
+  }
+  dt_dev_distort_backtransform_plus(dev, pipe, 0.0,
+                                    DT_DEV_TRANSFORM_DIR_ALL, buf, n);
+  for(int k = 0; k < n; k++)
+  {
+    dt_rf_recipe_point_t *rp = &recipe->points[from + k];
+    rp->x = buf[k * 2 + 0] / (float)pipe->iwidth;
+    rp->y = buf[k * 2 + 1] / (float)pipe->iheight;
+    rp->label = (int32_t)pts[from + k].label;
+    rp->decode_after = 0;
+    rp->threshold = 0.0f;
+    rp->_pad = 0;
+    // the replay's own arithmetic, forward
+    buf[k * 2 + 0] = rp->x * (float)pipe->iwidth;
+    buf[k * 2 + 1] = rp->y * (float)pipe->iheight;
+  }
+  dt_dev_distort_transform_plus(dev, pipe, 0.0, DT_DEV_TRANSFORM_DIR_ALL,
+                                buf, n);
+  for(int k = 0; k < n; k++)
+  {
+    pts[from + k].x = buf[k * 2 + 0] * psx;
+    pts[from + k].y = buf[k * 2 + 1] * psy;
+  }
+  g_free(buf);
+  return TRUE;
+}
+
+// one decode of the sky chain through the very function the replay
+// calls at each recorded boundary, on the stand-in session data. the
+// job's mask is handed back (caller frees); NULL on failure
+static float *_sky_decode(_object_data_t *od,
+                          const dt_seg_point_t *const pts,
+                          const int n,
+                          const float cc_ratio,
+                          int *out_w,
+                          int *out_h)
+{
+  _decode_job_t *djob = g_malloc0(sizeof(_decode_job_t));
+  djob->d = od;
+  djob->n_prompt_points = n;
+  djob->reset_prev_mask = FALSE;
+  djob->n_passes = 1;
+  djob->points = g_new(dt_seg_point_t, n + djob->n_passes + 2);
+  memcpy(djob->points, pts, (size_t)n * sizeof(dt_seg_point_t));
+  djob->seed_x = -1;
+  djob->seed_y = -1;
+  djob->cc_ratio = cc_ratio;
+  djob->threshold = SKY_THRESHOLD;
+  djob->do_crf = FALSE;
+  djob->do_refine = FALSE;
+  _decode_thread_func(djob);
+  float *mask = djob->out_mask;
+  djob->out_mask = NULL;
+  if(out_w) *out_w = djob->out_w;
+  if(out_h) *out_h = djob->out_h;
+  _decode_job_free(djob);
+  return mask;
+}
+
 // ------------------------ one-shot detection job ----------------------------
 //
-// "select subject" and its future siblings: a promptless detection as a
+// "select subject", "select sky" and their siblings: a detection as a
 // cancellable background job, no interactive session, no canvas freeze.
-// the job is the promptless replay run FORWARD: it captures a fresh v2
-// promptless recipe from the live state, then performs exactly the steps
+// the job is the replay run FORWARD: it captures a fresh v2 recipe from
+// the live state, then performs exactly the steps
 // dt_object_recipe_compute performs on that recipe -- the same render
-// helper at the same dimensions, the same detector call, the same
-// seed-component filter and bbox, the same native finalisation core and
-// the same content-addressed file name -- so the recipe it stores really
-// regenerates the file it wrote. what the replay cannot do is added
-// around that spine: the model may be DOWNLOADED first (the catalogue's
-// download->detect chaining), the _job_step hook keeps one toast alive
-// for the whole 15-40 s, and the produced file is applied as a raster
-// shape through the finalisation apply idle, unchanged
+// helper at the same dimensions, the same detector call (or, for a row
+// that draws through the segmentation model, the same decodes at the
+// boundaries it records), the same component filter and bbox, the same
+// native finalisation core and the same content-addressed file name --
+// so the recipe it stores really regenerates the file it wrote. what the
+// replay cannot do is added around that spine: the model may be
+// DOWNLOADED first (the catalogue's download->detect chaining), the
+// _job_step hook keeps one toast alive for the whole 15-40 s, and the
+// produced file is applied as a raster shape through the finalisation
+// apply idle, unchanged
 
 typedef struct _detect_job_t
 {
@@ -4905,6 +5592,11 @@ typedef struct _detect_job_t
   // resolved at launch so the job is self-contained; the recipe records
   // this very id, and the version once the model is installed
   char model_id[DT_RF_RECIPE_MODEL_ID_LEN];
+  // a via_points row draws through the active model of the "mask" task,
+  // resolved at launch too (the state said it is installed): the recipe
+  // of such a job records THIS id as its segmentation model, the map
+  // model above never being replayed
+  char seg_model_id[DT_RF_RECIPE_MODEL_ID_LEN];
   gboolean download;              // model absent: download it first
   int render_size;                // raw render-cap preference at launch
   float threshold;                // session threshold at launch (clamped)
@@ -4958,6 +5650,31 @@ static void _detect_download_progress(const char *model_id,
 }
 #endif
 
+// derive the content-addressed target of a complete recipe under the
+// local mask root, exactly as the replay does from ITS loaded dev.
+// NULL when the folder cannot be created (reported by a toast)
+static gchar *_detect_outpath(const dt_develop_t *dev,
+                              const dt_rf_recipe_t *recipe)
+{
+  gchar *outpath = NULL;
+  const dt_image_t *img = &dev->image_storage;
+  gchar *base = g_path_get_basename(img->filename);
+  char *dot = g_strrstr(base, ".");
+  if(dot) *dot = '\0';
+  gchar *fname = dt_rasterfile_recipe_filename(recipe, base,
+                                               img->width, img->height,
+                                               img->exif_datetime_taken);
+  gchar *root = dt_rasterfile_mask_root();
+  if(g_mkdir_with_parents(root, 0755) == 0)
+    outpath = g_build_filename(root, fname, NULL);
+  else
+    dt_control_log(_("cannot create raster mask folder"));
+  g_free(root);
+  g_free(fname);
+  g_free(base);
+  return outpath;
+}
+
 static int32_t _detect_job_run(dt_job_t *job)
 {
   _detect_job_t *const j = dt_control_job_get_params(job);
@@ -4970,6 +5687,7 @@ static int32_t _detect_job_run(dt_job_t *job)
   gchar *outpath = NULL;
   dt_ai_environment_t *env = NULL;
   dt_detect_context_t *det = NULL;
+  dt_seg_context_t *seg = NULL;
   dt_dev_pixelpipe_t pipe;
   dt_mipmap_buffer_t buf;
   gboolean pipe_ready = FALSE, buf_ready = FALSE;
@@ -4977,6 +5695,12 @@ static int32_t _detect_job_run(dt_job_t *job)
   int pw = 0, ph = 0;
   dt_rf_recipe_t recipe;
   memset(&recipe, 0, sizeof(recipe));
+  // a via_points row: the detector's map chooses the prompts, the
+  // segmentation model draws the mask, and the recipe is a points recipe
+  // (the replay's clicked family) under the row's prompt kind
+  const gboolean via_points = j->detector->via_points;
+  // the stand-in session data the decodes run on, the replay's pattern
+  _object_data_t od = { 0 };
 
   const double t_start = dt_get_wtime();
 
@@ -5035,18 +5759,24 @@ static int32_t _detect_job_run(dt_job_t *job)
   // dt_conf lookup between the fingerprint and the pixels it names
   const _matte_session_t matte = _matte_session_from_conf();
 
-  // ---- the recipe: the promptless v2 blob a headless replay consumes.
-  // filled before the compute, so every parameter the compute reads below
-  // is a parameter the recipe records -- the two cannot diverge. the
-  // decode scalars and the refinement pin stay zero: no decode chain ran.
-  // this family is version EXT whatever the matting stage does, its
-  // prompt kind being an extension field in use by itself
+  // ---- the recipe: the v2 blob a headless replay consumes. filled
+  // before the compute, so every parameter the compute reads below is a
+  // parameter the recipe records -- the two cannot diverge. a promptless
+  // row records its detector as the segmentation model and no points:
+  // the decode scalars and the refinement pin stay zero, no decode chain
+  // ran. a via_points row records the SEGMENTATION model (the one its
+  // decodes run on), a single-pass decode chain, and its points once
+  // they are derived below -- the map model is not recorded, it chose
+  // the points and the points alone regenerate the file. either family
+  // is version EXT whatever the matting stage does, its prompt kind
+  // being an extension field in use by itself
   recipe.magic = DT_RF_RECIPE_MAGIC;
   recipe.version = DT_RF_RECIPE_VERSION_EXT;
   recipe.distort_hash = (int64_t)j->distort_hash;
-  g_strlcpy(recipe.seg_model, j->model_id, sizeof(recipe.seg_model));
   {
-    const char *v = dt_ai_model_get_version(j->model_id);
+    const char *seg_id = via_points ? j->seg_model_id : j->model_id;
+    g_strlcpy(recipe.seg_model, seg_id, sizeof(recipe.seg_model));
+    const char *v = dt_ai_model_get_version(seg_id);
     if(v)
       g_strlcpy(recipe.seg_model_version, v,
                 sizeof(recipe.seg_model_version));
@@ -5055,8 +5785,16 @@ static int32_t _detect_job_run(dt_job_t *job)
   recipe.threshold = j->threshold;
   recipe.ai_refine_margin = j->margin;
   recipe.prompt_kind = j->detector->prompt_kind;
-  recipe.detect_input = dt_detect_get_side(det);
+  // the input side pins a replayed detector's resample geometry; a
+  // via_points recipe replays no detector, so it records none
+  recipe.detect_input = via_points ? 0 : dt_detect_get_side(det);
   recipe.class_bits = j->detector->class_bits;
+  // the decode chain of the sky: one decoder pass per recorded boundary,
+  // no peak points or box of its own (the recorded points carry the
+  // box), no CRF, no per-decode contour refinement -- the native pass
+  // refines the contour, as for every detection
+  if(via_points)
+    recipe.refine_passes = 1;
   // the matting stage from the session hoisted above, through the same
   // single writer the clicked capture uses. an operator that cannot be
   // named in the recipe is a mask with no reproducible provenance, and
@@ -5121,40 +5859,27 @@ static int32_t _detect_job_run(dt_job_t *job)
   recipe.encode_w = out_w;
   recipe.encode_h = out_h;
 
-  // the recipe is complete: derive its content-addressed target, exactly
-  // as the replay does from ITS loaded dev
+  // a promptless recipe is complete here: derive its content-addressed
+  // target. a valid file under this fingerprint IS this detection,
+  // already made (same recipe, same image): skip the whole compute and
+  // just apply. no instance disabling here, unlike the replay -- so a
+  // REdetection of a subject whose file was purged renders under a
+  // history that may already apply the first one through its module.
+  // the replay's documented self-influence class (and raster forms sit
+  // outside its instance disabling anyway): assumed, not solved. a
+  // via_points recipe is only complete once its points are derived, so
+  // its target and this shortcut come after the decodes below
+  if(!via_points)
   {
-    const dt_image_t *img = &dev.image_storage;
-    gchar *base = g_path_get_basename(img->filename);
-    char *dot = g_strrstr(base, ".");
-    if(dot) *dot = '\0';
-    gchar *fname = dt_rasterfile_recipe_filename(&recipe, base,
-                                                 img->width, img->height,
-                                                 img->exif_datetime_taken);
-    gchar *root = dt_rasterfile_mask_root();
-    if(g_mkdir_with_parents(root, 0755) == 0)
-      outpath = g_build_filename(root, fname, NULL);
-    else
-      dt_control_log(_("cannot create raster mask folder"));
-    g_free(root);
-    g_free(fname);
-    g_free(base);
-  }
-  if(!outpath)
-    goto cleanup;
-
-  // a valid file under this fingerprint IS this detection, already made
-  // (same recipe, same image): skip the whole compute and just apply.
-  // no instance disabling here, unlike the replay -- so a REdetection of
-  // a subject whose file was purged renders under a history that may
-  // already apply the first one through its module. the replay's
-  // documented self-influence class (and raster forms sit outside its
-  // instance disabling anyway): assumed, not solved
-  if(g_file_test(outpath, G_FILE_TEST_EXISTS) && _mask_png_valid(outpath))
-  {
-    dt_print(DT_DEBUG_AI,
-             "[object mask] detect: %s already exists, reusing", outpath);
-    goto apply;
+    outpath = _detect_outpath(&dev, &recipe);
+    if(!outpath)
+      goto cleanup;
+    if(g_file_test(outpath, G_FILE_TEST_EXISTS) && _mask_png_valid(outpath))
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] detect: %s already exists, reusing", outpath);
+      goto apply;
+    }
   }
 
   rgb = _replay_render_rgb8(&dev, &pipe, &recipe, out_w, out_h);
@@ -5165,11 +5890,16 @@ static int32_t _detect_job_run(dt_job_t *job)
   }
 
   // this pipe served the encode render; the finalisation core below
-  // builds its own
-  dt_dev_pixelpipe_cleanup(&pipe);
-  pipe_ready = FALSE;
-  dt_mipmap_cache_release(&buf);
-  buf_ready = FALSE;
+  // builds its own. a via_points job keeps it a while longer: the
+  // prompts it derives are recorded in input space, backtransformed
+  // through this very pipe (the replay's pipe maps them forward again)
+  if(!via_points)
+  {
+    dt_dev_pixelpipe_cleanup(&pipe);
+    pipe_ready = FALSE;
+    dt_mipmap_cache_release(&buf);
+    buf_ready = FALSE;
+  }
 
   if(!_job_step(job, j->msg)) goto cleanup;
 
@@ -5184,25 +5914,237 @@ static int32_t _detect_job_run(dt_job_t *job)
     dt_control_log(_("the detection failed on this image"));
     goto cleanup;
   }
-  g_free(rgb);
-  rgb = NULL;
 
   // the detector is done; release it before the heavy native pass, which
-  // loads its own refinement context (the replay's VRAM rule)
+  // loads its own refinement context (the replay's VRAM rule) -- and,
+  // for a via_points row, before the segmentation model takes its place
+  // on the card. the environment stays for that model
   dt_detect_free(det);
   det = NULL;
-  dt_ai_env_destroy(env);
-  env = NULL;
+  if(!via_points)
+  {
+    g_free(rgb);
+    rgb = NULL;
+    dt_ai_env_destroy(env);
+    env = NULL;
+  }
 
   if(!_job_step(job, j->msg)) goto cleanup;
 
+  if(via_points)
+  {
+    // ---- the map chooses the prompts, the segmentation model draws ----
+    // (see the sky prompt derivation above for the rules and their
+    // origin). every prompt goes through the recipe and back before it
+    // is decoded, so the decodes here and the replay's see the same
+    // tensors
+    float *pmap = hint;   // the detector's map, the decodes' guide
+    hint = NULL;
+    float *mask1 = NULL;
+    dt_seg_point_t pts[DT_RF_RECIPE_MAX_POINTS];
+    float max_p = 0.0f;
+    const double t_sky = dt_get_wtime();
+    int n1 = _sky_prompts_pass1(pmap, out_w, out_h, pts, &max_p);
+    if(n1 == 0)
+    {
+      // the guard: no pixel of the map is surely sky. nothing is
+      // created, and the toast says why -- a silent empty mask would
+      // read as a failure of the tool
+      dt_print(DT_DEBUG_AI,
+               "[object mask] sky: map peak %.3f <= %.2f, no sky in this"
+               " frame (%.2fs)", max_p, SKY_P_POS, dt_get_wtime() - t_sky);
+      dt_control_log(_("no sky found in this image"));
+      g_free(pmap);
+      goto cleanup;
+    }
+    int n_pos1 = 0, n_neg1 = 0;
+    for(int k = 0; k < n1; k++)
+    {
+      n_pos1 += pts[k].label == 1;
+      n_neg1 += pts[k].label == 0;
+    }
+    dt_print(DT_DEBUG_AI,
+             "[object mask] sky: map peak %.3f, pass 1: %d positive(s),"
+             " %d negative(s), box (%.0f,%.0f)-(%.0f,%.0f) on %dx%d"
+             " (%.2fs)",
+             max_p, n_pos1, n_neg1, pts[n1 - 2].x, pts[n1 - 2].y,
+             pts[n1 - 1].x, pts[n1 - 1].y, out_w, out_h,
+             dt_get_wtime() - t_sky);
+    if(!_sky_record_points(&dev, &pipe, out_w, out_h, pts, 0, n1, &recipe))
+    {
+      dt_control_log(_("AI mask: out of memory"));
+      g_free(pmap);
+      goto cleanup;
+    }
+    recipe.n_points = n1;
+    recipe.points[n1 - 1].decode_after = 1;
+    recipe.points[n1 - 1].threshold = SKY_THRESHOLD;
+
+    // the segmentation model, loaded and encoded as the replay does it:
+    // the per-image embedding cache first (a clicked session on this
+    // image may have paid for it already, under the same key), else the
+    // render made above, with the CPU fallback and the cache populated
+    // for whoever comes next -- never clobbering a slot the interactive
+    // session owns
+    seg = dt_seg_load(env, j->seg_model_id);
+    if(!seg)
+    {
+      dt_control_log(_("cannot load the segmentation model"));
+      g_free(pmap);
+      goto cleanup;
+    }
+    od.env = env;
+    od.seg = seg;
+    gboolean encoded = FALSE;
+    if(dt_seg_disk_cache_load(seg, j->imgid, j->distort_hash))
+    {
+      int cw = 0, ch = 0;
+      dt_seg_get_encoded_rgb(seg, &cw, &ch);
+      if(cw == out_w && ch == out_h)
+      {
+        encoded = TRUE;
+        dt_print(DT_DEBUG_AI,
+                 "[object mask] sky: cached encoding %dx%d reused", cw, ch);
+      }
+      else
+      {
+        dt_print(DT_DEBUG_AI,
+                 "[object mask] sky: cached encoding is %dx%d, this render"
+                 " is %dx%d, re-encoding", cw, ch, out_w, out_h);
+        dt_seg_reset_encoding(seg);
+      }
+    }
+    if(!encoded)
+    {
+      const double t_enc = dt_get_wtime();
+      encoded = _seg_encode_cpu_fallback(&seg, env, j->seg_model_id,
+                                         rgb, out_w, out_h);
+      od.seg = seg;
+      if(encoded && !dt_seg_disk_cache_exists(j->imgid))
+        dt_seg_disk_cache_save(seg, j->imgid, j->distort_hash,
+                               rgb, out_w, out_h);
+      if(!encoded)
+      {
+        dt_control_log(_("AI mask: encoding failed"));
+        g_free(pmap);
+        goto cleanup;
+      }
+      dt_print(DT_DEBUG_AI, "[object mask] sky: encoded %dx%d (%.2fs)",
+               out_w, out_h, dt_get_wtime() - t_enc);
+    }
+    g_free(rgb);
+    rgb = NULL;
+
+    if(!_job_step(job, j->msg))
+    {
+      g_free(pmap);
+      goto cleanup;
+    }
+
+    // pass 1, read raw: the corrections are derived from the decode as
+    // the model drew it, the component rule applies to the final mask
+    int mw = 0, mh = 0;
+    mask1 = _sky_decode(&od, pts, n1, -1.0f, &mw, &mh);
+    if(!mask1 || mw != out_w || mh != out_h)
+    {
+      dt_control_log(_("the detection failed on this image"));
+      g_free(mask1);
+      g_free(pmap);
+      goto cleanup;
+    }
+
+    // pass 2: the corrections, decoded on top of pass 1 (the decoder
+    // feeds its previous low-resolution mask back on its own, as it
+    // does between two clicks); pass 1 stands when there is nothing to
+    // correct -- its mask under the row's component rule, which is what
+    // the replay's decode at that boundary yields
+    int n_pos2 = 0, n_neg2 = 0;
+    const int n2 = _sky_prompts_pass2(pmap, mask1, out_w, out_h,
+                                      DT_RF_RECIPE_MAX_POINTS - n1,
+                                      pts + n1, &n_pos2, &n_neg2);
+    g_free(pmap);
+    pmap = NULL;
+    if(n2 > 0)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] sky: pass 2: %d positive(s), %d negative(s)"
+               " added", n_pos2, n_neg2);
+      if(!_sky_record_points(&dev, &pipe, out_w, out_h, pts, n1, n1 + n2,
+                             &recipe))
+      {
+        dt_control_log(_("AI mask: out of memory"));
+        g_free(mask1);
+        goto cleanup;
+      }
+      recipe.n_points = n1 + n2;
+      recipe.points[n1 + n2 - 1].decode_after = 1;
+      recipe.points[n1 + n2 - 1].threshold = SKY_THRESHOLD;
+      g_free(mask1);
+      mask1 = NULL;
+      hint = _sky_decode(&od, pts, n1 + n2, j->detector->cc_ratio,
+                         &mw, &mh);
+      if(!hint || mw != out_w || mh != out_h)
+      {
+        dt_control_log(_("the detection failed on this image"));
+        goto cleanup;
+      }
+    }
+    else
+    {
+      dt_print(DT_DEBUG_AI, "[object mask] sky: pass 2: nothing to correct,"
+                            " pass 1 stands");
+      _keep_major_components(mask1, out_w, out_h, SKY_THRESHOLD,
+                             j->detector->cc_ratio, FALSE);
+      hint = mask1;
+      mask1 = NULL;
+    }
+    dt_print(DT_DEBUG_AI,
+             "[object mask] sky: %d point(s) recorded, %d decode(s)"
+             " (%.2fs)", recipe.n_points, n2 > 0 ? 2 : 1,
+             dt_get_wtime() - t_sky);
+
+    // the segmentation stack is done; release it before the heavy native
+    // pass (the replay's VRAM rule), and the render pipe with it
+    if(od.refine)
+    {
+      dt_refine_free(od.refine);
+      od.refine = NULL;
+    }
+    dt_seg_free(seg);
+    seg = NULL;
+    od.seg = NULL;
+    dt_ai_env_destroy(env);
+    env = NULL;
+    od.env = NULL;
+    dt_dev_pixelpipe_cleanup(&pipe);
+    pipe_ready = FALSE;
+    dt_mipmap_cache_release(&buf);
+    buf_ready = FALSE;
+
+    // the recipe is complete now: its target, and the shortcut a
+    // promptless row took above
+    outpath = _detect_outpath(&dev, &recipe);
+    if(!outpath)
+      goto cleanup;
+    if(g_file_test(outpath, G_FILE_TEST_EXISTS) && _mask_png_valid(outpath))
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] detect: %s already exists, reusing", outpath);
+      goto apply;
+    }
+
+    if(!_job_step(job, j->msg)) goto cleanup;
+  }
+
   // seed filter and subject bbox, exactly as the replay derives them
-  // from this very recipe
+  // from this very recipe (a via_points mask already went through its
+  // row's component rule inside the decode, as the replay's does)
   {
     const float thresh = CLAMP(recipe.threshold, 0.3f, 0.9f);
     const float margin = CLAMPF(recipe.ai_refine_margin, 0.0f, 0.5f);
-    if(j->detector->keep_seed)
-      _keep_major_components(hint, out_w, out_h, thresh);
+    if(!via_points && j->detector->keep_seed)
+      _keep_major_components(hint, out_w, out_h, thresh,
+                             j->detector->cc_ratio, TRUE);
     dt_seg_point_t tl, br;
     if(!_compute_bbox(hint, out_w, out_h, thresh, margin, &tl, &br))
     {
@@ -5274,6 +6216,8 @@ cleanup:
   if(pipe_ready) dt_dev_pixelpipe_cleanup(&pipe);
   if(buf_ready) dt_mipmap_cache_release(&buf);
   if(det) dt_detect_free(det);
+  if(od.refine) dt_refine_free(od.refine);
+  if(seg) dt_seg_free(seg);
   if(env) dt_ai_env_destroy(env);
   dt_dev_cleanup(&dev);
   g_atomic_int_set(&_finalize_running, 0);
@@ -5319,6 +6263,25 @@ static dt_ai_model_t *_detector_resolve_model(const dt_detector_t *det)
   return candidate;
 }
 
+// the segmentation model a via_points detection would decode with NOW:
+// the active model of the "mask" task, installed. registry copy, caller
+// frees; NULL when none is usable
+static dt_ai_model_t *_detector_resolve_seg_model(void)
+{
+  dt_ai_models_init_lazy();
+  char *id = dt_ai_models_get_active_for_task("mask");
+  dt_ai_model_t *model = (id && id[0]) ? dt_ai_models_get_by_id(id) : NULL;
+  g_free(id);
+  if(model
+     && model->status != DT_AI_MODEL_DOWNLOADED
+     && model->status != DT_AI_MODEL_UPDATE_AVAILABLE)
+  {
+    dt_ai_model_free(model);
+    model = NULL;
+  }
+  return model;
+}
+
 dt_masks_object_detect_state_t
 dt_masks_object_detect_state(const struct dt_detector_t *detector)
 {
@@ -5326,6 +6289,19 @@ dt_masks_object_detect_state(const struct dt_detector_t *detector)
     return DT_MASKS_OBJECT_DETECT_UNAVAILABLE;
   if(!dt_ai_registry_is_enabled())
     return DT_MASKS_OBJECT_DETECT_AI_OFF;
+
+  // a row that draws through the segmentation model needs it installed
+  // as well as its own: the job downloads the map model at most, and an
+  // entry must not promise a detection its launch cannot run. no
+  // download is offered for the segmentation model here -- it is the
+  // interactive selection's, installed from the preferences like today
+  if(detector->via_points)
+  {
+    dt_ai_model_t *seg = _detector_resolve_seg_model();
+    if(!seg)
+      return DT_MASKS_OBJECT_DETECT_UNAVAILABLE;
+    dt_ai_model_free(seg);
+  }
 
   dt_ai_model_t *model = _detector_resolve_model(detector);
   if(!model)
@@ -5378,6 +6354,17 @@ gboolean dt_masks_object_detect_launch(const struct dt_detector_t *detector,
     dt_control_log(_("AI model is not available. Check preferences > AI"));
     return FALSE;
   }
+  // the state above already demanded it for a via_points row; resolved
+  // again here so the job carries the id (the registry may move between
+  // the two calls, in which case the launch refuses like the state would)
+  dt_ai_model_t *seg = detector->via_points ? _detector_resolve_seg_model()
+                                            : NULL;
+  if(detector->via_points && !seg)
+  {
+    dt_control_log(_("AI model is not available. Check preferences > AI"));
+    dt_ai_model_free(model);
+    return FALSE;
+  }
 
   // one heavy AI mask job at a time: the very token the interactive
   // finalisation and the headless replay serialise on
@@ -5385,6 +6372,7 @@ gboolean dt_masks_object_detect_launch(const struct dt_detector_t *detector,
   {
     dt_control_log(_("mask still computing, try again in a moment"));
     dt_ai_model_free(model);
+    dt_ai_model_free(seg);
     return FALSE;
   }
 
@@ -5397,6 +6385,10 @@ gboolean dt_masks_object_detect_launch(const struct dt_detector_t *detector,
   j->history_end = dev->history_end;
   j->detector = detector;
   g_strlcpy(j->model_id, model->id ? model->id : "", sizeof(j->model_id));
+  if(seg)
+    g_strlcpy(j->seg_model_id, seg->id ? seg->id : "",
+              sizeof(j->seg_model_id));
+  dt_ai_model_free(seg);
   j->download = state == DT_MASKS_OBJECT_DETECT_DOWNLOAD;
   j->render_size = _conf_render_size();
   // through the session accessors, NULL session: the conf branch, with
@@ -5927,13 +6919,13 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
   dt_develop_t *dev = darktable.develop;
   if(!target || !target->has_recipe || !dt_rf_recipe_valid(&target->recipe))
     return FALSE;
-  // a promptless recipe records no clicked session to reopen: revising
-  // one is a redetect, not a decode replay -- refuse until that surface
-  // exists
-  if(target->recipe.prompt_kind != DT_RF_PROMPT_POINTS)
+  // a detector-made recipe records no clicked session to reopen (the
+  // sky's points were chosen by a map, not by a hand): revising one is a
+  // redetect, not a decode replay -- refuse until that surface exists
+  if(dt_rf_prompt_detected(target->recipe.prompt_kind))
   {
     dt_print(DT_DEBUG_AI,
-             "[object mask] edit: promptless recipes have no click"
+             "[object mask] edit: detector-made recipes have no click"
              " session to reopen");
     return FALSE;
   }
@@ -6496,11 +7488,13 @@ gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe)
     return FALSE;
 
   // the seg_model slot carries the interactive segmentation model of a
-  // clicked recipe and the recorded detector of a promptless one: rebind
-  // from the active model of the family's OWN task, or a subject recipe
-  // would silently be rebound to the click-session SAM model
+  // recipe with points (clicked, or the sky's derived ones) and the
+  // recorded detector of a promptless one: rebind from the active model
+  // of the family's OWN task, or a subject recipe would silently be
+  // rebound to the click-session SAM model
+  const gboolean by_points = dt_rf_prompt_replays_points(recipe->prompt_kind);
   const char *seg_task = "mask";
-  if(recipe->prompt_kind != DT_RF_PROMPT_POINTS)
+  if(!by_points)
   {
     const dt_detector_t *detector
       = dt_detector_find(recipe->prompt_kind, recipe->class_bits);
@@ -6516,7 +7510,7 @@ gboolean dt_object_recipe_rebind_models(dt_rf_recipe_t *recipe)
     return FALSE;
   }
 
-  if(recipe->prompt_kind != DT_RF_PROMPT_POINTS)
+  if(!by_points)
   {
     // the input side travels with the model: repin it to the new model's
     // manifest, or the rebound recipe would fail the side gate of its

@@ -27,18 +27,21 @@
 G_BEGIN_DECLS
 
 // the task x detector matrix, designed once and consulted everywhere: a
-// promptless detection is identified in a recipe by (prompt_kind,
-// class_bits), and this table is the single authority mapping that pair
-// to the registry task supplying its models, the base name of the form
-// it creates, and its post-processing. the replay gates, the rebind and
-// the catalogue all resolve through it, so a diagnostic can never
-// promise a repair the replay would refuse (they cannot diverge on WHICH
-// task a recipe belongs to), and adding a detector is one row here plus
-// its registry task -- never a change to the gate code. models
-// themselves stay out of the table: a recipe pins its model by the
-// recorded (id, version), the active model of a task comes from the
-// registry, and the class set travels as a recipe parameter so eight
-// semantic entries can share one model
+// detection is identified in a recipe by (prompt_kind, class_bits), and
+// this table is the single authority mapping that pair to the registry
+// task supplying its models, the base name of the form it creates, and
+// its post-processing. the replay gates, the rebind and the catalogue
+// all resolve through it, so a diagnostic can never promise a repair the
+// replay would refuse (they cannot diverge on WHICH task a recipe
+// belongs to), and adding a detector is one row here plus its registry
+// task -- never a change to the gate code. models themselves stay out of
+// the table: a recipe pins its model by the recorded (id, version), the
+// active model of a task comes from the registry, and the class set
+// travels as a recipe parameter so eight semantic entries can share one
+// model. a via_points row is the one exception to "the task supplies the
+// recorded model": its recipe records the SEGMENTATION model the prompts
+// were decoded with, and the row's own task only names the map model
+// the creation consults -- the replay never loads it
 typedef struct dt_detector_t
 {
   const char *task;    // registry task whose models implement it
@@ -59,11 +62,37 @@ typedef struct dt_detector_t
                        // detection (DT_MASKS_RASTER_FLAG_INVERT on its
                        // point) -- same recipe, same file, the other side
                        // selected (Lightroom's "background")
+  gboolean via_points; // FALSE: the detector's map IS the mask (one
+                       // inference, promptless recipe, no points).
+                       // TRUE: the map only chooses point and box
+                       // prompts for the interactive segmentation model
+                       // (the active model of the "mask" task), which
+                       // draws the mask; the recipe then is a POINTS
+                       // recipe under this row's prompt kind, replayed
+                       // like a clicked one, and the row needs BOTH
+                       // models installed to be offered
+  float cc_ratio;      // connected-component floor of the final mask:
+                       // a component below this fraction goes. relative
+                       // to the LARGEST component when keep_seed is set
+                       // (a second subject must be comparable to the
+                       // first), to the whole image area otherwise (a
+                       // sky patch between branches is kept whatever
+                       // the main sky measures, a speck is not)
 } dt_detector_t;
 
 static const dt_detector_t dt_detectors[] = {
-  { "mask-subject", N_("subject"), "✦", DT_RF_PROMPT_SUBJECT, 0, TRUE, FALSE },
-  { "mask-subject", N_("background"), "✦", DT_RF_PROMPT_SUBJECT, 0, TRUE, TRUE },
+  { "mask-subject", N_("subject"), "✦", DT_RF_PROMPT_SUBJECT, 0, TRUE, FALSE,
+    FALSE, 0.05f },
+  { "mask-subject", N_("background"), "✦", DT_RF_PROMPT_SUBJECT, 0, TRUE, TRUE,
+    FALSE, 0.05f },
+  // the sky: a CLIPSeg map frozen on the word "sky" is far too coarse to
+  // be a mask (22x22 patches) but reliable about where the sky certainly
+  // is and is not; the prompts derived from it drive the same
+  // segmentation model as a clicked selection. the 0.5 % floor keeps
+  // the sky seen through a windmill's lattice or a fence, which the
+  // subject's 5 %-of-the-largest rule would drop
+  { "mask-sky", N_("sky"), "✦", DT_RF_PROMPT_SKY, 0, FALSE, FALSE,
+    TRUE, 0.005f },
 };
 
 // resolve a recipe's (prompt_kind, class_bits) to its table row; NULL
