@@ -316,7 +316,7 @@ static void _group_name_for_module(const dt_iop_module_t *module,
                                    char *name,
                                    const size_t name_size)
 {
-  gchar *module_label = dt_history_item_get_name(module);
+  gchar *module_label = dt_history_item_get_name_plain(module);
   snprintf(name, name_size, _("group `%s'"), module_label);
   g_free(module_label);
 }
@@ -1989,7 +1989,7 @@ void dt_masks_iop_combo_populate(GtkWidget *w, dt_iop_module_t **m)
           dt_bauhaus_combobox_add_section(combo, _("use same shapes as"));
           cids[pos++] = 0; // nothing to do
         }
-        gchar *module_label = dt_history_item_get_name(other_mod);
+        gchar *module_label = dt_history_item_get_name_plain(other_mod);
         dt_bauhaus_combobox_add(combo, module_label);
         g_free(module_label);
         cids[pos++] = -1 * pos2;

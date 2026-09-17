@@ -24,6 +24,7 @@
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/masks/object_recipe.h"
+#include "gui/draw.h"
 
 // the raster shape: a persistent mask form whose content is not a geometry
 // but a reference to a raster mask file (see dt_masks_point_raster_t in
@@ -1236,6 +1237,29 @@ static int _raster_get_points_border(dt_develop_t *dev,
     }
   _raster_cache_release(entry);
 
+  // a background selects everything but the file's loops: one more loop,
+  // a rectangle far outside any canvas, and the even-odd rules of the
+  // tint (post_expose) and of the hit test (get_distance) turn inside
+  // out on their own -- the tint covers the background, a click on the
+  // background selects the shape, and the stroked edge is the same edge.
+  // off-screen, so the rectangle itself is never seen
+  if(pt->flags & DT_MASKS_RASTER_FLAG_INVERT)
+  {
+    const int total = ocount + 5;
+    float *ext = dt_alloc_align_float((size_t)total * 2);
+    if(ext)
+    {
+      memcpy(ext, pts, sizeof(float) * 2 * ocount);
+      const float far = 1.0e6f;
+      const float corners[10] = { DT_INVALID_COORDINATE, DT_INVALID_COORDINATE,
+                                  -far, -far, far, -far, far, far, -far, far };
+      memcpy(ext + 2 * ocount, corners, sizeof(corners));
+      dt_free_align(pts);
+      pts = ext;
+      ocount = total;
+    }
+  }
+
   *points = pts;
   *points_count = ocount;
   return 1;
@@ -1492,9 +1516,11 @@ static void _raster_events_post_expose(cairo_t *cr,
   const gboolean selected = (gui->group_selected == index)
     && (gui->form_selected || gui->form_dragging);
 
-  // every loop as one cairo subpath, stroked once through the shared
-  // helper in its dashed style: the dashes read as "a precise mask",
-  // not an editable outline -- there are no anchors to draw
+  // every loop as one cairo subpath: a light tint inside (even-odd, so
+  // the holes stay clear whatever the loops' orientation), then the
+  // shared main-line stroke -- the mask has no anchors to draw, and a
+  // hairline alone is easy to miss on a busy photograph when the shape
+  // has just landed in the library with no module to display it through
   gboolean any = FALSE;
   int start = 0;
   for(int k = 0; k <= gpt->points_count; k++)
@@ -1513,7 +1539,14 @@ static void _raster_events_post_expose(cairo_t *cr,
     start = k + 1;
   }
   if(any)
-    dt_masks_line_stroke(cr, TRUE, FALSE, selected, zoom_scale);
+  {
+    cairo_save(cr);
+    cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
+    dt_draw_set_color_overlay(cr, TRUE, selected ? 0.35 : 0.25);
+    cairo_fill_preserve(cr);
+    cairo_restore(cr);
+    dt_masks_line_stroke(cr, FALSE, FALSE, selected, zoom_scale);
+  }
 }
 
 // the function table for raster shapes

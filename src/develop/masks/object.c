@@ -2474,7 +2474,7 @@ static gboolean _finalize_apply_idle(gpointer data)
       if(!mod_grp)
       {
         mod_grp = dt_masks_create(DT_MASKS_GROUP);
-        gchar *label = dt_history_item_get_name(target);
+        gchar *label = dt_history_item_get_name_plain(target);
         snprintf(mod_grp->name, sizeof(mod_grp->name), _("group '%s'"), label);
         g_free(label);
         dev->forms = g_list_append(dev->forms, mod_grp);
@@ -3891,11 +3891,11 @@ static uint8_t *_replay_render_rgb8(dt_develop_t *dev,
   return rgb;
 }
 
-dt_object_recipe_status_t
-dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
-                         const dt_imgid_t imgid,
-                         gboolean (*keep_going)(void *),
-                         void *user)
+static dt_object_recipe_status_t
+_recipe_compute_locked(const dt_rf_recipe_t *recipe,
+                       const dt_imgid_t imgid,
+                       gboolean (*keep_going)(void *),
+                       void *user)
 {
   if(!dt_rf_recipe_valid(recipe) || !dt_is_valid_imgid(imgid))
     return DT_OBJECT_RECIPE_FAILED;
@@ -4455,18 +4455,6 @@ dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
   const int bw = CLAMP((int)br.x - bx + 1, 1, hint_w - bx);
   const int bh = CLAMP((int)br.y - by + 1, 1, hint_h - by);
 
-  // the native pass is the peak of VRAM use and shares its serialisation
-  // token with the interactive finalisation job: never run both at once.
-  // busy means a finalisation (or another replay) is in flight -- fail
-  // cleanly, the caller may retry later
-  if(!g_atomic_int_compare_and_exchange(&_finalize_running, 0, 1))
-  {
-    dt_print(DT_DEBUG_AI,
-             "[object mask] replay: a finalisation is already running,"
-             " try again later");
-    status = DT_OBJECT_RECIPE_RETRY;
-    goto cleanup;
-  }
   int pw = 0, ph = 0;
   const _finalize_render_req_t req = {
     .hint = hint,
@@ -4481,7 +4469,6 @@ dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
     .matte = _matte_session_recorded(recipe),
   };
   alpha_full = _finalize_render_alpha(&dev, &req, keep_going, user, &pw, &ph);
-  g_atomic_int_set(&_finalize_running, 0);
   if(!alpha_full)
   {
     // the render core reports failure and cancellation alike; recover the
@@ -4521,6 +4508,36 @@ cleanup:
     dt_print(DT_DEBUG_ALWAYS,
              "[object mask] could not regenerate the mask of image %d from"
              " its recipe (run with -d ai for details)", imgid);
+  return status;
+}
+
+// one AI mask job at a time, for the WHOLE replay: the detector (or the
+// segmentation stack of a clicked recipe) and the native pass both live
+// on the GPU, and two replays scheduled together -- three missing files
+// on an image just opened -- used to run their detectors side by side
+// while one of them held the token for its native pass alone. the arena
+// then ran out and the inference silently fell back to the CPU. the
+// token is the one the interactive finalisation and the detection job
+// hold for their whole run; busy means one of them, or another replay,
+// is in flight: fail cleanly, the job system retries the slot later
+dt_object_recipe_status_t
+dt_object_recipe_compute(const dt_rf_recipe_t *recipe,
+                         const dt_imgid_t imgid,
+                         gboolean (*keep_going)(void *),
+                         void *user)
+{
+  if(!dt_rf_recipe_valid(recipe) || !dt_is_valid_imgid(imgid))
+    return DT_OBJECT_RECIPE_FAILED;
+  if(!g_atomic_int_compare_and_exchange(&_finalize_running, 0, 1))
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: another AI mask job is running,"
+             " try again later");
+    return DT_OBJECT_RECIPE_RETRY;
+  }
+  const dt_object_recipe_status_t status
+    = _recipe_compute_locked(recipe, imgid, keep_going, user);
+  g_atomic_int_set(&_finalize_running, 0);
   return status;
 }
 
@@ -7100,11 +7117,13 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
       return 1;
     }
 
-    // shift+right-click: finalise a precise raster mask at native
-    // resolution, on a worker job. separate from the vector path on purpose:
-    // this one has no editable points, and says so by being a distinct gesture
-    if(d && d->has_selection && d->mask
-       && dt_modifier_is(state, GDK_SHIFT_MASK))
+    // right-click: the mask file -- the refined alpha at native resolution,
+    // graded edges kept, written by a worker job. this is the cutout the
+    // one-shot detections produce too, so the plain gesture lands on the
+    // same kind of shape everywhere. shift+right-click asks for editable
+    // paths instead, below: the same native finalisation traced by potrace
+    const gboolean as_paths = dt_modifier_is(state, GDK_SHIFT_MASK);
+    if(d && d->has_selection && d->mask && !as_paths)
     {
       if(!_launch_native_finalize(d, gui, module, FALSE))
         return 1;   // busy: keep the session, the user can retry
@@ -7127,11 +7146,11 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
       return 1;
     }
 
-    // right-click: precise paths -- same native finalisation as the raster
-    // gesture, traced by potrace at 1:1 instead of written to a file. falls
-    // back to the classic working-grid vectorisation when the job is busy
-    // or when there is no refined mask to work from
-    if(d && d->has_selection && d->mask
+    // shift+right-click: editable paths -- same native finalisation as the
+    // mask file, traced by potrace at 1:1 instead of written to a file.
+    // falls back to the classic working-grid vectorisation when the job is
+    // busy or when there is no refined mask to work from
+    if(d && d->has_selection && d->mask && as_paths
        && _launch_native_finalize(d, gui, module, TRUE))
     {
       gui->creation = FALSE;
@@ -7167,7 +7186,7 @@ static int _object_events_button_pressed(dt_iop_module_t *module,
         if(!mod_grp)
         {
           mod_grp = dt_masks_create(DT_MASKS_GROUP);
-          gchar *module_label = dt_history_item_get_name(module);
+          gchar *module_label = dt_history_item_get_name_plain(module);
           snprintf(mod_grp->name, sizeof(mod_grp->name),
                    _("group '%s'"), module_label);
           g_free(module_label);
@@ -7880,7 +7899,7 @@ static void _object_set_hint_message(const dt_masks_form_gui_t *const gui,
                  _("<b>add</b>: click, <b>subtract</b>: shift+click, "
                    "<b>clear</b>: ctrl+shift+click, "
                    "<b>apply</b>: right-click, "
-                   "<b>apply+save raster</b>: shift+right-click\n"
+                   "<b>apply as editable paths</b>: shift+right-click\n"
                    "<b>smoothing</b>: scroll (%3.2f), "
                    "<b>cleanup</b>: shift+scroll (%d), "
                    "<b>opacity</b>: ctrl+scroll (%d%%)"),

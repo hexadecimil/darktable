@@ -580,6 +580,8 @@ void dt_dev_module_remove(dt_develop_t *dev,
                           struct dt_iop_module_t *module);
 /** generates item multi-instance name */
 gchar *dt_history_item_get_name(const struct dt_iop_module_t *module);
+/** the same, without markup escaping: for widgets showing plain text */
+gchar *dt_history_item_get_name_plain(const struct dt_iop_module_t *module);
 
 /*
  * distort functions

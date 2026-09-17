@@ -28,6 +28,7 @@
 #include "common/atomic.h"
 #include "common/debug.h"
 #include "common/history.h"
+#include "common/utility.h"
 #include "common/image_cache.h"
 #include "common/mipmap_cache.h"
 #include "common/opencl.h"
@@ -3874,6 +3875,25 @@ gchar *dt_history_item_get_name(const dt_iop_module_t *module)
                                    module->multi_name,
                                    FALSE,
                                    module->multi_name_hand_edited);
+}
+
+gchar *dt_history_item_get_name_plain(const dt_iop_module_t *module)
+{
+  // the same words as above -- name, then the instance label localised
+  // unless it was typed by hand -- with no markup escaping: for a widget
+  // that shows text, not markup (a menu entry, a plain label, a tooltip,
+  // a tree cell bound to "text"), where "contrast &amp; texture" is
+  // what the escaped form reads like
+  const char *label = module->multi_name;
+  if(!label || !*label || !strcmp(label, "0"))
+    return g_strdup(module->name());
+
+  char *l_label = module->multi_name_hand_edited
+    ? g_strdup(label)
+    : dt_util_localize_segmented_name(label, FALSE);
+  gchar *result = g_strdup_printf("%s • %s", module->name(), l_label);
+  g_free(l_label);
+  return result;
 }
 
 gboolean dt_dev_distort_transform(dt_develop_t *dev,

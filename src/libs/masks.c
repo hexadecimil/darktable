@@ -1308,7 +1308,7 @@ static int _mask_target_shapes(const dt_iop_module_t *m)
 // will do besides -- has to be readable in the entry itself.
 static gchar *_mask_target_label(const dt_iop_module_t *m)
 {
-  gchar *name = dt_history_item_get_name(m);
+  gchar *name = dt_history_item_get_name_plain(m);
   const int shapes = _mask_target_shapes(m);
 
   const gchar *note = NULL;
@@ -1672,7 +1672,7 @@ static void _creation_bar_update(dt_lib_masks_t *d)
     // the module alone, without the "(2 shapes)" the catalogue adds to pick
     // between entries: inside a sentence that annotation reads as something
     // the shape about to be drawn is going to do
-    gchar *name = dt_history_item_get_name(d->arm_module);
+    gchar *name = dt_history_item_get_name_plain(d->arm_module);
     // the shape and not "it": the icon this sentence refers back to is a row
     // away, above two lists, and a pronoun that far from its antecedent reads
     // as if the module in brackets were a qualifier of the photograph
@@ -1732,7 +1732,7 @@ static void _target_row_update(dt_lib_masks_t *d)
     // the module alone, without the "(2 shapes)" the menu adds to tell two
     // entries apart: there is one line here and nothing to tell it apart from.
     // the arrow carries no msgid -- it is a glyph and a module name
-    gchar *name = dt_history_item_get_name(target);
+    gchar *name = dt_history_item_get_name_plain(target);
     gchar *text = g_strdup_printf("→ %s", name);
     gtk_label_set_text(GTK_LABEL(d->target_label), text);
     g_free(text);
@@ -2962,7 +2962,7 @@ static void _set_iter_name(dt_lib_masks_t *lm,
       ? dt_util_localize_segmented_name(src->multi_name, FALSE)
       : g_strdup(src->name());
 
-    gchar *cname = dt_history_item_get_name(rmod);
+    gchar *cname = dt_history_item_get_name_plain(rmod);
     gchar *rtarget = g_strdup_printf("→ %s", cname);
     g_free(cname);
 
@@ -2970,7 +2970,7 @@ static void _set_iter_name(dt_lib_masks_t *lm,
     // is written here with the other derived columns: an in-place
     // refresh after a rename then updates it along with the name,
     // instead of leaving it stale until the next full rebuild
-    gchar *sname = dt_history_item_get_name(src);
+    gchar *sname = dt_history_item_get_name_plain(src);
     gchar *rtip = g_strdup_printf
       (_("raster mask: pixels handed over by '%s'\n"
          "it has no shapes to edit on the photograph\n"
@@ -3216,7 +3216,7 @@ static void _set_iter_name(dt_lib_masks_t *lm,
   if(live && !dt_is_valid_maskid(grid)
      && !dt_masks_group_name_is_default(form, live))
   {
-    gchar *mname = dt_history_item_get_name(live);
+    gchar *mname = dt_history_item_get_name_plain(live);
     target = g_strdup_printf("→ %s", mname);
     g_free(mname);
   }
@@ -4292,7 +4292,7 @@ static void _tree_context_menu(dt_lib_module_t *self,
               }
               if(nbuse == 0) g_strlcat(str, " (", sizeof(str));
               g_strlcat(str, " ", sizeof(str));
-              gchar *module_label = dt_history_item_get_name(m);
+              gchar *module_label = dt_history_item_get_name_plain(m);
               g_strlcat(str, module_label, sizeof(str));
               g_free(module_label);
               nbuse++;
@@ -4416,7 +4416,7 @@ static void _tree_context_menu(dt_lib_module_t *self,
       // a group owned by a module is already named after it
       // ("group `exposure'"), the plain module name reads better here
       if(sel_module && parent->formid == sel_module->blend_params->mask_id)
-        scope = dt_history_item_get_name(sel_module);
+        scope = dt_history_item_get_name_plain(sel_module);
       else if(*parent->name)
         scope = g_strdup(parent->name);
     }
@@ -5446,7 +5446,7 @@ static gboolean _tree_query_tooltip(GtkWidget *widget,
       // its tooltip (develop/imageop.c), from the same two msgids: one switch,
       // two places to reach it, one wording. the second says what THIS click
       // does, which is not the same sentence in both directions
-      gchar *name = dt_history_item_get_name(row_module);
+      gchar *name = dt_history_item_get_name_plain(row_module);
       gchar *line = g_strdup_printf(row_module->enabled
                                       ? _("'%s' is switched on")
                                       : _("'%s' is switched off"),
