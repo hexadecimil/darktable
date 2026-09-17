@@ -26,8 +26,9 @@
 
 G_BEGIN_DECLS
 
-/** One-shot promptless detection context. Not thread-safe: a context
- *  belongs to the thread that uses it. */
+/** One-shot detection context: the photo alone, or the photo and a
+ *  text prompt frozen at export. Not thread-safe: a context belongs to
+ *  the thread that uses it. */
 typedef struct dt_detect_context_t dt_detect_context_t;
 
 /** TRUE when a model for the given detection task (e.g. "mask-subject")
@@ -51,6 +52,16 @@ gboolean dt_detect_available(const char *task);
  * The model output may be declared [1,1,S,S] or [1,S,S]: the rank is
  * read from the session, the element count is what is checked.
  *
+ * A model with TWO inputs is text-conditioned: besides the image it
+ * takes the embedding of the prompt it answers about, one of a fixed
+ * set frozen at export. The set is named by attributes.prompts, its
+ * embeddings lie in prompts.bin next to the model (n_prompts x
+ * prompt_dim float32, little-endian, in the order of the list), and
+ * `prompt_index` selects the one this context runs with. A model with
+ * one input ignores `prompt_index`; a two-input model refuses a
+ * negative index, an index past the list, or a prompts.bin whose size
+ * disagrees with the manifest.
+ *
  * No provider restriction and no warmup inference: a detection is a
  * single call on a background job, so a CPU fallback is slow but blocks
  * nothing, and a warmup would exactly double the cost.
@@ -64,7 +75,8 @@ gboolean dt_detect_available(const char *task);
  */
 dt_detect_context_t *dt_detect_load(dt_ai_environment_t *env,
                                     const char *model_id,
-                                    const char *task);
+                                    const char *task,
+                                    const int prompt_index);
 
 void dt_detect_free(dt_detect_context_t *ctx);
 
@@ -72,7 +84,7 @@ void dt_detect_free(dt_detect_context_t *ctx);
 int dt_detect_get_side(const dt_detect_context_t *ctx);
 
 /**
- * @brief Detect on an RGB frame, one inference, no prompt.
+ * @brief Detect on an RGB frame, one inference, no click.
  *
  * The frame is resampled to the model's square input (stretched, or
  * letterboxed with zero padding when the manifest says so), normalised,

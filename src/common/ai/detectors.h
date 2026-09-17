@@ -53,7 +53,10 @@ typedef struct dt_detector_t
                        // with the entry and follows the theme like
                        // any other character. UTF-8, never translated
   int32_t prompt_kind; // DT_RF_PROMPT_* recorded in the recipe
-  int64_t class_bits;  // semantic class set; 0 = salient subject
+  int64_t class_bits;  // semantic class set; 0 = salient subject. for
+                       // the text rows (DT_RF_PROMPT_SKY) the prompt
+                       // index, which is what tells their recipes and
+                       // their form names apart
   gboolean keep_seed;  // TRUE: single-object detection, keep only one
                        // connected component (the seed's, or the largest
                        // when no seed exists); FALSE: multi-component
@@ -78,21 +81,41 @@ typedef struct dt_detector_t
                        // first), to the whole image area otherwise (a
                        // sky patch between branches is kept whatever
                        // the main sky measures, a speck is not)
+  // the text rows: the map model answers about one of the prompts
+  // frozen in its package (attributes.prompts), and the map is read
+  // against thresholds of the row's own -- a class the model is sure of
+  // (the sky) bears a stricter reading than one it is timid about
+  // (vegetation). -1 and zeros on a row whose map is the mask itself
+  int32_t prompt_index; // index into attributes.prompts; -1 = the model
+                        // takes the image alone
+  float p_guard;        // the guard: a map with no pixel above this has
+                        // nothing of the class, no decode
+  float p_pos;          // surely the class: pass-1 positives
+  float p_neg;          // surely not: pass-1 negatives, pass-2 overflow
+  float p_box;          // the class's extent: box, negative frontier
 } dt_detector_t;
 
 static const dt_detector_t dt_detectors[] = {
   { "mask-subject", N_("subject"), "✦", DT_RF_PROMPT_SUBJECT, 0, TRUE, FALSE,
-    FALSE, 0.05f },
+    FALSE, 0.05f, -1, 0.0f, 0.0f, 0.0f, 0.0f },
   { "mask-subject", N_("background"), "✦", DT_RF_PROMPT_SUBJECT, 0, TRUE, TRUE,
-    FALSE, 0.05f },
-  // the sky: a CLIPSeg map frozen on the word "sky" is far too coarse to
-  // be a mask (22x22 patches) but reliable about where the sky certainly
+    FALSE, 0.05f, -1, 0.0f, 0.0f, 0.0f, 0.0f },
+  // the text rows: one CLIPSeg map per prompt, far too coarse to be a
+  // mask (22x22 patches) but reliable about where the class certainly
   // is and is not; the prompts derived from it drive the same
   // segmentation model as a clicked selection. the 0.5 % floor keeps
   // the sky seen through a windmill's lattice or a fence, which the
-  // subject's 5 %-of-the-largest rule would drop
-  { "mask-sky", N_("sky"), "✦", DT_RF_PROMPT_SKY, 0, FALSE, FALSE,
-    TRUE, 0.005f },
+  // subject's 5 %-of-the-largest rule would drop. class_bits IS the
+  // prompt index: the sky keeps 0, the class its recipes were recorded
+  // under before the model took a second input
+  { "mask-text", N_("sky"), "✦", DT_RF_PROMPT_SKY, 0, FALSE, FALSE,
+    TRUE, 0.005f, 0, 0.70f, 0.70f, 0.05f, 0.40f },
+  { "mask-text", N_("water"), "✦", DT_RF_PROMPT_SKY, 1, FALSE, FALSE,
+    TRUE, 0.005f, 1, 0.85f, 0.70f, 0.05f, 0.40f },
+  { "mask-text", N_("vegetation"), "✦", DT_RF_PROMPT_SKY, 2, FALSE, FALSE,
+    TRUE, 0.005f, 2, 0.38f, 0.50f, 0.05f, 0.40f },
+  { "mask-text", N_("person"), "✦", DT_RF_PROMPT_SKY, 7, FALSE, FALSE,
+    TRUE, 0.005f, 7, 0.53f, 0.50f, 0.05f, 0.40f },
 };
 
 // resolve a recipe's (prompt_kind, class_bits) to its table row; NULL

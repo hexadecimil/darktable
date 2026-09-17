@@ -4147,7 +4147,8 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
   env = dt_ai_env_init(NULL);
   if(promptless)
   {
-    det = env ? dt_detect_load(env, recipe->seg_model, detector->task)
+    det = env ? dt_detect_load(env, recipe->seg_model, detector->task,
+                               detector->prompt_index)
               : NULL;
     if(!det)
     {
@@ -4918,50 +4919,52 @@ dt_object_recipe_model_gap(const dt_rf_recipe_t *recipe, gchar ***missing)
   return _recipe_model_gap(recipe, missing, NULL, NULL, NULL);
 }
 
-// ------------------------- sky prompt derivation ----------------------------
+// ------------------------- text prompt derivation ---------------------------
 //
-// the sky detector's map (CLIPSeg frozen on the word "sky", 352x352, ~22
-// patches across) is not a mask: its edges are 2-4x halos, a thin mast
-// or a wire vanishes in it, a pale horizon band drops below any
-// threshold. what it IS reliable about is where the sky certainly is
-// (p > 0.7) and certainly is not (p < 0.05). so the map chooses the
-// prompts and the interactive segmentation model draws the edge, exactly
-// as it does for a clicked selection -- with these prompts standing in
-// for the clicks. two decodes, both recorded in the recipe as decode
-// boundaries so the replay reproduces them from the points alone:
+// the map of a text detector (CLIPSeg answered about one word -- sky,
+// water, vegetation, person -- 352x352, ~22 patches across) is not a
+// mask: its edges are 2-4x halos, a thin mast or a wire vanishes in it,
+// a pale horizon band drops below any threshold. what it IS reliable
+// about is where the class certainly is (p > p_pos) and certainly is
+// not (p < p_neg). so the map chooses the prompts and the interactive
+// segmentation model draws the edge, exactly as it does for a clicked
+// selection -- with these prompts standing in for the clicks. two
+// decodes, both recorded in the recipe as decode boundaries so the
+// replay reproduces them from the points alone:
 //
 //  pass 1  positives: in each cell of a 3x3 grid whose map peak exceeds
-//          0.7, the pixel maximising (distance to the cell's p <= 0.7
-//          pixels) x p -- the centre of the cell's surely-sky zone, not
-//          its bare peak; topped up to 5 by farthest-point sampling
-//          among p > 0.7 when fewer cells qualify; 9 at most. negatives:
-//          as many as the positives (5 at least) among p < 0.05, taken
-//          in a band along the frontier of p > 0.4 (3 % of the long
-//          side, widened by 1.5x until it holds 50 candidates per
-//          point), farthest-point sampled with a bias toward the
-//          frontier. a box around p > 0.4 with a 2 % margin. the guard
-//          before anything: no pixel above 0.7 means no sky, no decode.
+//          p_pos, the pixel maximising (distance to the cell's p <=
+//          p_pos pixels) x p -- the centre of the cell's surely-class
+//          zone, not its bare peak; topped up to 5 by farthest-point
+//          sampling among p > p_pos when fewer cells qualify; 9 at
+//          most. negatives: as many as the positives (5 at least) among
+//          p < p_neg, taken in a band along the frontier of p > p_box
+//          (3 % of the long side, widened by 1.5x until it holds 50
+//          candidates per point), farthest-point sampled with a bias
+//          toward the frontier. a box around p > p_box with a 2 %
+//          margin. the guard before anything: no pixel above p_guard
+//          means none of the class, no decode.
 //  pass 2  the first mask, read against the map: where it overflows onto
-//          p < 0.05 a negative at the centre of each such region, where
-//          it misses p > 0.5 a positive at the centre of each such
-//          region (regions of at least 0.05 % of the frame, largest
-//          first, 9 of each at most, fewer when the recipe is short of
-//          room). one more decode with every point of pass 1 plus
-//          these, on the first decode's mask feedback. nothing to add
-//          means pass 1 stands.
+//          p < p_neg a negative at the centre of each such region, where
+//          it misses p > min(0.5, p_pos) a positive at the centre of
+//          each such region (regions of at least 0.05 % of the frame,
+//          largest first, 9 of each at most, fewer when the recipe is
+//          short of room). one more decode with every point of pass 1
+//          plus these, on the first decode's mask feedback. nothing to
+//          add means pass 1 stands.
 //
-// the thresholds and counts are those of the study that validated the
-// chain (16 of 18 skies covered, no leak, none of the 5 skyless frames
-// prompted): they are the contract of the recorded recipes, and a
-// change to any of them changes what a recipe replays to. every
-// function below is pure and deterministic -- ties resolve in raster
-// order, no sampling is random -- so a replay's pass-2 points are the
-// creation's, byte for byte
+// the four thresholds are the detector row's (dt_detectors[]): the sky's
+// (0.7 / 0.05 / 0.4, guard 0.7) are those of the study that validated
+// the chain (16 of 18 skies covered, no leak, none of the 5 skyless
+// frames prompted), the other classes read their map at the level the
+// model is sure of them. thresholds and counts are the contract of the
+// recorded recipes, and a change to any of them changes what a recipe
+// replays to. every function below is pure and deterministic -- ties
+// resolve in raster order, no sampling is random -- so a replay's
+// pass-2 points are the creation's, byte for byte
 
-#define SKY_P_POS 0.7f        // surely sky: positives, and the guard
-#define SKY_P_NEG 0.05f       // surely not sky: negatives, pass-2 overflow
-#define SKY_P_BOX 0.4f        // the sky's extent: box, negative frontier
-#define SKY_P_MISS 0.5f       // pass 2: map sky the first mask missed
+#define SKY_P_MISS 0.5f       // pass 2: map class the first mask missed,
+                              // never above the row's positives
 #define SKY_K_MIN 5           // positives topped up to this many
 #define SKY_K_MAX 9           // per label and per pass
 #define SKY_BAND 0.03f        // negative band, fraction of the long side
@@ -5092,11 +5095,12 @@ static int _sky_fps(const uint8_t *const cand,
 }
 
 // pass-1 positives: the grid centres, topped up by sampling. `pts` holds
-// at least SKY_K_MAX entries; returns the count, 0 only when the map
-// has no pixel above SKY_P_POS (the caller's guard has already said so)
+// at least SKY_K_MAX entries; returns the count, 0 when the map has no
+// pixel above the row's p_pos
 static int _sky_positives(const float *const p,
                           const int w,
                           const int h,
+                          const float p_pos,
                           dt_seg_point_t *const pts)
 {
   int n = 0;
@@ -5112,7 +5116,7 @@ static int _sky_positives(const float *const p,
       for(int y = y0; y < y1; y++)
         for(int x = x0; x < x1; x++)
           cell_max = MAX(cell_max, p[(size_t)y * w + x]);
-      if(cell_max <= SKY_P_POS) continue;
+      if(cell_max <= p_pos) continue;
 
       // the distance transform of the cell's surely-sky zone, measured to
       // the cell's own uncertain pixels only (a neighbouring cell's do
@@ -5125,7 +5129,7 @@ static int _sky_positives(const float *const p,
       for(int y = 0; y < ch; y++)
         for(int x = 0; x < cw; x++)
         {
-          const gboolean in = p[(size_t)(y0 + y) * w + x0 + x] > SKY_P_POS;
+          const gboolean in = p[(size_t)(y0 + y) * w + x0 + x] > p_pos;
           d[(size_t)y * cw + x] = in ? DT_DISTANCE_TRANSFORM_MAX : 0.0f;
           any_out |= !in;
         }
@@ -5162,7 +5166,7 @@ static int _sky_positives(const float *const p,
     uint8_t *cand = g_try_malloc((size_t)npix);
     if(cand)
     {
-      for(int i = 0; i < npix; i++) cand[i] = p[i] > SKY_P_POS;
+      for(int i = 0; i < npix; i++) cand[i] = p[i] > p_pos;
       n = _sky_fps(cand, p, w, h, SKY_K_MIN, 1, pts, n);
       g_free(cand);
     }
@@ -5170,11 +5174,14 @@ static int _sky_positives(const float *const p,
   return MIN(n, SKY_K_MAX);
 }
 
-// pass-1 negatives: `k` points among p < SKY_P_NEG, close to the sky's
-// frontier. appended at pts[0..); returns the count
+// pass-1 negatives: `k` points among p < p_neg, close to the frontier
+// of the class's extent (p > p_box). appended at pts[0..); returns the
+// count
 static int _sky_negatives(const float *const p,
                           const int w,
                           const int h,
+                          const float p_neg,
+                          const float p_box,
                           const int k,
                           dt_seg_point_t *const pts)
 {
@@ -5186,16 +5193,16 @@ static int _sky_negatives(const float *const p,
   int n = 0;
   if(!dist || !cand || !band_cand || !weight) goto done;
 
-  // distance of every non-sky pixel to the nearest pixel of the sky's
-  // extent (p > SKY_P_BOX); zero on the sky itself
-  gboolean any_sky = FALSE;
+  // distance of every pixel outside the class's extent (p > p_box) to
+  // the nearest pixel of it; zero on the extent itself
+  gboolean any_in = FALSE;
   for(int i = 0; i < npix; i++)
   {
-    const gboolean sky = p[i] > SKY_P_BOX;
-    dist[i] = sky ? 0.0f : DT_DISTANCE_TRANSFORM_MAX;
-    any_sky |= sky;
+    const gboolean in = p[i] > p_box;
+    dist[i] = in ? 0.0f : DT_DISTANCE_TRANSFORM_MAX;
+    any_in |= in;
   }
-  if(any_sky)
+  if(any_in)
     _sky_edt(dist, w, h);
   else
     for(int i = 0; i < npix; i++) dist[i] = 0.0f;
@@ -5203,7 +5210,7 @@ static int _sky_negatives(const float *const p,
   int n_cand = 0;
   for(int i = 0; i < npix; i++)
   {
-    cand[i] = p[i] < SKY_P_NEG;
+    cand[i] = p[i] < p_neg;
     n_cand += cand[i];
   }
   if(n_cand == 0) goto done;
@@ -5242,19 +5249,22 @@ done:
   return n;
 }
 
-// the box around the sky's extent, with its margin, as the two corner
-// prompts the segmentation decoder takes. p > SKY_P_BOX is never empty
-// past the guard; the surely-sky set stands in should it ever be
+// the box around the class's extent (p > p_box), with its margin, as
+// the two corner prompts the segmentation decoder takes. the extent is
+// never empty once positives were found; the surely-class set (p >
+// p_pos) stands in should it ever be
 static void _sky_box(const float *const p,
                      const int w,
                      const int h,
+                     const float p_pos,
+                     const float p_box,
                      dt_seg_point_t *const tl,
                      dt_seg_point_t *const br)
 {
   int min_x = INT_MAX, min_y = INT_MAX, max_x = INT_MIN, max_y = INT_MIN;
   for(int pass = 0; pass < 2 && max_x == INT_MIN; pass++)
   {
-    const float thr = pass == 0 ? SKY_P_BOX : SKY_P_POS;
+    const float thr = pass == 0 ? p_box : p_pos;
     for(int y = 0; y < h; y++)
       for(int x = 0; x < w; x++)
         if(p[(size_t)y * w + x] > thr)
@@ -5283,11 +5293,14 @@ static void _sky_box(const float *const p,
 
 // the pass-1 prompts in encode-grid pixels: positives, then negatives,
 // then the box corners, in that order in `pts` (at least SKY_K_MAX * 2
-// + 2 entries). returns the count, 0 when the guard refuses (no pixel
-// of the map above SKY_P_POS: no sky in this frame)
+// + 2 entries), read against the thresholds of the detector row.
+// returns the count, 0 when the guard refuses (no pixel of the map
+// above p_guard) or no positive is found above p_pos: none of the class
+// in this frame
 static int _sky_prompts_pass1(const float *const p,
                               const int w,
                               const int h,
+                              const dt_detector_t *const det,
                               dt_seg_point_t *const pts,
                               float *const max_p)
 {
@@ -5295,13 +5308,13 @@ static int _sky_prompts_pass1(const float *const p,
   float pmax = 0.0f;
   for(int i = 0; i < npix; i++) pmax = MAX(pmax, p[i]);
   if(max_p) *max_p = pmax;
-  if(pmax <= SKY_P_POS) return 0;
+  if(pmax <= det->p_guard) return 0;
 
-  int n = _sky_positives(p, w, h, pts);
+  int n = _sky_positives(p, w, h, det->p_pos, pts);
   if(n == 0) return 0;
   const int k = MAX(SKY_K_MIN, n);
-  n += _sky_negatives(p, w, h, k, pts + n);
-  _sky_box(p, w, h, &pts[n], &pts[n + 1]);
+  n += _sky_negatives(p, w, h, det->p_neg, det->p_box, k, pts + n);
+  _sky_box(p, w, h, det->p_pos, det->p_box, &pts[n], &pts[n + 1]);
   return n + 2;
 }
 
@@ -5420,9 +5433,10 @@ done:
 }
 
 // the pass-2 corrections from the first mask read against the map:
-// positives at the centres of the map sky the mask missed, negatives at
-// the centres of the mask's overflow onto surely-not-sky, largest
-// regions first. `room` caps the total (the recipe holds
+// positives at the centres of the map class the mask missed, negatives
+// at the centres of the mask's overflow onto surely-not-class, largest
+// regions first. the miss level is the relaxed SKY_P_MISS, never above
+// the row's own positives. `room` caps the total (the recipe holds
 // DT_RF_RECIPE_MAX_POINTS in all): when both lists together exceed it
 // each keeps its largest regions, the room split evenly with the odd
 // slot to the positives -- the clouds the first pass tends to carve out
@@ -5432,6 +5446,7 @@ static int _sky_prompts_pass2(const float *const p,
                               const float *const mask,
                               const int w,
                               const int h,
+                              const dt_detector_t *const det,
                               const int room,
                               dt_seg_point_t *const pts,
                               int *const n_pos_out,
@@ -5439,6 +5454,7 @@ static int _sky_prompts_pass2(const float *const p,
 {
   const int npix = w * h;
   const int min_area = (int)ceilf(SKY_FIX_MIN_AREA * (float)npix);
+  const float p_miss = MIN(SKY_P_MISS, det->p_pos);
   dt_seg_point_t neg[SKY_K_MAX], pos[SKY_K_MAX];
   int n_neg = 0, n_pos = 0;
   uint8_t *bin = g_try_malloc((size_t)npix);
@@ -5451,10 +5467,10 @@ static int _sky_prompts_pass2(const float *const p,
   }
 
   for(int i = 0; i < npix; i++)
-    bin[i] = mask[i] > SKY_THRESHOLD && p[i] < SKY_P_NEG;
+    bin[i] = mask[i] > SKY_THRESHOLD && p[i] < det->p_neg;
   n_neg = _sky_region_centres(bin, w, h, min_area, SKY_K_MAX, 0, neg);
   for(int i = 0; i < npix; i++)
-    bin[i] = p[i] > SKY_P_MISS && !(mask[i] > SKY_THRESHOLD);
+    bin[i] = p[i] > p_miss && !(mask[i] > SKY_THRESHOLD);
   n_pos = _sky_region_centres(bin, w, h, min_area, SKY_K_MAX, 1, pos);
   g_free(bin);
 
@@ -5464,9 +5480,9 @@ static int _sky_prompts_pass2(const float *const p,
     const int keep_neg = MIN(n_neg, room - keep_pos);
     keep_pos = MIN(n_pos, room - keep_neg);
     dt_print(DT_DEBUG_AI,
-             "[object mask] sky: pass 2 wants %d+/%d- points, %d slots left"
+             "[object mask] %s: pass 2 wants %d+/%d- points, %d slots left"
              " in the recipe, keeping %d+/%d-",
-             n_pos, n_neg, room, keep_pos, keep_neg);
+             det->label, n_pos, n_neg, room, keep_pos, keep_neg);
     n_pos = keep_pos;
     n_neg = keep_neg;
   }
@@ -5769,9 +5785,12 @@ static int32_t _detect_job_run(dt_job_t *job)
 
   // a fresh environment scans the installed models, so it must be
   // created after the download; loading is BY the resolved id, with the
-  // task check of the detect consumer
+  // task check of the detect consumer, on the row's prompt for a text
+  // model
   env = dt_ai_env_init(NULL);
-  det = env ? dt_detect_load(env, j->model_id, j->detector->task) : NULL;
+  det = env ? dt_detect_load(env, j->model_id, j->detector->task,
+                             j->detector->prompt_index)
+            : NULL;
   if(!det)
   {
     dt_control_log(_("cannot load the detection model"));
@@ -5971,7 +5990,8 @@ static int32_t _detect_job_run(dt_job_t *job)
         dt_detect_free(det);
         det = NULL;
         dt_detect_context_t *alt = dt_detect_load(env, fallback,
-                                                  j->detector->task);
+                                                  j->detector->task,
+                                                  j->detector->prompt_index);
         float *alt_hint = alt
           ? g_try_malloc(npix * sizeof(float)) : NULL;
         if(alt_hint && dt_detect_run(alt, rgb, out_w, out_h, alt_hint))
@@ -6021,26 +6041,30 @@ static int32_t _detect_job_run(dt_job_t *job)
   if(via_points)
   {
     // ---- the map chooses the prompts, the segmentation model draws ----
-    // (see the sky prompt derivation above for the rules and their
-    // origin). every prompt goes through the recipe and back before it
-    // is decoded, so the decodes here and the replay's see the same
-    // tensors
+    // (see the text prompt derivation above for the rules and their
+    // origin; the thresholds are the row's). every prompt goes through
+    // the recipe and back before it is decoded, so the decodes here and
+    // the replay's see the same tensors
+    const dt_detector_t *const det_row = j->detector;
+    const char *const what = det_row->label;   // the journal's, untranslated
     float *pmap = hint;   // the detector's map, the decodes' guide
     hint = NULL;
     float *mask1 = NULL;
     dt_seg_point_t pts[DT_RF_RECIPE_MAX_POINTS];
     float max_p = 0.0f;
     const double t_sky = dt_get_wtime();
-    int n1 = _sky_prompts_pass1(pmap, out_w, out_h, pts, &max_p);
+    int n1 = _sky_prompts_pass1(pmap, out_w, out_h, det_row, pts, &max_p);
     if(n1 == 0)
     {
-      // the guard: no pixel of the map is surely sky. nothing is
+      // the guard: no pixel of the map is surely the class. nothing is
       // created, and the toast says why -- a silent empty mask would
       // read as a failure of the tool
       dt_print(DT_DEBUG_AI,
-               "[object mask] sky: map peak %.3f <= %.2f, no sky in this"
-               " frame (%.2fs)", max_p, SKY_P_POS, dt_get_wtime() - t_sky);
-      dt_control_log(_("no sky found in this image"));
+               "[object mask] %s: map peak %.3f (guard %.2f, positives"
+               " above %.2f), none in this frame (%.2fs)",
+               what, max_p, det_row->p_guard, det_row->p_pos,
+               dt_get_wtime() - t_sky);
+      dt_control_log(_("no %s found in this image"), _(det_row->label));
       g_free(pmap);
       goto cleanup;
     }
@@ -6051,10 +6075,10 @@ static int32_t _detect_job_run(dt_job_t *job)
       n_neg1 += pts[k].label == 0;
     }
     dt_print(DT_DEBUG_AI,
-             "[object mask] sky: map peak %.3f, pass 1: %d positive(s),"
+             "[object mask] %s: map peak %.3f, pass 1: %d positive(s),"
              " %d negative(s), box (%.0f,%.0f)-(%.0f,%.0f) on %dx%d"
              " (%.2fs)",
-             max_p, n_pos1, n_neg1, pts[n1 - 2].x, pts[n1 - 2].y,
+             what, max_p, n_pos1, n_neg1, pts[n1 - 2].x, pts[n1 - 2].y,
              pts[n1 - 1].x, pts[n1 - 1].y, out_w, out_h,
              dt_get_wtime() - t_sky);
     if(!_sky_record_points(&dev, &pipe, out_w, out_h, pts, 0, n1, &recipe))
@@ -6095,8 +6119,8 @@ static int32_t _detect_job_run(dt_job_t *job)
       recipe.points[n1 - 1].decode_after = 1;
       recipe.points[n1 - 1].threshold = SKY_THRESHOLD;
       dt_print(DT_DEBUG_AI,
-               "[object mask] sky: the segmentation model takes no box,"
-               " %d point(s) kept", n1);
+               "[object mask] %s: the segmentation model takes no box,"
+               " %d point(s) kept", what, n1);
     }
     gboolean encoded = FALSE;
     if(dt_seg_disk_cache_load(seg, j->imgid, j->distort_hash))
@@ -6107,13 +6131,14 @@ static int32_t _detect_job_run(dt_job_t *job)
       {
         encoded = TRUE;
         dt_print(DT_DEBUG_AI,
-                 "[object mask] sky: cached encoding %dx%d reused", cw, ch);
+                 "[object mask] %s: cached encoding %dx%d reused",
+                 what, cw, ch);
       }
       else
       {
         dt_print(DT_DEBUG_AI,
-                 "[object mask] sky: cached encoding is %dx%d, this render"
-                 " is %dx%d, re-encoding", cw, ch, out_w, out_h);
+                 "[object mask] %s: cached encoding is %dx%d, this render"
+                 " is %dx%d, re-encoding", what, cw, ch, out_w, out_h);
         dt_seg_reset_encoding(seg);
       }
     }
@@ -6132,8 +6157,8 @@ static int32_t _detect_job_run(dt_job_t *job)
         g_free(pmap);
         goto cleanup;
       }
-      dt_print(DT_DEBUG_AI, "[object mask] sky: encoded %dx%d (%.2fs)",
-               out_w, out_h, dt_get_wtime() - t_enc);
+      dt_print(DT_DEBUG_AI, "[object mask] %s: encoded %dx%d (%.2fs)",
+               what, out_w, out_h, dt_get_wtime() - t_enc);
     }
     g_free(rgb);
     rgb = NULL;
@@ -6162,7 +6187,7 @@ static int32_t _detect_job_run(dt_job_t *job)
     // correct -- its mask under the row's component rule, which is what
     // the replay's decode at that boundary yields
     int n_pos2 = 0, n_neg2 = 0;
-    const int n2 = _sky_prompts_pass2(pmap, mask1, out_w, out_h,
+    const int n2 = _sky_prompts_pass2(pmap, mask1, out_w, out_h, det_row,
                                       DT_RF_RECIPE_MAX_POINTS - n1,
                                       pts + n1, &n_pos2, &n_neg2);
     g_free(pmap);
@@ -6170,8 +6195,8 @@ static int32_t _detect_job_run(dt_job_t *job)
     if(n2 > 0)
     {
       dt_print(DT_DEBUG_AI,
-               "[object mask] sky: pass 2: %d positive(s), %d negative(s)"
-               " added", n_pos2, n_neg2);
+               "[object mask] %s: pass 2: %d positive(s), %d negative(s)"
+               " added", what, n_pos2, n_neg2);
       if(!_sky_record_points(&dev, &pipe, out_w, out_h, pts, n1, n1 + n2,
                              &recipe))
       {
@@ -6194,16 +6219,16 @@ static int32_t _detect_job_run(dt_job_t *job)
     }
     else
     {
-      dt_print(DT_DEBUG_AI, "[object mask] sky: pass 2: nothing to correct,"
-                            " pass 1 stands");
+      dt_print(DT_DEBUG_AI, "[object mask] %s: pass 2: nothing to correct,"
+                            " pass 1 stands", what);
       _keep_major_components(mask1, out_w, out_h, SKY_THRESHOLD,
                              j->detector->cc_ratio, FALSE);
       hint = mask1;
       mask1 = NULL;
     }
     dt_print(DT_DEBUG_AI,
-             "[object mask] sky: %d point(s) recorded, %d decode(s)"
-             " (%.2fs)", recipe.n_points, n2 > 0 ? 2 : 1,
+             "[object mask] %s: %d point(s) recorded, %d decode(s)"
+             " (%.2fs)", what, recipe.n_points, n2 > 0 ? 2 : 1,
              dt_get_wtime() - t_sky);
 
     // the segmentation stack is done; release it before the heavy native

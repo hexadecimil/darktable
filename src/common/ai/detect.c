@@ -16,12 +16,12 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-/* One-shot promptless detection.
+/* One-shot detection.
  *
  * Third instance of the model-consumer pattern: segmentation.c drives the
  * interactive SAM stack, refine.c the CascadePSP chain, this file the
- * detectors that take the photo alone -- no prompt -- and answer with a
- * soft mask (salient subject today, semantic classes later). One
+ * detectors that take the photo alone -- no click -- and answer with a
+ * soft mask: the salient subject, or the class a text prompt names. One
  * fixed-size network, one inference, the result resampled back onto the
  * caller's grid.
  *
@@ -30,6 +30,11 @@
  * read from the model's config.json, because the task families it serves
  * share the calling convention and differ only in those constants -- the
  * bench-selected model replaces the development one by packaging alone.
+ * A text-conditioned model (CLIPSeg exported with the text embedding as
+ * a second input) is the same consumer with one more tensor: the
+ * embeddings of its prompts are frozen at export into prompts.bin next
+ * to the model, listed by name in the manifest, and the caller picks one
+ * by index -- no text tower runs here.
  *
  * Loading is BY ID, never "the active model of the task": the recipe
  * replay must load the recorded model even when the user has since
@@ -45,6 +50,7 @@
 #include "common/math.h"
 #include "control/control.h"
 
+#include <json-glib/json-glib.h>
 #include <math.h>
 #include <string.h>
 
@@ -77,6 +83,12 @@ struct dt_detect_context_t
   float stdv[3];
 
   float *t_image;       // 3 * side * side, CHW
+  float *t_prompt;      // prompt_dim floats, the embedding of the prompt
+                        // this context answers about; NULL for a model
+                        // that takes the image alone
+  int prompt_dim;       // attributes.prompt_dim
+  int text_input;       // slot of the text tensor among the two inputs
+                        // (dt_ai_run binds by position)
   float *o_mask;        // side * side
 };
 
@@ -100,9 +112,126 @@ gboolean dt_detect_available(const char *task)
 }
 
 
+/* The prompt list of a text-conditioned model: attributes.prompts is a
+ * JSON array of strings, which the numeric accessors of the backend do
+ * not read, so the attribute block is parsed here. Returns the length
+ * of the list (0 when absent) and, through `name`, the entry at `index`
+ * when there is one (caller frees). */
+static int _prompt_list(const dt_ai_model_info_t *info,
+                        const int index,
+                        char **name)
+{
+  if(name) *name = NULL;
+  if(!info->attributes) return 0;
+
+  int n = 0;
+  JsonParser *parser = json_parser_new();
+  if(json_parser_load_from_data(parser, info->attributes, -1, NULL))
+  {
+    JsonNode *root = json_parser_get_root(parser);
+    JsonObject *obj = root && JSON_NODE_HOLDS_OBJECT(root)
+      ? json_node_get_object(root) : NULL;
+    JsonNode *node = obj && json_object_has_member(obj, "prompts")
+      ? json_object_get_member(obj, "prompts") : NULL;
+    if(node && JSON_NODE_HOLDS_ARRAY(node))
+    {
+      JsonArray *arr = json_node_get_array(node);
+      n = (int)json_array_get_length(arr);
+      if(name && index >= 0 && index < n)
+      {
+        JsonNode *e = json_array_get_element(arr, index);
+        if(e && JSON_NODE_HOLDS_VALUE(e)
+           && json_node_get_value_type(e) == G_TYPE_STRING)
+          *name = g_strdup(json_node_get_string(e));
+      }
+    }
+  }
+  g_object_unref(parser);
+  return n;
+}
+
+
+/* The embedding of prompt `index`, read from prompts.bin in the model's
+ * folder and checked against the manifest: the file holds exactly the
+ * embeddings the list names, prompt_dim float32 each, little-endian, in
+ * the order of the list. Newly allocated, prompt_dim floats; NULL with
+ * the reason journaled. The folder is the registry's, the same one the
+ * model card is read from. */
+static float *_load_prompt(const dt_ai_model_info_t *info,
+                           const char *model_id,
+                           const int index,
+                           int *dim_out)
+{
+  char *name = NULL;
+  const int n = _prompt_list(info, index, &name);
+  const int dim = dt_ai_model_attribute_int(info, "prompt_dim", 0);
+  float *out = NULL;
+  char *dir = NULL, *path = NULL, *data = NULL;
+  gsize len = 0, expected = 0;
+
+  if(n <= 0 || dim <= 0)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[detect] model %s takes a text prompt but its manifest names"
+             " no prompts / prompt_dim", model_id);
+    goto out;
+  }
+  if(index < 0 || index >= n)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[detect] model %s: prompt %d is not among its %d prompts",
+             model_id, index, n);
+    goto out;
+  }
+
+  dir = dt_ai_models_get_path(model_id);
+  path = dir ? g_build_filename(dir, "prompts.bin", NULL) : NULL;
+  if(!path || !g_file_get_contents(path, &data, &len, NULL))
+  {
+    dt_print(DT_DEBUG_AI, "[detect] model %s: cannot read %s", model_id,
+             path ? path : "prompts.bin");
+    goto out;
+  }
+  expected = (gsize)n * (gsize)dim * sizeof(float);
+  if(len != expected)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[detect] model %s: prompts.bin holds %" G_GSIZE_FORMAT
+             " bytes where %d x %d floats (%" G_GSIZE_FORMAT ") were"
+             " expected", model_id, len, n, dim, expected);
+    goto out;
+  }
+
+  out = g_try_malloc((size_t)dim * sizeof(float));
+  if(!out)
+  {
+    dt_print(DT_DEBUG_AI, "[detect] out of memory for the prompt embedding");
+    goto out;
+  }
+  for(int k = 0; k < dim; k++)
+  {
+    uint32_t u;
+    memcpy(&u, data + ((gsize)index * dim + k) * sizeof(float), sizeof(u));
+    u = GUINT32_FROM_LE(u);
+    memcpy(&out[k], &u, sizeof(u));
+  }
+  *dim_out = dim;
+  dt_print(DT_DEBUG_AI, "[detect] model %s: prompt %d '%s' (%d floats)",
+           model_id, index, name ? name : "?", dim);
+
+out:
+  g_free(data);
+  g_free(path);
+  g_free(dir);
+  g_free(name);
+  return out;
+}
+
+
 dt_detect_context_t *dt_detect_load(dt_ai_environment_t *env,
                                     const char *model_id,
-                                    const char *task)
+                                    const char *task,
+                                    const int prompt_index)
 {
   if(!env || !model_id || !model_id[0]) return NULL;
 
@@ -144,11 +273,15 @@ dt_detect_context_t *dt_detect_load(dt_ai_environment_t *env,
                                              DT_AI_OPT_DEFAULT, NULL, 0);
   if(!ai) return NULL;
 
-  if(dt_ai_get_input_count(ai) != 1 || dt_ai_get_output_count(ai) != 1)
+  // the session is the arbiter of the input count, whatever the
+  // manifest says: one input is the image, two are the image and the
+  // text embedding, anything else is not a detector
+  const int n_inputs = dt_ai_get_input_count(ai);
+  if((n_inputs != 1 && n_inputs != 2) || dt_ai_get_output_count(ai) != 1)
   {
     dt_print(DT_DEBUG_AI,
-             "[detect] expected 1 input / 1 output, got %d / %d",
-             dt_ai_get_input_count(ai), dt_ai_get_output_count(ai));
+             "[detect] expected 1-2 inputs / 1 output, got %d / %d",
+             n_inputs, dt_ai_get_output_count(ai));
     dt_ai_unload_model(ai);
     return NULL;
   }
@@ -159,6 +292,24 @@ dt_detect_context_t *dt_detect_load(dt_ai_environment_t *env,
   ctx->model_id = g_strdup(model_id);
   ctx->side = side;
   ctx->letterbox = dt_ai_model_attribute_bool(info, "letterbox");
+
+  if(n_inputs == 2)
+  {
+    ctx->t_prompt = _load_prompt(info, model_id, prompt_index,
+                                 &ctx->prompt_dim);
+    if(!ctx->t_prompt)
+    {
+      dt_detect_free(ctx);
+      return NULL;
+    }
+    // dt_ai_run binds the inputs by position, so the text tensor's slot
+    // is read from the session: the input the model names
+    // text_embedding, the second one when it names neither
+    ctx->text_input = 1;
+    for(int i = 0; i < 2; i++)
+      if(g_strcmp0(dt_ai_get_input_name(ai, i), "text_embedding") == 0)
+        ctx->text_input = i;
+  }
 
   // the models of this family emit logits; an absent attribute means
   // "sigmoid", only an explicit "none" opts out
@@ -228,6 +379,7 @@ void dt_detect_free(dt_detect_context_t *ctx)
 {
   if(!ctx) return;
   g_free(ctx->t_image);
+  g_free(ctx->t_prompt);
   g_free(ctx->o_mask);
   g_free(ctx->model_id);
   if(ctx->ai_ctx) dt_ai_unload_model(ctx->ai_ctx);
@@ -397,15 +549,26 @@ gboolean dt_detect_run(dt_detect_context_t *ctx,
   {
     shape_1c[0] = s; shape_1c[1] = s;
   }
-  dt_ai_tensor_t input = {
+  // the image, and for a text-conditioned model the prompt embedding
+  // in the slot the session declared for it (see dt_detect_load)
+  int64_t shape_txt[2] = { 1, ctx->prompt_dim };
+  dt_ai_tensor_t inputs[2];
+  const int n_inputs = ctx->t_prompt ? 2 : 1;
+  const int img_input = ctx->t_prompt ? 1 - ctx->text_input : 0;
+  inputs[img_input] = (dt_ai_tensor_t){
     .data = (void *)ctx->t_image,
     .shape = shape_img, .ndim = 4, .type = DT_AI_FLOAT
   };
+  if(ctx->t_prompt)
+    inputs[ctx->text_input] = (dt_ai_tensor_t){
+      .data = (void *)ctx->t_prompt,
+      .shape = shape_txt, .ndim = 2, .type = DT_AI_FLOAT
+    };
   dt_ai_tensor_t output = {
     .data = ctx->o_mask,
     .shape = shape_1c, .ndim = out_ndim, .type = DT_AI_FLOAT
   };
-  if(dt_ai_run(ctx->ai_ctx, &input, 1, &output, 1) != 0)
+  if(dt_ai_run(ctx->ai_ctx, inputs, n_inputs, &output, 1) != 0)
   {
     // one retry on the CPU provider, the restore_* convention: the
     // observed failure mode is the GPU EP running out of VRAM
@@ -425,7 +588,7 @@ gboolean dt_detect_run(dt_detect_context_t *ctx,
              "[detect] GPU inference failed; retrying on CPU");
     dt_control_log(_("AI detection: GPU inference failed, "
                      "falling back to CPU"));
-    if(dt_ai_run(ctx->ai_ctx, &input, 1, &output, 1) != 0)
+    if(dt_ai_run(ctx->ai_ctx, inputs, n_inputs, &output, 1) != 0)
     {
       dt_print(DT_DEBUG_AI, "[detect] inference failed");
       return FALSE;

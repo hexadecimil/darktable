@@ -62,15 +62,20 @@
 #define DT_RF_PROMPT_POINTS 0    // clicked prompts; points[] replay
 #define DT_RF_PROMPT_SUBJECT 1   // one-shot salient subject; no points
 #define DT_RF_PROMPT_SEMANTIC 2  // semantic classes (class_bits); no points
-// the sky selection: a detector's coarse map chose the prompts, the
+// the text selections (sky, water, vegetation, person): a detector's
+// coarse map, answered about a text prompt, chose the prompts, the
 // interactive segmentation model drew the mask from them. the recipe is
 // a POINTS recipe in every mechanical respect -- seg_model is the
 // segmentation model, points[] are the derived prompts with their decode
 // boundaries, the replay is the clicked replay -- and a DETECTOR row for
-// everything the user sees (creation entry, form name). the map itself
+// everything the user sees (creation entry, form name), told from its
+// siblings by class_bits, which carries the prompt index. the map itself
 // is not recorded: it served once, to choose the points, and the points
-// alone regenerate the file
-#define DT_RF_PROMPT_SKY 3       // detector-derived prompts; points[] replay
+// alone regenerate the file. the symbol keeps the name of the first such
+// row, whose recipes it was written under
+#define DT_RF_PROMPT_SKY 3       // detector-derived prompts (text map),
+                                 // class_bits = prompt index; points[]
+                                 // replay
 
 // the two families a prompt kind can belong to, each asked at its own
 // call sites. a kind may belong to both (SKY does), so neither is the
@@ -148,7 +153,8 @@ typedef struct dt_rf_recipe_t
   // to EXT), never a second layout migration
   int32_t prompt_kind;     // DT_RF_PROMPT_*; selects the replay family
   int32_t detect_input;    // detector model input side; 0 for POINTS
-  int64_t class_bits;      // semantic class set; 0 unless SEMANTIC
+  int64_t class_bits;      // semantic class set (SEMANTIC), prompt index
+                           // (SKY); 0 otherwise
   // the matting stage. all four are written together or not at all, and
   // only from version EXT: a session that ran the stage records enabled,
   // the operator's table id, its ALGORITHM revision (bumped by any numeric
