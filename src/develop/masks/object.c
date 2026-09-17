@@ -190,6 +190,22 @@ typedef struct _object_data_t
                                // dev->gui_module may hold whatever module
                                // the user unfolded in the meantime
   dt_rf_recipe_t edit_recipe;  // owned copy of the recipe being replayed
+  // the component rule of the session's decodes: a text-selection recipe
+  // (sky, water, ...) keeps every component above its detector row's
+  // floor where a clicked one keeps the seed's. borrowed from the static
+  // table, NULL for the clicked rule. the replay, the live decodes and
+  // the re-capture all read it, so the mask on screen, the mask a click
+  // refines and the recipe that regenerates it obey ONE rule
+  const dt_detector_t *edit_detector;
+  // -- refinement of an existing raster shape --
+  // the shape the session reopened, replaced IN PLACE by the closing
+  // gesture (NO_MASKID: the session closes into a new shape), and the
+  // module whose masks history item that replacement commits -- by
+  // identity, never by pointer: the finalisation job outlives any widget
+  int32_t edit_replace_formid;
+  gboolean edit_has_sink;
+  char edit_sink_op[32];
+  int32_t edit_sink_priority;
   // -- the session's own parameters --
   // during an edit session these hold the RECORDED values, so a decode
   // added after the replay continues the recorded chain instead of
@@ -297,6 +313,7 @@ struct _edit_replay_job_t
 {
   _object_data_t od;    // stand-in; seg/env/refine ALIAS the session's
   dt_rf_recipe_t recipe;
+  const dt_detector_t *detector; // the session's component rule, borrowed
   float *enc_pts;       // prompts in session encode space, snapshotted on
                         // the GUI thread at launch
   int n_points;
@@ -422,6 +439,12 @@ static void _edit_session_end(_object_data_t *d, const int final_state)
   // reading behind for a later session to inherit
   d->edit_matte_seeded = FALSE;
   d->edit_matte_op = NULL;
+  d->edit_detector = NULL;
+  // a session that failed or was dropped no longer stands for the shape
+  // it reopened: whatever the surviving plain tool produces is a new
+  // shape, never a replacement of one it did not start from
+  d->edit_replace_formid = NO_MASKID;
+  d->edit_has_sink = FALSE;
   d->edit_baseline_valid = FALSE;
   g_atomic_int_set(&d->edit_pending, final_state);
 }
@@ -875,13 +898,17 @@ static gpointer _encode_thread_func(gpointer data)
   double final_scale = fmin(scale, 1.0); // don't upscale
   int out_w = (int)(final_scale * pipe.processed_width);
   int out_h = (int)(final_scale * pipe.processed_height);
-  if(pinned)
+  // the model is pinned, the dimensions only when the recipe records
+  // some: a refinement whose prompts were derived from a mask file
+  // records none (they are normalised, any grid takes them) and encodes
+  // the current frame under the recorded cap, like a plain session
+  const gboolean pin_dims = pinned && pin_w > 0 && pin_h > 0;
+  if(pin_dims)
   {
     // the recipe travels in the XMP and is untrusted input: the encode
     // render never upscales, so recorded dims above the processed frame
     // are necessarily corrupt (headless replay rule)
-    if(pin_w <= 0 || pin_h <= 0
-       || pin_w > pipe.processed_width || pin_h > pipe.processed_height)
+    if(pin_w > pipe.processed_width || pin_h > pipe.processed_height)
     {
       dt_print(DT_DEBUG_AI,
                "[object mask] edit: recorded encode dims %dx%d unusable for"
@@ -928,7 +955,7 @@ static gpointer _encode_thread_func(gpointer data)
     // edit session: the cache is validated without dimensions, and a hit
     // at other dims than the recipe records would put the replayed
     // prompts on the wrong grid -- re-encode then (headless replay rule)
-    if(!pinned || (cw == pin_w && ch == pin_h))
+    if(!pin_dims || (cw == pin_w && ch == pin_h))
     {
       dt_dev_pixelpipe_cleanup(&pipe);
       dt_mipmap_cache_release(&buf);
@@ -1581,18 +1608,25 @@ static void _launch_decode(dt_masks_form_gui_t *gui)
     job->points[i].label = (int)gpp[i];
   }
 
-  // seed point for the connected component filter: last positive point
+  // seed point for the connected component filter: last positive point.
+  // a session reopened on a text selection keeps its detector row's
+  // rule instead (every component above the row's floor, no seed), as
+  // the replay of its recorded decodes did: a click added to a sky must
+  // not drop the patches between the branches the sky was made with
   job->seed_x = -1;
   job->seed_y = -1;
-  for(int i = gui->guipoints_count - 1; i >= 0; i--)
-  {
-    if((int)gpp[i] == 1)
+  if(d->edit_valid && d->edit_detector)
+    job->cc_ratio = d->edit_detector->cc_ratio;
+  else
+    for(int i = gui->guipoints_count - 1; i >= 0; i--)
     {
-      job->seed_x = (int)(gp[i * 2 + 0] * sx);
-      job->seed_y = (int)(gp[i * 2 + 1] * sy);
-      break;
+      if((int)gpp[i] == 1)
+      {
+        job->seed_x = (int)(gp[i * 2 + 0] * sx);
+        job->seed_y = (int)(gp[i * 2 + 1] * sy);
+        break;
+      }
     }
-  }
 
   // through the session accessors: an edit session decodes with the
   // recipe's recorded scalars, not the preferences of the day. a click
@@ -2040,6 +2074,11 @@ typedef struct _finalize_job_t
   char target_op[32];
   int target_multi_priority;
   gboolean has_target;
+  // the raster shape a refinement session reopened: the produced file
+  // replaces that shape's IN PLACE instead of becoming a new one.
+  // NO_MASKID for a creation. by id, like the target: resolved at apply
+  // time, on the GUI thread, against whatever the forms are by then
+  int32_t replace_formid;
   gboolean vectorize;   // TRUE: produce path forms instead of a raster file
   int cleanup;          // potrace turdsize, working-grid px^2 (scaled inside)
   float smoothing;      // potrace alphamax
@@ -2236,6 +2275,17 @@ static gboolean _capture_recipe(_object_data_t *d,
     }
   }
   g_free(pts);
+  // a session reopened on a text selection re-captures a recipe of that
+  // kind: its decodes ran under the row's component rule (see
+  // _launch_decode), and only a recipe naming the row replays them so.
+  // the kind is an extension field in use, hence version EXT, as the
+  // detection job wrote it
+  if(d->edit_valid && d->edit_detector)
+  {
+    recipe->version = DT_RF_RECIPE_VERSION_EXT;
+    recipe->prompt_kind = d->edit_detector->prompt_kind;
+    recipe->class_bits = d->edit_detector->class_bits;
+  }
   // the matting stage LAST, over an otherwise finished version-1 blob: it
   // is the only field group whose presence moves the recipe to version
   // EXT, and writing it here makes "an off stage leaves a byte-identical
@@ -2349,6 +2399,7 @@ typedef struct _finalize_apply_t
   char target_op[32];
   int target_multi_priority;
   gboolean has_target;
+  int32_t replace_formid; // the shape to refine in place, or NO_MASKID
   gboolean vectorize;
   GList *forms;         // dt_masks_form_t*, points already input-normalized
   GList *signs;
@@ -2543,6 +2594,80 @@ static gboolean _finalize_apply_idle(gpointer data)
     dt_dev_reprocess_all(dev);
     dt_control_queue_redraw_center();
     return G_SOURCE_REMOVE;
+  }
+
+  // ---- refinement: the reopened shape takes the new file ----
+  // the shape keeps everything that is ITS own -- id, name, side
+  // (background or not), every group it sits in with its operator and
+  // opacity -- and only its point moves: the new recipe names the new
+  // content-addressed file, and a hashed point is what invalidates the
+  // pipe caches of every module wearing it (dt_masks_group_hash). the
+  // old file stays: content-addressed, a duplicate may still name it.
+  // a shape deleted while the job ran falls through to a new one, the
+  // work is not lost
+  if(dt_is_valid_maskid(a->replace_formid))
+  {
+    dt_masks_form_t *old = dt_masks_get_from_id(dev, a->replace_formid);
+    dt_masks_point_raster_t *opt = dt_masks_raster_point(old);
+    if(opt)
+    {
+      if(a->has_recipe)
+      {
+        opt->recipe = a->recipe;
+        memset(opt->file, 0, sizeof(opt->file));
+      }
+      else
+      {
+        memset(&opt->recipe, 0, sizeof(opt->recipe));
+        gchar *leaf = g_path_get_basename(a->outpath);
+        g_strlcpy(opt->file, leaf, sizeof(opt->file));
+        g_free(leaf);
+      }
+
+      dt_iop_module_t *target = NULL;
+      if(a->has_target)
+        for(GList *l = dev->iop; l; l = g_list_next(l))
+        {
+          dt_iop_module_t *m = l->data;
+          if(!strcmp(m->op, a->target_op)
+             && m->multi_priority == a->target_multi_priority)
+          {
+            target = m;
+            break;
+          }
+        }
+      if(target && !target->blend_params) target = NULL;
+
+      dt_print(DT_DEBUG_AI,
+               "[object mask] refine: shape %d '%s' replaced in place"
+               " (%d point(s), kind %d, %s)",
+               old->formid, old->name, a->recipe.n_points,
+               a->recipe.prompt_kind,
+               target ? target->op : "no module");
+
+      dt_dev_add_masks_history_item(dev, target, TRUE);
+      if(target && target->gui_data) dt_iop_gui_update(target);
+      dt_control_log(_("'%s' refined"), old->name);
+      dt_dev_masks_list_change(dev);
+      // put the refined shape back where it was: on the photograph
+      // through its module's edit mode, or through its own library row
+      if(target)
+      {
+        if(!dev->form_gui->creation && !dev->form_visible)
+        {
+          dt_masks_set_edit_mode(target, DT_MASKS_EDIT_FULL);
+          dt_masks_iop_update(target);
+        }
+      }
+      else
+        dt_dev_masks_selection_change(dev, NULL, old->formid);
+      dt_dev_reprocess_all(dev);
+      dt_control_queue_redraw_center();
+      return G_SOURCE_REMOVE;
+    }
+    dt_print(DT_DEBUG_AI,
+             "[object mask] refine: shape %d is gone, filing a new one",
+             a->replace_formid);
   }
 
   // ---- the precise mask becomes a real mask: a raster shape ----
@@ -3688,6 +3813,7 @@ static int32_t _finalize_job_run(dt_job_t *job)
     a->has_target = j->has_target;
     memcpy(a->target_op, j->target_op, sizeof(a->target_op));
     a->target_multi_priority = j->target_multi_priority;
+    a->replace_formid = j->replace_formid;
     a->has_recipe = j->has_recipe;
     if(j->has_recipe)
       a->recipe = j->recipe;
@@ -3795,6 +3921,27 @@ static gboolean _launch_native_finalize(_object_data_t *d,
     g_strlcpy(j->target_op, target->op, sizeof(j->target_op));
     j->target_multi_priority = target->multi_priority;
     j->has_target = TRUE;
+  }
+  // a refinement session closes into the shape it reopened, and the
+  // history item lands on the module that shape's group belongs to --
+  // both decided at the opening, from the shape, never from the module
+  // the canvas hands the gesture (the session opened for no sink). the
+  // paths route keeps its plain behaviour: new paths, no replacement
+  j->replace_formid = NO_MASKID;
+  if(!vectorize && dt_is_valid_maskid(d->edit_replace_formid))
+  {
+    j->replace_formid = d->edit_replace_formid;
+    j->has_target = d->edit_has_sink;
+    if(d->edit_has_sink)
+    {
+      g_strlcpy(j->target_op, d->edit_sink_op, sizeof(j->target_op));
+      j->target_multi_priority = d->edit_sink_priority;
+    }
+    dt_print(DT_DEBUG_AI,
+             "[object mask] refine: finalising for shape %d (%d point(s),"
+             " %s)",
+             j->replace_formid, gui->guipoints_count,
+             d->edit_has_sink ? d->edit_sink_op : "no module");
   }
 
   dt_job_t *job = dt_control_job_create(_finalize_job_run,
@@ -6668,17 +6815,22 @@ static gpointer _edit_replay_thread_func(gpointer data)
       djob->points[k].y = rj->enc_pts[k * 2 + 1];
       djob->points[k].label = (int)recipe->points[k].label;
     }
-    // seed for the connected-component filter: last positive point, as in
-    // _launch_decode
+    // the component filter, as _launch_decode and the headless replay
+    // decide it: the seed of a clicked session is its last positive
+    // point, a text selection's points have no seed and its table row
+    // names the rule
     djob->seed_x = -1;
     djob->seed_y = -1;
-    for(int k = n_prompt - 1; k >= 0; k--)
-      if(recipe->points[k].label == 1)
-      {
-        djob->seed_x = (int)rj->enc_pts[k * 2 + 0];
-        djob->seed_y = (int)rj->enc_pts[k * 2 + 1];
-        break;
-      }
+    if(rj->detector)
+      djob->cc_ratio = rj->detector->cc_ratio;
+    else
+      for(int k = n_prompt - 1; k >= 0; k--)
+        if(recipe->points[k].label == 1)
+        {
+          djob->seed_x = (int)rj->enc_pts[k * 2 + 0];
+          djob->seed_y = (int)rj->enc_pts[k * 2 + 1];
+          break;
+        }
     djob->threshold = CLAMP(recipe->points[i].threshold, 0.3f, 0.9f);
     djob->do_crf = recipe->crf_enabled != 0;
     djob->crf_iter = CLAMP(recipe->crf_iterations, 1, 10);
@@ -6767,6 +6919,44 @@ static void _edit_replay_start(dt_masks_form_gui_t *gui, _object_data_t *d)
     _edit_session_end(d, EDIT_FAILED);
     _edit_drop_pinned_encode(d);
     return;
+  }
+
+  // the two things a recipe of derived prompts (a refinement of a
+  // detector-made mask) leaves to the session, both settled here where
+  // the encoding is known. a recorded recipe never trips either: its
+  // dims and its box were written for the model it pins.
+  //  - no encode dimensions: it takes the session's. normalised
+  //    coordinates land on any grid, and this is the grid the re-capture
+  //    will record;
+  //  - the box is a prompt only the SAM family reads (labels 2 and 3):
+  //    with another segmentation model the two corners are dropped and
+  //    the decode boundary moves back onto the last point -- the
+  //    detection job's own rule, applied here because the prompts are
+  //    chosen before the session's model is loaded
+  {
+    dt_rf_recipe_t *er = &d->edit_recipe;
+    if(er->encode_w <= 0 || er->encode_h <= 0)
+    {
+      er->encode_w = d->encode_w;
+      er->encode_h = d->encode_h;
+    }
+    const int en = er->n_points;
+    if(d->seg && !dt_seg_supports_box(d->seg) && en >= 3
+       && er->points[en - 2].label == 2 && er->points[en - 1].label == 3)
+    {
+      const int32_t after = er->points[en - 1].decode_after;
+      const float thr = er->points[en - 1].threshold;
+      memset(&er->points[en - 2], 0, 2 * sizeof(er->points[0]));
+      er->n_points = en - 2;
+      if(after)
+      {
+        er->points[en - 3].decode_after = 1;
+        er->points[en - 3].threshold = thr;
+      }
+      dt_print(DT_DEBUG_AI,
+               "[object mask] refine: the segmentation model takes no box,"
+               " %d point(s) kept", er->n_points);
+    }
   }
 
   const dt_rf_recipe_t *recipe = &d->edit_recipe;
@@ -6873,6 +7063,7 @@ static void _edit_replay_start(dt_masks_form_gui_t *gui, _object_data_t *d)
   }
   g_free(pts);
   rj->recipe = *recipe;
+  rj->detector = d->edit_detector;
   rj->n_points = n;
   rj->last_decode = last_decode;
   // the stand-in: seg/env/refine ALIAS the session's -- the replay needs
@@ -7037,26 +7228,253 @@ static void _edit_replay_finish(dt_masks_form_gui_t *gui, _object_data_t *d)
   dt_control_queue_redraw_center();
 }
 
+// ---- the prompts of a detector-made mask, read off its file ----
+//
+// a recipe that records no points (the one-shot detectors: the subject
+// and its background) has no click session to reopen: its mask came from
+// a map the segmentation model never saw. what CAN be reopened is the
+// mask itself. the file the shape renders, read on the grid the
+// segmentation model encodes, stands in for a detector's map, and the
+// text prompt derivation chooses prompts from it as it does from the
+// sky's: positives in the sure zone, negatives along its frontier, a box
+// around its extent. the recorded recipe supplies the frame (its encode
+// dimensions and render cap, so the pinned encode lands on the grid the
+// prompts were derived on), the ACTIVE segmentation model draws, and the
+// result is a POINTS recipe like a clicked session's: the session
+// replays it, the user refines it, the re-capture records what was
+// really decoded. an approximation of the detector's mask by
+// construction -- the segmentation model draws its own edge -- which is
+// what the clicks are for. a background derives from the same file as
+// its subject: the file IS the subject, the side stays on the shape.
+//
+// the grid mapping is the raster render's own, run the other way
+// (raster.c, _raster_get_file_roi): encode pixel -> preview pipe pixel
+// (the scale every click takes, _launch_decode) -> pipe input space
+// through the backtransform -> the post-rawprepare frame the file lives
+// in. nodes every G encode pixels, the coordinates interpolated between
+// them, the file sampled there through the shared cache at the render's
+// own minification level. GUI thread: the preview pipe's transform is
+// the one the session's clicks go through, so a derived prompt and a
+// click at the same place decode identically
+
+// the thresholds a mask file is read at when it stands in for a map: the
+// file is the finalised alpha, binary but for its penumbra, so the sure
+// zone and the guard sit at one half, the sure-not zone at the sky's
+// level, and the box takes the extent a little under the half. only the
+// four thresholds of this row are ever read
+static const dt_detector_t _refine_thresholds = {
+  .task = "mask",
+  .label = "refine",
+  .glyph = "",
+  .prompt_kind = DT_RF_PROMPT_POINTS,
+  .prompt_index = -1,
+  .p_guard = 0.5f,
+  .p_pos = 0.5f,
+  .p_neg = 0.05f,
+  .p_box = 0.4f,
+};
+
+static gboolean _edit_derive_recipe(const dt_masks_form_t *form,
+                                    const dt_rf_recipe_t *src,
+                                    dt_rf_recipe_t *out)
+{
+  dt_develop_t *dev = darktable.develop;
+  const dt_image_t *img = &dev->image_storage;
+  const dt_masks_point_raster_t *rpt = dt_masks_raster_point(form);
+  if(!rpt)
+    return FALSE;
+
+  float wd, ht, iwidth, iheight;
+  dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
+  if(wd <= 0 || ht <= 0 || iwidth <= 0 || iheight <= 0)
+    return FALSE;
+
+  // the working grid: the frame the session is about to encode -- the
+  // CURRENT processed frame under the recorded cap, the encode thread's
+  // formula on the preview pipe's estimate of that frame. a sampling grid
+  // and nothing more: the prompts are recorded normalised and land on
+  // whatever grid the session really encodes, which is why the derived
+  // recipe pins no encode dimensions (see the zero below) -- the recorded
+  // ones belong to the geometry of the detection, and a crop since would
+  // put them out of reach of a pinned encode for no gain
+  const double full_w = (double)wd / iwidth * (double)img->width;
+  const double full_h = (double)ht / iheight * (double)img->height;
+  const double cap = (double)MAX(src->render_size, 1024);
+  const double e_scale = fmin(fmin(cap / full_w, cap / full_h), 1.0);
+  const int ew = (int)(e_scale * full_w), eh = (int)(e_scale * full_h);
+  if(ew < 8 || eh < 8)
+    return FALSE;
+
+  // the model the session will encode with -- the active one, installed
+  dt_ai_model_t *model = _detector_resolve_seg_model();
+  if(!model)
+    return FALSE;
+
+  const double t0 = dt_get_wtime();
+  const int G = 8;
+  const int gnx = ew / G + 2, gny = eh / G + 2;
+  const size_t npix = (size_t)ew * eh;
+  float *nodes = g_try_malloc((size_t)gnx * gny * 2 * sizeof(float));
+  float *coords = g_try_malloc(npix * 2 * sizeof(float));
+  float *p = g_try_malloc(npix * sizeof(float));
+  dt_seg_point_t pts[DT_RF_RECIPE_MAX_POINTS];
+  float max_p = 0.0f;
+  gboolean ok = FALSE;
+  int n = 0;
+  if(!nodes || !coords || !p) goto done;
+
+  // the nodes, at encode pixel centres, to preview pipe pixels and back
+  // through the pipe's distortions to its input space
+  const float to_prev_x = wd / (float)ew, to_prev_y = ht / (float)eh;
+  for(int y = 0; y < gny; y++)
+    for(int x = 0; x < gnx; x++)
+    {
+      float *nd = nodes + ((size_t)y * gnx + x) * 2;
+      nd[0] = ((float)(x * G) + 0.5f) * to_prev_x;
+      nd[1] = ((float)(y * G) + 0.5f) * to_prev_y;
+    }
+  if(!dt_dev_distort_backtransform(dev, nodes, (size_t)gnx * gny))
+    goto done;
+  // ... and to the file frame: the render's mapping, its half pixel
+  // included (pixel centres to the sampler's corner indexing)
+  const float to_file_x = (float)img->width / iwidth;
+  const float to_file_y = (float)img->height / iheight;
+  const float cropx = (float)img->crop_x, cropy = (float)img->crop_y;
+  for(size_t k = 0; k < (size_t)gnx * gny; k++)
+  {
+    nodes[k * 2 + 0] = nodes[k * 2 + 0] * to_file_x - cropx - 0.5f;
+    nodes[k * 2 + 1] = nodes[k * 2 + 1] * to_file_y - cropy - 0.5f;
+  }
+  // file pixels per encode pixel, off the first node pair: the
+  // minification level the read averages at
+  const float step
+    = hypotf(nodes[2] - nodes[0], nodes[3] - nodes[1]) / (float)G;
+
+  DT_OMP_FOR()
+  for(int y = 0; y < eh; y++)
+  {
+    const int cy = y / G;
+    const float wy = (float)(y - cy * G) / (float)G;
+    for(int x = 0; x < ew; x++)
+    {
+      const int cx = x / G;
+      const float wx = (float)(x - cx * G) / (float)G;
+      const float *n00 = nodes + ((size_t)cy * gnx + cx) * 2;
+      const float *n01 = n00 + 2;
+      const float *n10 = nodes + ((size_t)(cy + 1) * gnx + cx) * 2;
+      const float *n11 = n10 + 2;
+      float *c = coords + ((size_t)y * ew + x) * 2;
+      c[0] = n00[0] * (1.0f - wx) * (1.0f - wy) + n01[0] * wx * (1.0f - wy)
+             + n10[0] * (1.0f - wx) * wy + n11[0] * wx * wy;
+      c[1] = n00[1] * (1.0f - wx) * (1.0f - wy) + n01[1] * wx * (1.0f - wy)
+             + n10[1] * (1.0f - wx) * wy + n11[1] * wx * wy;
+    }
+  }
+  if(!dt_masks_raster_sample(rpt, img, coords, npix, step, p))
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] refine: the mask file of '%s' cannot be read,"
+             " nothing to derive the prompts from", form->name);
+    goto done;
+  }
+
+  n = _sky_prompts_pass1(p, ew, eh, &_refine_thresholds, pts, &max_p);
+  if(n == 0)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] refine: the mask file of '%s' lights nothing of"
+             " the %dx%d encode frame (peak %.3f)",
+             form->name, ew, eh, max_p);
+    goto done;
+  }
+  int n_pos = 0, n_neg = 0;
+  for(int k = 0; k < n; k++)
+  {
+    n_pos += pts[k].label == 1;
+    n_neg += pts[k].label == 0;
+  }
+
+  // the prompts into the recipe: encode pixels to preview pixels, the
+  // backtransform, the input dimensions -- _capture_recipe's mapping of a
+  // click, applied to the derived points. coords is big enough by far
+  for(int k = 0; k < n; k++)
+  {
+    coords[k * 2 + 0] = pts[k].x * to_prev_x;
+    coords[k * 2 + 1] = pts[k].y * to_prev_y;
+  }
+  if(!dt_dev_distort_backtransform(dev, coords, n))
+    goto done;
+
+  // the derived recipe: the recorded cap, the active segmentation model,
+  // one decode of the sky's kind (single pass, no CRF, no per-decode
+  // refinement, the half threshold) at the last point, a POINTS kind.
+  // the matting block, the render cap and the path parameters ride along
+  // from the recorded recipe: the finalisation this session runs must be
+  // the one the mask was made with
+  *out = *src;
+  out->version = src->matting_enabled ? DT_RF_RECIPE_VERSION_EXT
+                                      : DT_RF_RECIPE_VERSION;
+  // the points were derived on the CURRENT geometry, and the session
+  // encodes it at whatever dimensions the cap yields (see above)
+  out->distort_hash = (int64_t)_compute_distort_hash(dev);
+  out->encode_w = 0;
+  out->encode_h = 0;
+  memset(out->seg_model, 0, sizeof(out->seg_model));
+  memset(out->seg_model_version, 0, sizeof(out->seg_model_version));
+  g_strlcpy(out->seg_model, model->id, sizeof(out->seg_model));
+  {
+    const char *v = dt_ai_model_get_version(model->id);
+    if(v)
+      g_strlcpy(out->seg_model_version, v, sizeof(out->seg_model_version));
+  }
+  memset(out->refine_model, 0, sizeof(out->refine_model));
+  memset(out->refine_model_version, 0, sizeof(out->refine_model_version));
+  out->refine_passes = 1;
+  out->threshold = SKY_THRESHOLD;
+  out->crf_enabled = 0;
+  out->crf_iterations = 0;
+  out->crf_sigma_color = 0.0f;
+  out->crf_w_bilateral = 0.0f;
+  out->ai_refine = 0;
+  out->n_points = n;
+  out->_pad0 = 0;
+  memset(out->points, 0, sizeof(out->points));
+  for(int k = 0; k < n; k++)
+  {
+    dt_rf_recipe_point_t *rp = &out->points[k];
+    rp->x = coords[k * 2 + 0] / iwidth;
+    rp->y = coords[k * 2 + 1] / iheight;
+    rp->label = (int32_t)pts[k].label;
+  }
+  out->points[n - 1].decode_after = 1;
+  out->points[n - 1].threshold = SKY_THRESHOLD;
+  out->prompt_kind = DT_RF_PROMPT_POINTS;
+  out->detect_input = 0;
+  out->class_bits = 0;
+  ok = dt_rf_recipe_valid(out);
+
+  dt_print(DT_DEBUG_AI,
+           "[object mask] refine: '%s' (kind %d, %s) read on %dx%d, peak"
+           " %.3f: %d positive(s), %d negative(s), box (%.0f,%.0f)-(%.0f,%.0f)"
+           " for %s (%.2fs)",
+           form->name, src->prompt_kind, src->seg_model, ew, eh, max_p,
+           n_pos, n_neg, pts[n - 2].x, pts[n - 2].y, pts[n - 1].x,
+           pts[n - 1].y, model->id, dt_get_wtime() - t0);
+
+done:
+  g_free(nodes);
+  g_free(coords);
+  g_free(p);
+  dt_ai_model_free(model);
+  return ok;
+}
+
 gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
                                    const dt_object_edit_target_t *target)
 {
-  // reserved for the in-place re-finalisation payload (C3); the C2 session
-  // closes through the existing gestures, which create a NEW mask
-  (void)target_module;
-
   dt_develop_t *dev = darktable.develop;
   if(!target || !target->has_recipe || !dt_rf_recipe_valid(&target->recipe))
     return FALSE;
-  // a detector-made recipe records no clicked session to reopen (the
-  // sky's points were chosen by a map, not by a hand): revising one is a
-  // redetect, not a decode replay -- refuse until that surface exists
-  if(dt_rf_prompt_detected(target->recipe.prompt_kind))
-  {
-    dt_print(DT_DEBUG_AI,
-             "[object mask] edit: detector-made recipes have no click"
-             " session to reopen");
-    return FALSE;
-  }
   // opening a session goes through dt_masks_change_form_gui, which tears
   // down whatever session is in flight -- same guard as every other
   // creation entry point
@@ -7088,6 +7506,61 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
     return FALSE;
   }
 
+  // the shape a refinement reopens, resolved once: it names the file the
+  // detector families derive their prompts from, and it is what the
+  // closing gesture replaces. a shape gone between the menu and this call
+  // is a session for nothing
+  const dt_masks_form_t *shape = NULL;
+  if(dt_is_valid_maskid(target->raster_formid))
+  {
+    shape = dt_masks_get_from_id(dev, target->raster_formid);
+    if(!dt_masks_raster_point(shape))
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] refine: shape %d is not a raster shape",
+               target->raster_formid);
+      return FALSE;
+    }
+  }
+
+  // the recipe the session replays. a recipe with points is its own: the
+  // recorded clicks, or the prompts a map chose for a text selection,
+  // both replayed through the recorded segmentation model. a promptless
+  // one (the one-shot detectors) records no session to reopen: its
+  // prompts are derived from the shape's file (see _edit_derive_recipe),
+  // and there is no such file without a shape -- a rasterfile instance
+  // keeps its headless recompute
+  dt_rf_recipe_t recipe = target->recipe;
+  const dt_detector_t *detector = NULL;
+  if(!dt_rf_prompt_replays_points(recipe.prompt_kind))
+  {
+    if(!shape)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[object mask] edit: detector-made recipes have no click"
+               " session to reopen");
+      return FALSE;
+    }
+    if(!_edit_derive_recipe(shape, &target->recipe, &recipe))
+    {
+      dt_control_log(_("cannot refine '%s': its mask file could not be"
+                       " read, or lights nothing"), shape->name);
+      return FALSE;
+    }
+  }
+  else if(dt_rf_prompt_detected(recipe.prompt_kind))
+  {
+    // a text selection replays under its row's component rule; a pair
+    // the table does not know cannot be replayed faithfully, and the
+    // model verdict below says so in the user's words
+    detector = dt_detector_find(recipe.prompt_kind, recipe.class_bits);
+    dt_print(DT_DEBUG_AI,
+             "[object mask] refine: '%s' replays %d recorded point(s) of"
+             " kind %d under %s",
+             shape ? shape->name : "rasterfile", recipe.n_points,
+             recipe.prompt_kind, detector ? detector->label : "no row");
+  }
+
   // the matting stage, asked BEFORE the model gap for the reason the
   // replay gate and the headless toast ask it first: it is a build
   // capability, and the model verdict below would answer "models check
@@ -7100,11 +7573,11 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
   //    (see the pre-seed below), exactly as every other recorded parameter
   //    is seeded. that is what this session used to be unable to do, and
   //    what the warning it printed instead was standing in for
-  if(!_matte_op_recorded(&target->recipe) && target->recipe.matting_enabled)
+  if(!_matte_op_recorded(&recipe) && recipe.matting_enabled)
   {
     // untrusted bytes, terminated before anything formats them
     char id[DT_RF_RECIPE_MATTING_ID_LEN];
-    memcpy(id, target->recipe.matting_id, sizeof(id));
+    memcpy(id, recipe.matting_id, sizeof(id));
     id[sizeof(id) - 1] = '\0';
     dt_control_log(_("cannot edit this mask: it records the matting stage"
                      " '%s', which this darktable cannot reproduce"),
@@ -7121,7 +7594,7 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
   {
     dt_object_recipe_model_gap_t seg_gap, refine_gap, matte_gap;
     const dt_object_recipe_model_gap_t gap
-      = _recipe_model_gap(&target->recipe, NULL, &seg_gap, &refine_gap,
+      = _recipe_model_gap(&recipe, NULL, &seg_gap, &refine_gap,
                           &matte_gap);
     if(gap != DT_OBJECT_RECIPE_MODELS_OK)
     {
@@ -7137,7 +7610,7 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
         dt_control_log(_("cannot edit this mask: AI processing is disabled"));
 #ifdef HAVE_MATTE_VITMATTE
       else if(!seg_at_fault && refine_gap != gap
-              && matte_gap == gap && _matte_op_recorded(&target->recipe))
+              && matte_gap == gap && _matte_op_recorded(&recipe))
         // its OWN words: no version is recorded for this one (the recipe
         // pins the operator's algorithm revision, never a model version),
         // and no download catalogue carries these weights, so neither the
@@ -7146,14 +7619,14 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
         dt_control_log(_("cannot edit this mask: its matting stage needs"
                          " the model '%s', which is not installed on this"
                          " machine"),
-                       _matte_op_recorded(&target->recipe)->model);
+                       _matte_op_recorded(&recipe)->model);
 #endif
       else
         dt_control_log(_("cannot edit this mask: model '%s' does not match"
                          " the recorded state (see the AI models"
                          " preferences, or use 'recompute mask')"),
-                       seg_at_fault ? target->recipe.seg_model
-                                    : target->recipe.refine_model);
+                       seg_at_fault ? recipe.seg_model
+                                    : recipe.refine_model);
       return FALSE;
     }
   }
@@ -7162,15 +7635,16 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
   // session: gate the proactive recompute of rasterfile.c gui_changed
   // before anything can trigger it, or every gui_update would race a
   // second inference stack against this session. cleared on EVERY session
-  // exit by _edit_session_end
+  // exit by _edit_session_end. a shape names no instance (-1), the gate
+  // then holds the session's modality and nothing else
   dt_object_mask_edit_set_active("rasterfile", target->raster_multi_priority);
 
   // drop the module focus BEFORE entering the session: request_focus tears
   // the mask view down when a module loses focus, which would destroy the
-  // session created below. side effect wanted for C2: with no focused
-  // module the closing gesture wires the produced mask to no sink instead
-  // of blending it into the rasterfile instance that happened to hold
-  // focus (C3 carries the real target through the payload instead)
+  // session created below. side effect wanted: with no focused module the
+  // closing gesture wires the produced mask to no sink instead of blending
+  // it into the module that happened to hold focus -- a refinement carries
+  // its real target through the session instead (edit_sink_* below)
   dt_iop_request_focus(NULL);
 
   // enter the session by the masks panel's own add-shape pattern
@@ -7188,26 +7662,26 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
   // no persistent-model restore: the slot holds the ACTIVE model, the
   // session needs the recorded one loaded by id
   _object_data_t *d = g_new0(_object_data_t, 1);
-  d->preview_cleanup = CLAMP(target->recipe.cleanup, 0, 100);
-  d->preview_smoothing = CLAMPF(target->recipe.smoothing, 0.0f, 1.3f);
-  d->preview_feather = CLAMPF(target->recipe.feather, 0.0f, 1.0f);
-  d->preview_refine = target->recipe.crf_enabled != 0;
-  d->edit_recipe = target->recipe;
+  d->preview_cleanup = CLAMP(recipe.cleanup, 0, 100);
+  d->preview_smoothing = CLAMPF(recipe.smoothing, 0.0f, 1.3f);
+  d->preview_feather = CLAMPF(recipe.feather, 0.0f, 1.0f);
+  d->preview_refine = recipe.crf_enabled != 0;
+  d->edit_recipe = recipe;
+  d->edit_detector = detector;
   // the session's parameters, all of them, from the recipe: read back
   // through the _session_* accessors, which are the only readers of the
   // corresponding preferences. the clamps are the ones _launch_decode
   // applied when these values were recorded, and shield a hand-edited
   // recipe; the accessors re-apply them, so a raw copy would do too
-  d->edit_threshold = CLAMP(target->recipe.threshold, 0.3f, 0.9f);
-  d->edit_n_passes = CLAMP(target->recipe.refine_passes, 1, 3);
-  d->edit_crf_iter = CLAMP(target->recipe.crf_iterations, 1, 10);
-  d->edit_crf_sigma_color = CLAMP(target->recipe.crf_sigma_color, 1.0f, 50.0f);
-  d->edit_crf_w_bilateral
-    = CLAMP(target->recipe.crf_w_bilateral, 0.5f, 30.0f);
-  d->edit_do_refine = target->recipe.ai_refine != 0;
-  d->edit_refine_margin = CLAMPF(target->recipe.ai_refine_margin, 0.0f, 0.5f);
+  d->edit_threshold = CLAMP(recipe.threshold, 0.3f, 0.9f);
+  d->edit_n_passes = CLAMP(recipe.refine_passes, 1, 3);
+  d->edit_crf_iter = CLAMP(recipe.crf_iterations, 1, 10);
+  d->edit_crf_sigma_color = CLAMP(recipe.crf_sigma_color, 1.0f, 50.0f);
+  d->edit_crf_w_bilateral = CLAMP(recipe.crf_w_bilateral, 0.5f, 30.0f);
+  d->edit_do_refine = recipe.ai_refine != 0;
+  d->edit_refine_margin = CLAMPF(recipe.ai_refine_margin, 0.0f, 0.5f);
   // raw, like the recipe stores it: the MAX belongs to the use points
-  d->edit_render_size = target->recipe.render_size;
+  d->edit_render_size = recipe.render_size;
   // the matting stage, through the SAME resolver the headless replay uses,
   // so an edit session and a regeneration of the same mask start from one
   // reading of the recipe. it answers an off stage for a recipe that
@@ -7216,7 +7690,7 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
   // the preferences name today. the refusal above has already rejected
   // every recipe this could fail to resolve
   {
-    const _matte_session_t rec = _matte_session_recorded(&target->recipe);
+    const _matte_session_t rec = _matte_session_recorded(&recipe);
     d->edit_matte_seeded = TRUE;
     d->edit_matte_enabled = rec.enabled;
     d->edit_matte_op = rec.op;
@@ -7228,15 +7702,32 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
   // a module mid-session refocuses from NULL, which skips the focus-loss
   // teardown and leaves the session alive with a module in hand
   d->edit_no_sink = TRUE;
+  // a refinement replaces its shape and commits on the module the shape's
+  // group belongs to, both by identity: the shape can be deleted and the
+  // module removed while the finalisation job runs
+  d->edit_replace_formid = shape ? shape->formid : NO_MASKID;
+  if(shape && target_module)
+  {
+    d->edit_has_sink = TRUE;
+    g_strlcpy(d->edit_sink_op, target_module->op, sizeof(d->edit_sink_op));
+    d->edit_sink_priority = target_module->multi_priority;
+  }
   d->edit_valid = TRUE;
   g_atomic_int_set(&d->edit_pending, EDIT_WAIT_ENCODE);
   gui->scratchpad = d;
   gui->scratchpad_cleanup = _free_data;
 
-  dt_print(DT_DEBUG_AI,
-           "[object mask] edit: session opened on rasterfile instance %d"
-           " (%d recorded points)",
-           target->raster_multi_priority, target->recipe.n_points);
+  if(shape)
+    dt_print(DT_DEBUG_AI,
+             "[object mask] refine: session opened on shape %d '%s'"
+             " (%d point(s), %s, for %s)",
+             shape->formid, shape->name, recipe.n_points, recipe.seg_model,
+             d->edit_has_sink ? d->edit_sink_op : "no module");
+  else
+    dt_print(DT_DEBUG_AI,
+             "[object mask] edit: session opened on rasterfile instance %d"
+             " (%d recorded points)",
+             target->raster_multi_priority, recipe.n_points);
   dt_control_queue_redraw_center();
   return TRUE;
 }

@@ -530,6 +530,43 @@ static inline float _raster_sample(const _raster_cache_entry_t *const entry,
                 + b * _raster_tap(entry, level, i + 1, j + 1));
 }
 
+// ---- the file read back by the object tool ----
+// the refinement session of a raster shape derives its prompts from the
+// very file the shape renders, on the grid its segmentation model
+// encodes: the caller maps that grid to level-0 file coordinates (the
+// mapping THE render above establishes, run the other way) and this
+// samples the file there through the shared cache -- same decode, same
+// pyramid, same sampler as the render, so a prompt derived from the
+// mask lands where the mask really is. `step` is the file distance
+// between adjacent samples and picks the mip level exactly as the
+// render picks it, so a minified read averages what the render averages
+gboolean dt_masks_raster_sample(const dt_masks_point_raster_t *pt,
+                                const dt_image_t *img,
+                                const float *file_pts,
+                                const size_t n,
+                                const float step,
+                                float *out)
+{
+  if(!pt || !img || !file_pts || !out) return FALSE;
+  gchar *path = _raster_resolve_path(pt, img);
+  if(!path) return FALSE;
+  _raster_cache_entry_t *entry = _raster_cache_acquire(path, TRUE);
+  g_free(path);
+  if(!entry) return FALSE;
+
+  int level = 0;
+  while(level < RASTER_MIP_LEVELS - 1
+        && step > 1.5f * (float)(1 << level))
+    level++;
+
+  DT_OMP_FOR()
+  for(size_t k = 0; k < n; k++)
+    out[k] = _raster_sample(entry, level, file_pts[k * 2], file_pts[k * 2 + 1]);
+
+  _raster_cache_release(entry);
+  return TRUE;
+}
+
 // flow pattern: _circle_get_mask_roi (circle.c). two deliberate
 // differences: the per-pixel step interpolates the file COORDINATES
 // between the grid nodes and then samples the file there -- never mask

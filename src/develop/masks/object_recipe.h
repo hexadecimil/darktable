@@ -75,6 +75,12 @@ typedef struct dt_object_edit_target_t
 {
   dt_object_edit_kind_t kind;
   int32_t raster_multi_priority;  // RASTER: identity of the edited instance
+                                  // (-1 when a raster SHAPE is edited)
+  int32_t raster_formid;          // RASTER: the raster shape the session
+                                  // refines and replaces IN PLACE when it
+                                  // closes; NO_MASKID (0) for a rasterfile
+                                  // instance, whose session closes into a
+                                  // new shape
   int32_t group_formid;           // PATHS / CONTEXT
   gboolean has_recipe;
   dt_rf_recipe_t recipe;          // copy owned by the callee
@@ -243,15 +249,24 @@ void dt_object_mask_edit_clear_active(void);
 // recipe: the session encodes with the RECORDED model at the recorded
 // dimensions, replays the recorded decodes at their recorded boundaries
 // with their recorded thresholds, and hands the user the exact working
-// state the original session finalised from. GUI thread only, darkroom
-// only; at most one edit session per process. `target_module` is reserved
-// for the re-finalisation payload (C3) and may be NULL.
+// state the original session finalised from. a recipe that records no
+// points (the one-shot detectors) opens all the same: its prompts are
+// derived from the mask file the shape renders, read against the active
+// segmentation model, and the session starts from that approximation.
+// GUI thread only, darkroom only; at most one edit session per process.
+//
+// `target_module` names the module whose masks history item the closing
+// gesture commits when `target->raster_formid` names a shape (the owner
+// of the group the shape sits in, NULL for a library shape); the session
+// itself always opens for no sink. the plain right-click then replaces
+// that shape's file and recipe IN PLACE -- name, flags and every group
+// membership kept -- while shift+right-click still traces new paths.
+// without a shape (a rasterfile instance) the session closes into a NEW
+// shape, as before.
 //
 // this entry point is the part of the edit UX that survives any surface
 // redesign (revisable-dressing hypothesis, plan §6): buttons, dialogs and
-// menu items all funnel here. C2 limitation, by design: the reopened
-// session ends through the existing gestures (right-click / shift+right-
-// click), which create a NEW mask -- C3 wires the in-place replacement
+// menu items all funnel here
 gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
                                    const dt_object_edit_target_t *target);
 

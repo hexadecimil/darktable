@@ -4037,6 +4037,43 @@ static void _tree_raster_recompute(GtkMenuItem *item, gpointer user_data)
     dt_control_log(_("recomputing the mask file needs the AI subsystem"));
 }
 
+// reopen a raster shape's mask as a clicked session: its recorded prompts
+// replayed, or, for a detector-made one, prompts read off its file. the
+// session closes back INTO the shape -- same row, same groups, new file.
+// the module travels on the item like the formid does: the owner of the
+// group a member row sits in, NULL for a library row, whose session then
+// behaves as one opened for no module. the guards of _start_creation, in
+// its order and with its words, before anything is touched -- the entry
+// point re-derives them, but the lock's toast belongs to this panel
+static void _tree_raster_refine(GtkMenuItem *item, gpointer user_data)
+{
+  (void)user_data;
+  const dt_mask_id_t id =
+    GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(item), "formid"));
+  dt_iop_module_t *module = g_object_get_data(G_OBJECT(item), "module");
+  dt_masks_form_t *form = dt_masks_get_from_id(darktable.develop, id);
+  const dt_masks_point_raster_t *rpt = dt_masks_raster_point(form);
+  if(!rpt || !dt_rf_recipe_valid(&rpt->recipe)) return;
+
+  if(dt_masks_shapes_locked())
+  {
+    dt_control_log(_("mask still computing, try again in a moment"));
+    return;
+  }
+
+  // the module may have gone away between the click that opened the menu
+  // and the click that picked the entry
+  if(module && !_mask_target_alive(module)) module = NULL;
+
+  dt_object_edit_target_t target = { 0 };
+  target.kind = DT_OBJECT_EDIT_RASTER;
+  target.raster_multi_priority = -1;
+  target.raster_formid = id;
+  target.has_recipe = TRUE;
+  target.recipe = rpt->recipe;
+  dt_object_mask_edit_begin(module, &target);
+}
+
 // the context menu of a tree row, built at click. it was inline in
 // _tree_button_pressed_cb, which made that function 345 lines of which the
 // gesture handling was ten: the menu is one subject, the hit-testing of a click
@@ -4251,6 +4288,42 @@ static void _tree_context_menu(dt_lib_module_t *self,
                         GUINT_TO_POINTER(grp->formid));
       g_signal_connect(item, "activate",
                        G_CALLBACK(_tree_raster_recompute), self);
+      gtk_menu_shell_append(menu, item);
+
+      // ... and the same mask reopened as a clicked session, closing back
+      // into this very shape. the session draws with the active
+      // segmentation model, so that is the first thing the label answers
+      // for; a recipe with points then replays its recorded model, and
+      // the verdict above (the matting stage first, as everywhere) is the
+      // replay's own gate -- a detector-made recipe derives its prompts
+      // from the file instead and pins nothing of its recorded model. a
+      // session or a computation in flight would be torn down by the
+      // opening: said in the label too, the click's toast being the
+      // panel's usual one
+      const char *freason = NULL;
+#ifdef HAVE_AI
+      if(!dt_masks_object_available())
+        freason = _("AI model not available");
+      else if(dt_masks_shapes_locked())
+        freason = _("mask still computing");
+      else if(!dt_object_recipe_matting_reproducible(&rpt->recipe)
+              || dt_rf_prompt_replays_points(rpt->recipe.prompt_kind))
+        freason = reason;
+#else
+      freason = _("AI model not available");
+#endif
+      gchar *flabel = freason
+        ? g_strdup_printf("%s (%s)", _("refine with clicks"), freason)
+        : g_strdup(_("refine with clicks"));
+      item = gtk_menu_item_new_with_label(flabel);
+      g_free(flabel);
+      gtk_widget_set_sensitive(item, freason == NULL);
+      g_object_set_data(G_OBJECT(item), "formid",
+                        GUINT_TO_POINTER(grp->formid));
+      g_object_set_data(G_OBJECT(item), "module",
+                        _mask_target_alive(sel_module) ? sel_module : NULL);
+      g_signal_connect(item, "activate",
+                       G_CALLBACK(_tree_raster_refine), self);
       gtk_menu_shell_append(menu, item);
     }
   }

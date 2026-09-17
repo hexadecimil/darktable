@@ -651,6 +651,17 @@ dt_masks_point_raster_t *dt_masks_raster_point(const dt_masks_form_t *form);
  * leaf under that same root. NULL when it names nothing. caller frees */
 gchar *dt_masks_raster_resolve_path(const dt_masks_point_raster_t *pt,
                                     const dt_image_t *img);
+/** sample the file a raster point names at `n` level-0 file coordinates
+ * (x, y pairs in the sampler's corner indexing, the render's own frame)
+ * into `out`, through the shared decoded cache; `step` is the file
+ * distance between adjacent samples and picks the minification level
+ * the render would pick. FALSE when the file cannot be read */
+gboolean dt_masks_raster_sample(const dt_masks_point_raster_t *pt,
+                                const dt_image_t *img,
+                                const float *file_pts,
+                                const size_t n,
+                                const float step,
+                                float *out);
 
 /** THE question every "add shape" entry point asks before mutating
  * anything: would starting a new shape destroy work in progress? starting
