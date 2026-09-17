@@ -112,10 +112,16 @@ static const dt_detector_t dt_detectors[] = {
     TRUE, 0.005f, 0, 0.70f, 0.70f, 0.05f, 0.40f },
   { "mask-text", N_("water"), "✦", DT_RF_PROMPT_SKY, 1, FALSE, FALSE,
     TRUE, 0.005f, 1, 0.85f, 0.70f, 0.05f, 0.40f },
+  // vegetation maps low (a median of 4.7% of the frame above 0.5 where
+  // the sky reaches 32%): seeds and box taken lower, or a wooded slope
+  // behind a bright foreground stays outside the box and is never asked
+  // for. person maps blur onto what the person stands on: the negative
+  // level is raised so the correction pass pushes the mask off the
+  // ground and the sea at the feet
   { "mask-text", N_("vegetation"), "✦", DT_RF_PROMPT_SKY, 2, FALSE, FALSE,
-    TRUE, 0.005f, 2, 0.38f, 0.50f, 0.05f, 0.40f },
+    TRUE, 0.005f, 2, 0.38f, 0.35f, 0.05f, 0.25f },
   { "mask-text", N_("person"), "✦", DT_RF_PROMPT_SKY, 7, FALSE, FALSE,
-    TRUE, 0.005f, 7, 0.53f, 0.50f, 0.05f, 0.40f },
+    TRUE, 0.005f, 7, 0.53f, 0.50f, 0.15f, 0.40f },
 };
 
 // resolve a recipe's (prompt_kind, class_bits) to its table row; NULL
