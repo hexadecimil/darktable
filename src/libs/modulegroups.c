@@ -154,6 +154,10 @@ typedef struct dt_lib_modulegroups_t
   // cleared by the manager through the shape_drag proxy
   gboolean shape_drag;
   GtkWidget *shape_drop;
+  // ... and, once a shape has been dropped there, the zone is a banner:
+  // what waits and what to do, and a button to call it off
+  GtkWidget *shape_drop_label;
+  GtkWidget *shape_drop_cancel;
 } dt_lib_modulegroups_t;
 
 typedef enum dt_lib_modulegroup_iop_visibility_type_t
@@ -242,30 +246,32 @@ static void _text_entry_changed_callback(GtkEntry *entry, dt_lib_module_t *self)
 
 // enter in the search box: a shape waiting since a drop on the "create"
 // zone goes to the first module on screen that can take it, and the focus
-// leaves the box as it does after a click on a header. the manager answers
-// FALSE when nothing waits or nothing on screen fits -- it says which --
-// and the box keeps the focus for the next try
+// leaves the box as it does after a click on a header. when nothing on
+// screen fits the manager says so and the shape keeps waiting: the box
+// keeps the focus for the next try
 static void _text_entry_activate_callback(GtkEntry *entry, dt_lib_module_t *self)
 {
   dt_develop_t *dev = darktable.develop;
   if(dev->proxy.masks.module
      && dev->proxy.masks.pending_shape_take
-     && dev->proxy.masks.pending_shape_take(dev->proxy.masks.module, NULL))
+     && dev->proxy.masks.pending_shape_take(dev->proxy.masks.module, NULL)
+     && !dt_dev_masks_pending_shape(dev))
     gtk_widget_grab_focus(dt_ui_center(darktable.gui->ui));
 }
 
-// ... and the focus leaving the box -- escape, a click on the photograph, on
-// another panel -- is the shape no longer waiting. a click on a module
-// header is not that: the header takes no focus, and its own handler asks
-// the manager first
-static gboolean _text_entry_focus_out_callback(GtkWidget *entry,
-                                               GdkEventFocus *event,
-                                               dt_lib_module_t *self)
+// escape in the search box -- before dt_gui_search_stop() moves the focus
+// -- and the banner's button: the shape stops waiting
+static void _text_entry_stop_search_callback(GtkSearchEntry *entry,
+                                             dt_lib_module_t *self)
 {
-  dt_develop_t *dev = darktable.develop;
-  if(dev->proxy.masks.module && dev->proxy.masks.pending_shape_cancel)
-    dev->proxy.masks.pending_shape_cancel(dev->proxy.masks.module);
-  return FALSE;
+  dt_dev_masks_pending_shape_cancel(darktable.develop);
+}
+
+static void _shape_drop_cancel_clicked(GtkButton *button,
+                                       dt_lib_module_t *self)
+{
+  dt_dev_masks_pending_shape_cancel(darktable.develop);
+  gtk_widget_grab_focus(dt_ui_center(darktable.gui->ui));
 }
 
 // the "create" zone: shown under the search box for the length of a shape
@@ -904,6 +910,25 @@ static gboolean _is_module_in_history(dt_iop_module_t *module)
   return FALSE;
 }
 
+// the search box's own rule: the text against the module's name, its
+// aliases and its instance name, case folded
+static gboolean _module_matches(const dt_iop_module_t *module,
+                                const gchar *text)
+{
+  gchar *needle = g_utf8_casefold(text, -1);
+  gchar *name = g_utf8_casefold(dt_iop_get_localized_name(module->op), -1);
+  gchar *aliases = g_utf8_casefold(dt_iop_get_localized_aliases(module->op), -1);
+  gchar *multi = g_utf8_casefold(module->multi_name, -1);
+  const gboolean match = g_strstr_len(name, -1, needle) != NULL
+    || g_strstr_len(aliases, -1, needle) != NULL
+    || g_strstr_len(multi, -1, needle) != NULL;
+  g_free(needle);
+  g_free(name);
+  g_free(aliases);
+  g_free(multi);
+  return match;
+}
+
 static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
 {
   dt_lib_modulegroups_t *d = self->data;
@@ -969,14 +994,18 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
         continue;
       }
 
-      // a shape of the mask manager is on its way: every module the drop
-      // could land on, whatever the group -- a deprecated one only if this
-      // edit already uses it, the rule the search below applies
+      // a shape of the mask manager is on its way, or waiting for a name:
+      // every module the drop could land on, whatever the group -- a
+      // deprecated one only if this edit already uses it, the rule the
+      // search below applies -- and, once a name is being typed, those
+      // that match it, by the search's own rule
       if(d->shape_drag)
       {
         if(w)
-          gtk_widget_set_visible(w, module->enabled
-                                    || !(module->flags() & IOP_FLAGS_DEPRECATED));
+          gtk_widget_set_visible(w, (module->enabled
+                                     || !(module->flags() & IOP_FLAGS_DEPRECATED))
+                                    && (!(text_entered && text_entered[0] != '\0')
+                                        || _module_matches(module, text_entered)));
         continue;
       }
 
@@ -1002,18 +1031,7 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
         }
         else
         {
-           const int is_match = (g_strstr_len(g_utf8_casefold(dt_iop_get_localized_name(module->op), -1), -1,
-                                              g_utf8_casefold(text_entered, -1))
-                                 != NULL) ||
-                                 (g_strstr_len(g_utf8_casefold(dt_iop_get_localized_aliases(module->op), -1), -1,
-                                               g_utf8_casefold(text_entered, -1))
-                                 != NULL) ||
-                                 (g_strstr_len(g_utf8_casefold(module->multi_name, -1), -1,
-                                               g_utf8_casefold(text_entered, -1))
-                                 != NULL);
-
-
-          if(is_match)
+          if(_module_matches(module, text_entered))
             gtk_widget_show(w);
           else
             gtk_widget_hide(w);
@@ -1217,9 +1235,12 @@ static void _lib_modulegroups_shape_drag(dt_lib_module_t *self,
   _lib_modulegroups_update_iop_visibility(self);
 }
 
-// a shape dropped on the "create" zone: the search box asks for the
-// module, and the list filters as the name is typed, the way it always
-// has. NULL is the question withdrawn or answered
+// a shape dropped on the "create" zone: the zone turns into the banner
+// that says what waits and what to do, with its cancel button, and the
+// search box asks for the module -- the list, every module of it, filters
+// as the name is typed. the panel itself is the manager's: it keeps the
+// drag's list of collapsed headers until the wait ends. NULL is the
+// question withdrawn or answered
 static void _lib_modulegroups_shape_pending(dt_lib_module_t *self,
                                             const char *name)
 {
@@ -1228,12 +1249,22 @@ static void _lib_modulegroups_shape_pending(dt_lib_module_t *self,
   {
     gtk_entry_set_placeholder_text(GTK_ENTRY(d->text_entry),
                                    _("search modules by name or tag"));
+    gtk_label_set_text(GTK_LABEL(d->shape_drop_label),
+                       _("create: drop here, then type the module"));
+    gtk_widget_hide(d->shape_drop_cancel);
+    dt_gui_remove_class(d->shape_drop, "modulegroups_shape_pending");
     return;
   }
 
   gchar *hint = g_strdup_printf(_("type a module for '%s'..."), name);
   gtk_entry_set_placeholder_text(GTK_ENTRY(d->text_entry), hint);
   g_free(hint);
+  gchar *text = g_strdup_printf(_("'%s' — click a module below to add it there,"
+                                  " or type its name and press enter"), name);
+  gtk_label_set_text(GTK_LABEL(d->shape_drop_label), text);
+  g_free(text);
+  gtk_widget_show(d->shape_drop_cancel);
+  dt_gui_add_class(d->shape_drop, "modulegroups_shape_pending");
   // the box may be hidden by the layout; the focus needs it on screen
   gtk_widget_show(d->hbox_search_box);
   gtk_entry_set_text(GTK_ENTRY(d->text_entry), "");
@@ -3182,8 +3213,8 @@ void gui_init(dt_lib_module_t *self)
                         d->hbox_search_box, NULL, G_CONNECT_AFTER | G_CONNECT_SWAPPED);
   g_signal_connect(G_OBJECT(d->text_entry), "activate",
                    G_CALLBACK(_text_entry_activate_callback), self);
-  g_signal_connect(G_OBJECT(d->text_entry), "focus-out-event",
-                   G_CALLBACK(_text_entry_focus_out_callback), self);
+  g_signal_connect(G_OBJECT(d->text_entry), "stop-search",
+                   G_CALLBACK(_text_entry_stop_search_callback), self);
 
   GtkWidget *visibility_wrapper = gtk_event_box_new(); // extra layer prevents disabling shortcuts when hidden
   gtk_container_add(GTK_CONTAINER(visibility_wrapper), d->text_entry);
@@ -3197,14 +3228,28 @@ void gui_init(dt_lib_module_t *self)
   gtk_box_pack_start(GTK_BOX(self->widget), d->hbox_search_box, TRUE, TRUE, 0);
 
   // the "create" zone, under the search box. an event box takes the drop,
-  // the label wears the frame. no GTK_DEST_DEFAULT_*: the answer comes
-  // from the manager on every motion, as on the module headers
+  // the label wears the frame; the cancel button beside it shows once a
+  // shape waits there (_lib_modulegroups_shape_pending). no
+  // GTK_DEST_DEFAULT_*: the answer comes from the manager on every
+  // motion, as on the module headers
   {
     GtkWidget *label = gtk_label_new(_("create: drop here, then type the module"));
     gtk_widget_set_name(label, "modulegroups-shape-drop");
     gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+    d->shape_drop_label = label;
+    d->shape_drop_cancel = gtk_button_new_with_label(_("cancel"));
+    gtk_widget_set_tooltip_text(d->shape_drop_cancel,
+                                _("the shape stays in the library (escape)"));
+    gtk_widget_set_valign(d->shape_drop_cancel, GTK_ALIGN_CENTER);
+    gtk_widget_set_no_show_all(d->shape_drop_cancel, TRUE);
+    g_signal_connect(d->shape_drop_cancel, "clicked",
+                     G_CALLBACK(_shape_drop_cancel_clicked), self);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_pack_start(GTK_BOX(row), label, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(row), d->shape_drop_cancel, FALSE, FALSE, 0);
     d->shape_drop = gtk_event_box_new();
-    gtk_container_add(GTK_CONTAINER(d->shape_drop), label);
+    gtk_container_add(GTK_CONTAINER(d->shape_drop), row);
     gtk_drag_dest_set(d->shape_drop, 0, target_list_mask_shape,
                       n_targets_mask_shape, GDK_ACTION_LINK);
     g_signal_connect(d->shape_drop, "drag-motion",

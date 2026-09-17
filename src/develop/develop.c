@@ -100,6 +100,8 @@ void dt_dev_init(dt_develop_t *dev,
   dev->forms = NULL;
   dev->form_visible = NULL;
   dev->form_gui = NULL;
+  dev->preview_formid = NO_MASKID;
+  dev->preview_imgid = NO_IMGID;
   dev->allforms = NULL;
 
   if(dev->gui_attached)
@@ -3702,6 +3704,19 @@ void dt_dev_masks_list_update(dt_develop_t *dev)
 {
   if(dev->proxy.masks.module && dev->proxy.masks.list_update)
     dev->proxy.masks.list_update(dev->proxy.masks.module);
+}
+
+const char *dt_dev_masks_pending_shape(dt_develop_t *dev)
+{
+  if(dev->proxy.masks.module && dev->proxy.masks.pending_shape)
+    return dev->proxy.masks.pending_shape(dev->proxy.masks.module);
+  return NULL;
+}
+
+void dt_dev_masks_pending_shape_cancel(dt_develop_t *dev)
+{
+  if(dev->proxy.masks.module && dev->proxy.masks.pending_shape_cancel)
+    dev->proxy.masks.pending_shape_cancel(dev->proxy.masks.module);
 }
 
 void dt_dev_masks_list_remove(dt_develop_t *dev,

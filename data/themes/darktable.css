@@ -2034,6 +2034,22 @@ treeview.view:drop(active).into
   border-style: solid;
 }
 
+/* ... and once a shape has been dropped there, the zone is the banner of
+   a modal wait: what waits and what to do, and a cancel button beside it.
+   filled, so that it reads as the one thing to answer on the panel */
+.modulegroups_shape_pending #modulegroups-shape-drop
+{
+  border-style: solid;
+  background-color: alpha(@masks_row_on_fg, 0.12);
+  margin-right: 0;
+}
+
+.modulegroups_shape_pending button
+{
+  margin: 0.3em 0.5em 0.3em 0.2em;
+  padding: 0.2em 0.6em;
+}
+
 
 /*** --- Thumbtable css part ---
 

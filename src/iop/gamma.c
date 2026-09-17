@@ -25,6 +25,7 @@
 #include "common/imagebuf.h"
 #include "control/control.h"
 #include "develop/develop.h"
+#include "develop/masks.h"
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
@@ -262,6 +263,56 @@ static void _mask_display(const float *const restrict in,
   }
 }
 
+// the same rendering as _mask_display, the mask handed over on its own
+// instead of riding in the alpha channel: what the mask manager's eye on a
+// shape row shows, a shape and nothing but it
+DT_OMP_DECLARE_SIMD(aligned(in, mask, out: 64) uniform(buffsize))
+static void _shape_display(const float *const restrict in,
+                           const float *const restrict mask,
+                           uint8_t *const restrict out,
+                           const size_t buffsize)
+{
+  const dt_aligned_pixel_t mask_color = { 1.0f, 1.0f, 0.0f };
+  const float mix = CLIP(dt_conf_get_float("darkroom/ui/develop_mask_mix"));
+  DT_OMP_FOR_SIMD(aligned(in, mask, out: 64) aligned(mask_color: 16))
+  for(size_t j = 0; j < buffsize; j+= 4)
+  {
+    const float m = mask[j / 4];
+    const float gray = interpolatef(mix, m, 0.3f * in[j + 0] + 0.59f * in[j + 1] + 0.11f * in[j + 2]);
+    const dt_aligned_pixel_t pixel = { gray, gray, gray, gray };
+    _write_pixel(pixel, out + j, mask_color, m);
+  }
+}
+
+// the shape the mask manager has an eye lit on (dt_masks_preview_shape):
+// its mask alone, rendered here at the end of the darkroom's pipe where
+// every distortion is behind us, in this module's own coordinates. the
+// full pipe only, for the image the eye was lit on -- a thumbnail or the
+// navigation preview never wears it. NULL when there is nothing to show;
+// otherwise a buffer of roi->width * roi->height, the caller frees it
+static float *_shape_preview_mask(dt_iop_module_t *self,
+                                  dt_dev_pixelpipe_iop_t *piece,
+                                  const dt_iop_roi_t *const roi)
+{
+  dt_develop_t *dev = self->dev;
+  if(!dev || !dev->gui_attached || piece->pipe != dev->full.pipe) return NULL;
+  const dt_mask_id_t formid = dev->preview_formid;
+  if(!dt_is_valid_maskid(formid) || dev->preview_imgid != piece->pipe->image.id)
+    return NULL;
+  // the pipe's own snapshot of the forms, as blend.c reads them
+  dt_masks_form_t *form = dt_masks_get_from_id_ext(piece->pipe->forms, formid);
+  if(!form) return NULL;
+
+  float *mask = dt_calloc_align_float((size_t)roi->width * roi->height);
+  if(!mask) return NULL;
+  if(dt_masks_get_mask_roi(self, piece, form, roi, mask) != 1)
+  {
+    dt_free_align(mask);
+    return NULL;
+  }
+  return mask;
+}
+
 DT_OMP_DECLARE_SIMD(aligned(in, out: 64) uniform(buffsize))
 static void _copy_output(const float *const restrict in,
                          uint8_t *const restrict out,
@@ -310,6 +361,21 @@ void process(dt_iop_module_t *self,
 
   const size_t buffsize = (size_t)roi_out->width * roi_out->height * 4;
   const float alpha = (mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK) ? 1.0f : 0.0f;
+
+  // a shape shown from the mask manager comes before whatever a module
+  // asks: lighting the eye put the module's request out
+  // (dt_masks_preview_shape), so the two never both stand. the output is
+  // never served from the cache: the eye can go out between two runs that
+  // hash the same
+  float *shape = _shape_preview_mask(self, piece, roi_out);
+  if(shape)
+  {
+    _shape_display((const float *const restrict)i, shape,
+                   (uint8_t *const restrict)o, buffsize);
+    dt_free_align(shape);
+    dt_dev_pixelpipe_invalidate_cacheline(piece->pipe, o, "gamma shape preview");
+    return;
+  }
 
   if((mask_display & DT_DEV_PIXELPIPE_DISPLAY_CHANNEL)
      && (mask_display & DT_DEV_PIXELPIPE_DISPLAY_ANY))

@@ -235,6 +235,12 @@ typedef struct dt_develop_t
   GList *forms;
   struct dt_masks_form_t *form_visible;
   struct dt_masks_form_gui_t *form_gui;
+  // the shape shown in yellow over the photograph, the way a module shows
+  // its own mask: the eye of a shape row in the mask manager. rendered by
+  // iop/gamma.c at the end of the full pipe, for the image it was lit on.
+  // dt_masks_preview_shape() is the one writer
+  dt_mask_id_t preview_formid;
+  dt_imgid_t preview_imgid;
   // all forms to be linked here for cleanup:
   GList *allforms;
 
@@ -290,9 +296,12 @@ typedef struct dt_develop_t
          shows under the search box */
       void (*shape_drag)(struct dt_lib_module_t *self,
                          const gboolean active);
-      /* a shape dropped on that zone waits for a module to be typed:
-         the search box takes the focus, empty, and says so in its
-         placeholder. NULL puts the placeholder back */
+      /* a shape dropped on that zone waits for a module: the zone
+         turns into a banner that says so, with a cancel button, and
+         the search box takes the focus, empty, to type the name into.
+         the panel stays as the drag left it -- every module listed,
+         every header collapsed -- until the wait ends. NULL is the
+         wait over, either way */
       void (*shape_pending)(struct dt_lib_module_t *self,
                             const char *name);
     } modulegroups;
@@ -324,16 +333,22 @@ typedef struct dt_develop_t
          panel. drop_shape_hover: can `module` take it right now --
          `module` NULL asks for the "create" zone of the module groups,
          which takes any shape. drop_shape: it was dropped there; TRUE
-         when it landed. pending_shape_take: a shape left waiting on
-         the "create" zone goes to `module` -- or, NULL, to the first
-         module on screen that can take it; TRUE when it went, FALSE
-         when nothing waited or the module was refused, and the
-         gesture then means what it always meant. pending_shape_cancel:
-         it stops waiting */
+         when it landed. pending_shape: the name of the shape left
+         waiting on the "create" zone, NULL when none waits -- while
+         one does, the darkroom is modal: the photograph is veiled, a
+         click on a module header names the module and a click on the
+         photograph, escape or the banner's button call it off.
+         pending_shape_take: the waiting shape goes to `module` -- or,
+         NULL, to the first module on screen that can take it; TRUE
+         when a shape was waiting and the gesture is answered, whether
+         it went or was refused with a word, FALSE when nothing waited
+         and the gesture means what it always meant.
+         pending_shape_cancel: it stops waiting */
       gboolean (*drop_shape_hover)(struct dt_lib_module_t *self,
                                    struct dt_iop_module_t *module);
       gboolean (*drop_shape)(struct dt_lib_module_t *self,
                              struct dt_iop_module_t *module);
+      const char *(*pending_shape)(struct dt_lib_module_t *self);
       gboolean (*pending_shape_take)(struct dt_lib_module_t *self,
                                      struct dt_iop_module_t *module);
       void (*pending_shape_cancel)(struct dt_lib_module_t *self);
@@ -586,6 +601,12 @@ int dt_dev_modulegroups_basics_module_toggle(dt_develop_t *dev,
  * masks plugin hooks
  */
 void dt_dev_masks_list_change(dt_develop_t *dev);
+/** the name of the shape waiting in the mask manager for a module to be
+    named (a drop on the "create" zone), NULL when none is: the darkroom
+    is modal for as long as one waits */
+const char *dt_dev_masks_pending_shape(dt_develop_t *dev);
+/** ... and the wait called off, from wherever the darkroom sees it end */
+void dt_dev_masks_pending_shape_cancel(dt_develop_t *dev);
 void dt_dev_masks_list_update(dt_develop_t *dev);
 void dt_dev_masks_list_remove(dt_develop_t *dev,
                               const dt_mask_id_t formid,

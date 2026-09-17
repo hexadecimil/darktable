@@ -2649,6 +2649,9 @@ static gboolean _finalize_apply_idle(gpointer data)
       if(target && target->gui_data) dt_iop_gui_update(target);
       dt_control_log(_("'%s' refined"), old->name);
       dt_dev_masks_list_change(dev);
+      // the refined mask in yellow over the photograph, the eye of its
+      // row lit, whatever the row: the result is what the clicks were for
+      dt_masks_preview_shape(dev, old->formid);
       // put the refined shape back where it was: on the photograph
       // through its module's edit mode, or through its own library row
       if(target)
@@ -2757,13 +2760,20 @@ static gboolean _finalize_apply_idle(gpointer data)
     }
   }
   else if(a->detector)
-    dt_control_log(_("'%s' added to the shape library, right-click it to"
-                     " add it to a module"), _(a->detector->label));
+    dt_control_log(_("'%s' added to the shape library: drag it onto a"
+                     " module, or right-click it"), _(a->detector->label));
   else
-    dt_control_log(_("object mask added to the shape library, right-click it to"
-                     " add it to a module"));
+    dt_control_log(_("object mask added to the shape library: drag it onto"
+                     " a module, or right-click it"));
 
   dt_dev_masks_list_change(dev);
+
+  // the new mask in yellow over the photograph, as a module shows its
+  // own, with the eye of its row lit -- the row of the library or of the
+  // module's mask, the detection reads the same either way, and the eye
+  // is the way to put it out. the state only: the reprocess below runs
+  // the pipe once for everything
+  dt_masks_preview_shape(dev, rform->formid);
 
   // no module asked for it: the raster shape sits in the shape library on
   // its own, and only its row can put it on the photograph -- a module's

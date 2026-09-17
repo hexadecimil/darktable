@@ -1276,9 +1276,8 @@ static int _raster_get_points_border(dt_develop_t *dev,
   _raster_cache_release(entry);
 
   // a background selects everything but the file's loops: one more loop,
-  // a rectangle far outside any canvas, and the even-odd rules of the
-  // tint (post_expose) and of the hit test (get_distance) turn inside
-  // out on their own -- the tint covers the background, a click on the
+  // a rectangle far outside any canvas, and the even-odd rule of the hit
+  // test (get_distance) turns inside out on its own -- a click on the
   // background selects the shape, and the stroked edge is the same edge.
   // off-screen, so the rectangle itself is never seen
   if(pt->flags & DT_MASKS_RASTER_FLAG_INVERT)
@@ -1576,11 +1575,10 @@ static void _raster_events_post_expose(cairo_t *cr,
   const gboolean selected = (gui->group_selected == index)
     && (gui->form_selected || gui->form_dragging);
 
-  // every loop as one cairo subpath: a light tint inside (even-odd, so
-  // the holes stay clear whatever the loops' orientation), then the
-  // shared main-line stroke -- the mask has no anchors to draw, and a
-  // hairline alone is easy to miss on a busy photograph when the shape
-  // has just landed in the library with no module to display it through
+  // every loop as one cairo subpath, then the shared main-line stroke:
+  // the mask has no anchors to draw. the edge only -- the mask itself is
+  // what the eye of the shape's row shows, in yellow through the pipe
+  // (dt_masks_preview_shape), and it is lit when the shape lands
   gboolean any = FALSE;
   int start = 0;
   for(int k = 0; k <= gpt->points_count; k++)
@@ -1599,14 +1597,7 @@ static void _raster_events_post_expose(cairo_t *cr,
     start = k + 1;
   }
   if(any)
-  {
-    cairo_save(cr);
-    cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
-    dt_draw_set_color_overlay(cr, TRUE, selected ? 0.24 : 0.16);
-    cairo_fill_preserve(cr);
-    cairo_restore(cr);
     dt_masks_line_stroke(cr, FALSE, FALSE, selected, zoom_scale);
-  }
 }
 
 // the function table for raster shapes

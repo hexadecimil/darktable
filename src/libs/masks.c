@@ -263,6 +263,17 @@ typedef struct dt_lib_masks_t
   // the widget only, module->expanded untouched, and
   // dt_iop_gui_update_expanded() puts each back from it
   gboolean panel_drag;
+  // the one selected row clicked again: it deselects, from an idle. the
+  // treeview's own press handler runs after ours on the same event and
+  // selects the row under the pointer (CLEAR_AND_SELECT, at press) -- an
+  // unselect made in the handler is undone before the click has returned,
+  // and claiming the gesture does not stop it. the idle runs once the
+  // whole press has been dispatched. ids and the view, never a path: a
+  // rebuild can land in between
+  GtkWidget *reclick_view;
+  dt_mask_id_t reclick_formid;
+  dt_mask_id_t reclick_groupid;
+  guint reclick_idle;
   struct dt_iop_module_t *drop_module;
   // a shape dropped on the "create" zone of libs/modulegroups.c, waiting
   // for a module to be typed in the search box or clicked in the list.
@@ -3293,16 +3304,15 @@ static void _set_iter_name(dt_lib_masks_t *lm,
     && (live->request_mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK);
 
   // a shape row -- a library shape, a member of a mask -- carries the same
-  // eye, for the shape alone: it puts THIS shape on the photograph the way
-  // its library row does when clicked (outline and tint), and takes it
-  // off again. lit while the shape is the one visible on its own, which
-  // is what the click toggles (_tree_button_pressed_cb). a mask row keeps
-  // the module's own display above
+  // eye, for the shape alone: THIS shape in yellow over the photograph,
+  // the way the module's eye above shows the module's whole mask, and
+  // off again on the next click (_tree_button_pressed_cb,
+  // dt_masks_preview_shape). one at a time, on either kind of row: the
+  // module's yellow and a shape's are the same channel of the same
+  // photograph. a mask row keeps the module's own display above
   const gboolean shape_eye = !show && !(form->type & DT_MASKS_GROUP);
   if(shape_eye)
-    show_on = darktable.develop->form_visible == form
-              && darktable.develop->form_gui
-              && !darktable.develop->form_gui->creation;
+    show_on = dt_masks_preview_is(darktable.develop, form->formid);
 
   // the glyph is drawn exactly where the shape HAS an operator: inside a
   // group, past the base, with an operator bit set. that is the very test
@@ -5032,18 +5042,45 @@ static gboolean _drop_shape_hover(dt_lib_module_t *self,
                           lm->drag_formid) < 0;
 }
 
-// the shape stops waiting: the state, and the placeholder that showed it
-static void _pending_shape_cancel(dt_lib_module_t *self)
+// the name of the shape waiting since a drop on the "create" zone, NULL
+// when none waits. read on every expose of the darkroom while it does:
+// the veil over the photograph is drawn from it
+static const char *_pending_shape(dt_lib_module_t *self)
 {
   dt_lib_masks_t *lm = self->data;
-  if(!dt_is_valid_maskid(lm->pending_formid)) return;
+  if(!dt_is_valid_maskid(lm->pending_formid)) return NULL;
+  const dt_masks_form_t *form =
+    dt_masks_get_from_id(darktable.develop, lm->pending_formid);
+  return form ? form->name : NULL;
+}
+
+// the wait itself, ended: the state and the banner that showed it. the
+// right panel is left as it is -- the two callers decide what it goes
+// back to, and one of them has a module to open first
+static void _pending_shape_clear(dt_lib_masks_t *lm)
+{
   lm->pending_formid = INVALID_MASKID;
   lm->pending_imgid = NO_IMGID;
   _modulegroups_shape_pending(NULL);
 }
 
+// the shape stops waiting, nothing named: the panel goes back to the
+// group it showed before the drag, and the veil leaves the photograph
+static void _pending_shape_cancel(dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
+  if(!dt_is_valid_maskid(lm->pending_formid)) return;
+  _pending_shape_clear(lm);
+  _panel_drag_end(lm);
+  dt_control_queue_redraw_center();
+}
+
 // the drag landed: on a header, the shape goes to that module; on the
-// "create" zone, it waits for one to be named in the search box
+// "create" zone, it waits for one to be named -- clicked in the panel,
+// which stays as the drag left it, every module listed and collapsed, or
+// typed in the search box. the darkroom is modal meanwhile: the
+// photograph is veiled (views/darkroom.c), a click on it, escape or the
+// banner's button call the wait off
 static gboolean _drop_shape(dt_lib_module_t *self,
                             dt_iop_module_t *module)
 {
@@ -5059,6 +5096,7 @@ static gboolean _drop_shape(dt_lib_module_t *self,
     lm->pending_formid = formid;
     lm->pending_imgid = darktable.develop->image_storage.id;
     _modulegroups_shape_pending(form->name);
+    dt_control_queue_redraw_center();
     return TRUE;
   }
 
@@ -5071,11 +5109,11 @@ static gboolean _drop_shape(dt_lib_module_t *self,
 // the list, or -- `module` NULL, enter in the search box -- the first one
 // on screen that can take a shape. a module whose mask already holds
 // shapes gets a new instance, default parameters, and the shape goes
-// there: "create" is the word on the zone. TRUE when the shape went
-// somewhere. a refusal says why and leaves the shape waiting: the wrong
-// name typed is retyped, and a click on a header that cannot take it
-// opens the module as any click does -- which takes the focus off the
-// search box, and the wait ends there
+// there: "create" is the word on the zone. TRUE whenever a shape was
+// waiting: the gesture is answered, and the caller does nothing more with
+// it. a refusal says why and leaves the shape waiting -- the wrong name
+// typed is retyped, a header that cannot take it opens nothing, the
+// banner still says what to do
 static gboolean _pending_shape_take(dt_lib_module_t *self,
                                     dt_iop_module_t *module)
 {
@@ -5111,27 +5149,33 @@ static gboolean _pending_shape_take(dt_lib_module_t *self,
     if(!module)
     {
       dt_control_log(_("no module on screen can take a drawn shape"));
-      return FALSE;
+      return TRUE;
     }
   }
   else if(!_mask_target_alive(module) || !_mask_target_ok(module))
   {
     dt_control_log(_("this module cannot take a drawn shape"));
-    return FALSE;
+    return TRUE;
   }
 
   // the wait is over before anything is written: the new instance and the
   // add both rebuild the lists, and a rebuild finding the shape still
-  // waiting would call it off under us
-  _pending_shape_cancel(self);
+  // waiting would call it off under us. the panel stays as it is until
+  // the module is open: _panel_drag_end() opens it last, so it is the one
+  // the panel scrolls to
+  _pending_shape_clear(lm);
 
   if(_mask_target_shapes(module) > 0)
   {
-    module = dt_iop_gui_duplicate(module, FALSE);
-    if(!module) return FALSE;
+    dt_iop_module_t *copy = dt_iop_gui_duplicate(module, FALSE);
+    if(copy) module = copy;
   }
 
-  return _shape_land(lm, module, formid);
+  if(_shape_land(lm, module, formid))
+    lm->drop_module = module;
+  _panel_drag_end(lm);
+  dt_control_queue_redraw_center();
+  return TRUE;
 }
 
 static void _tree_drag_begin_cb(GtkWidget *widget,
@@ -5178,8 +5222,10 @@ static void _tree_drag_end_cb(GtkWidget *widget,
 {
   dt_lib_masks_t *lm = self->data;
   // whatever became of the drag -- dropped, refused, escaped -- the right
-  // panel goes back
-  _panel_drag_end(lm);
+  // panel goes back. unless the shape is waiting on the "create" zone: the
+  // panel then stays as the drag left it, headers to click, until the
+  // wait ends (_pending_shape_take, _pending_shape_cancel)
+  if(!dt_is_valid_maskid(lm->pending_formid)) _panel_drag_end(lm);
   // this can land after gui_update swapped the stores: touch nothing but
   // the drag state and the indicator
   lm->drag_view = NULL;
@@ -5440,6 +5486,37 @@ static void _tree_leave_cb(GtkEventControllerMotion *controller,
   if(bin) gdk_window_set_cursor(bin, NULL);
 }
 
+// the deselection of a reclicked row, once the press it came from has been
+// dispatched in full -- see reclick_view. only if the selection is still
+// exactly that row: the press could have been the start of a drag whose
+// drop rebuilt the lists, or the view could be gone
+static gboolean _tree_reclick_idle(gpointer data)
+{
+  dt_lib_masks_t *lm = data;
+  lm->reclick_idle = 0;
+  GtkWidget *view = lm->reclick_view;
+  lm->reclick_view = NULL;
+  if(!view || _masks_view_index(lm, view) < 0) return G_SOURCE_REMOVE;
+
+  GtkTreeSelection *selection =
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
+  if(gtk_tree_selection_count_selected_rows(selection) != 1)
+    return G_SOURCE_REMOVE;
+
+  GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(view));
+  GList *rows = gtk_tree_selection_get_selected_rows(selection, NULL);
+  GtkTreeIter iter;
+  dt_mask_id_t grid = INVALID_MASKID;
+  dt_mask_id_t id = INVALID_MASKID;
+  if(rows && gtk_tree_model_get_iter(model, &iter, rows->data))
+    _lib_masks_get_values(model, &iter, NULL, &grid, &id);
+  g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+
+  if(id == lm->reclick_formid && grid == lm->reclick_groupid)
+    gtk_tree_selection_unselect_all(selection);
+  return G_SOURCE_REMOVE;
+}
+
 // what the click hit, and with which button -- nothing else. the right button
 // hands over to _tree_context_menu() above; everything that used to be built
 // here is there now
@@ -5635,48 +5712,43 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
     }
     else if(hit == DT_MASKS_OP_HIT_SHOW_SHAPE && mouse_path)
     {
-      // the eye of a shape row: the row's own click, or its undoing, and
-      // the row's selection follows -- one lit eye, one selected row, one
-      // shape on the photograph. claimed, so the treeview's own gesture
-      // does not select the row back after the undoing
+      // the eye of a shape row: this shape in yellow over the photograph,
+      // or off again. a switch: the row is selected under the click by
+      // the treeview's own gesture, as under the show cell of a mask row,
+      // and that is all the selection has to do with it. the list's eyes
+      // are relit by the call
       GtkTreeIter it;
       dt_mask_id_t fid = NO_MASKID;
       if(gtk_tree_model_get_iter(model, &it, mouse_path))
         _lib_masks_get_values(model, &it, NULL, NULL, &fid);
-      const dt_masks_form_t *f = dt_is_valid_maskid(fid)
-        ? dt_masks_get_from_id(darktable.develop, fid) : NULL;
-      if(f && darktable.develop->form_visible == f)
-      {
-        gtk_tree_selection_unselect_all(selection);
-        dt_masks_change_form_gui(NULL);
-        dt_control_queue_redraw_center();
-      }
-      else if(f)
-      {
-        gtk_tree_selection_unselect_all(selection);
-        gtk_tree_selection_select_path(selection, mouse_path);
-      }
-      dt_dev_masks_list_update(darktable.develop);
-      dt_gui_claim(gesture);
+      if(dt_is_valid_maskid(fid))
+        dt_masks_preview_shape(darktable.develop,
+                               dt_masks_preview_is(darktable.develop, fid)
+                               ? NO_MASKID : fid);
     }
     // if click on a blank space, then deselect all
     else if(!on_row)
     {
       gtk_tree_selection_unselect_all(selection);
     }
-    // a plain click on the one selected row: the shape leaves the
-    // photograph. this is the click the row's own selection put it there
-    // with, read the other way round -- the way out of a shape shown from
-    // the library, which no module's edit toggle covers. the gesture is
-    // claimed, or the treeview's own would select the row again on release;
-    // a double click (rename) is not this, n_press says so
+    // a plain click on the one selected row: the row deselects, and the
+    // shape leaves the photograph -- a library shape, or a module's whole
+    // edit session, which the selection change ends. this is the click
+    // the row's own selection put it there with, read the other way
+    // round. from an idle, see reclick_view: the treeview selects the row
+    // under the pointer after us on this very press. a double click
+    // (rename) is not this, n_press says so
     else if(hit == DT_MASKS_OP_HIT_NONE && n_press == 1
             && dt_modifier_is(mods, 0)
             && gtk_tree_selection_count_selected_rows(selection) == 1
-            && gtk_tree_selection_path_is_selected(selection, mouse_path))
+            && gtk_tree_selection_path_is_selected(selection, mouse_path)
+            && gtk_tree_model_get_iter(model, &iter, mouse_path))
     {
-      gtk_tree_selection_unselect_all(selection);
-      dt_gui_claim(gesture);
+      lm->reclick_view = treeview;
+      _lib_masks_get_values(model, &iter, NULL,
+                            &lm->reclick_groupid, &lm->reclick_formid);
+      if(!lm->reclick_idle)
+        lm->reclick_idle = g_idle_add(_tree_reclick_idle, lm);
     }
   }
   else if(button == GDK_BUTTON_SECONDARY)
@@ -5916,8 +5988,8 @@ static gboolean _tree_query_tooltip(GtkWidget *widget,
                            _("switch the module on to see its mask"));
     else if(hit == DT_MASKS_OP_HIT_SHOW_SHAPE)
       gtk_tooltip_set_text(tooltip,
-                           _("see this shape alone over the photograph\n"
-                             "click again to take it off"));
+                           _("see this shape alone, in yellow, over the"
+                             " photograph\nclick again to take it off"));
 
     if(hit != DT_MASKS_OP_HIT_NONE)
     {
@@ -7925,6 +7997,7 @@ void gui_init(dt_lib_module_t *self)
   // "create" zone of the module groups
   darktable.develop->proxy.masks.drop_shape_hover = _drop_shape_hover;
   darktable.develop->proxy.masks.drop_shape = _drop_shape;
+  darktable.develop->proxy.masks.pending_shape = _pending_shape;
   darktable.develop->proxy.masks.pending_shape_take = _pending_shape_take;
   darktable.develop->proxy.masks.pending_shape_cancel = _pending_shape_cancel;
   // the AI menu, for the ✦ of every blending panel: one menu for both
@@ -7943,6 +8016,8 @@ void gui_cleanup(dt_lib_module_t *self)
     g_source_remove(d->resize_timer);
   if(d && d->flash_timer)
     g_source_remove(d->flash_timer);
+  if(d && d->reclick_idle)
+    g_source_remove(d->reclick_idle);
   // the armament outlives the form on purpose; it must not outlive the panel
   // that is the only way to see it and the only way to put it down
   dt_masks_set_next_operator(DT_MASKS_STATE_NONE, NULL);

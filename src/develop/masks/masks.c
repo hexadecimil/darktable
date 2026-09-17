@@ -1516,6 +1516,41 @@ void dt_masks_events_post_expose(const dt_iop_module_t *module,
   cairo_restore(cr);
 }
 
+gboolean dt_masks_preview_is(const dt_develop_t *dev, const dt_mask_id_t formid)
+{
+  return dt_is_valid_maskid(formid)
+    && dev->preview_formid == formid
+    && dev->preview_imgid == dev->image_storage.id;
+}
+
+void dt_masks_preview_shape(dt_develop_t *dev, const dt_mask_id_t formid)
+{
+  const dt_mask_id_t id = dt_is_valid_maskid(formid) ? formid : NO_MASKID;
+  const dt_imgid_t imgid = dt_is_valid_maskid(id) ? dev->image_storage.id : NO_IMGID;
+  if(dev->preview_formid == id && dev->preview_imgid == imgid) return;
+  dev->preview_formid = id;
+  dev->preview_imgid = imgid;
+
+  // the module's own yellow goes out first: dt_iop_set_mask_display()
+  // reruns the pipe from that module, which is upstream of gamma, so the
+  // refresh below is covered by it and only ever adds a pass through the
+  // cache
+  dt_iop_module_t *gm = dev->gui_module;
+  if(dt_is_valid_maskid(id) && gm
+     && (gm->request_mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK))
+    dt_iop_set_mask_display(gm, FALSE);
+
+  // gamma is the last module of the pipe and the one that draws this:
+  // only it reruns, on its cached input
+  if(dev->gui_attached)
+  {
+    dt_iop_module_t *gamma = dt_iop_get_module_from_list(dev->iop, "gamma");
+    if(gamma) dt_iop_refresh_center(gamma);
+  }
+  // the eyes of the mask manager follow
+  dt_dev_masks_list_update(dev);
+}
+
 void dt_masks_clear_form_gui(const dt_develop_t *dev)
 {
   if(!dev->form_gui) return;

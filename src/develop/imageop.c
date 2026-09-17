@@ -2928,15 +2928,18 @@ static void _iop_plugin_header_released(GtkGestureSingle *gesture,
     else
     {
       // a shape is waiting in the mask manager for a module to be named,
-      // and a header was just clicked: that names it. refused -- the
-      // module cannot take a shape -- the click opens the module as ever
+      // and a header was just clicked: that names it. the click is the
+      // answer either way -- taken, or refused with a word because the
+      // module cannot take a shape -- and opens nothing: the darkroom is
+      // modal for as long as the shape waits
       dt_develop_t *dev = darktable.develop;
       if(dev->proxy.masks.module
          && dev->proxy.masks.pending_shape_take
          && dev->proxy.masks.pending_shape_take(dev->proxy.masks.module,
                                                 module))
       {
-        gtk_widget_grab_focus(dt_ui_center(darktable.gui->ui));
+        if(!dt_dev_masks_pending_shape(dev))
+          gtk_widget_grab_focus(dt_ui_center(darktable.gui->ui));
         return;
       }
 
@@ -3143,6 +3146,16 @@ void dt_iop_set_mask_display(dt_iop_module_t *module, const gboolean display)
   // blend_data unchecked is one caller away from being wrong
   dt_iop_gui_blend_data_t *bd = module ? module->blend_data : NULL;
   if(!bd) return;
+
+  // the shape the mask manager shows in yellow goes out when a module's
+  // yellow comes up: the two share the photograph (iop/gamma.c). the
+  // state alone -- the refresh below reruns the pipe from this module,
+  // and gamma is downstream of every module
+  if(display && dt_is_valid_maskid(module->dev->preview_formid))
+  {
+    module->dev->preview_formid = NO_MASKID;
+    module->dev->preview_imgid = NO_IMGID;
+  }
 
   module->request_mask_display &= ~DT_DEV_PIXELPIPE_DISPLAY_MASK;
   module->request_mask_display |=

@@ -797,6 +797,15 @@ void dt_masks_cleanup_unused(dt_develop_t *dev);
 /** function used to manipulate forms for masks */
 void dt_masks_change_form_gui(dt_masks_form_t *newform);
 void dt_masks_clear_form_gui(const dt_develop_t *dev);
+
+/** the shape shown in yellow over the photograph, the way a module's
+    "display mask" shows its own: one at a time, rendered at the end of
+    the full pipe by iop/gamma.c. NO_MASKID puts it away. the module's
+    yellow and this one share the photograph, so lighting one puts the
+    other out */
+void dt_masks_preview_shape(dt_develop_t *dev, const dt_mask_id_t formid);
+/** is `formid` the shape shown that way, on the image on screen */
+gboolean dt_masks_preview_is(const dt_develop_t *dev, const dt_mask_id_t formid);
 void dt_masks_reset_form_gui(void);
 void dt_masks_reset_show_masks_icons(void);
 

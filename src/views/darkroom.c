@@ -634,6 +634,7 @@ _darkroom_draw_dnd_hint(cairo_t *cr, const int width, const int height, const ch
   pango_font_description_set_absolute_size(desc, DT_PIXEL_APPLY_DPI(18) * PANGO_SCALE);
   PangoLayout *layout = pango_cairo_create_layout(cr);
   pango_layout_set_font_description(layout, desc);
+  pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
   pango_layout_set_text(layout, text, -1);
   PangoRectangle ink, logical;
   pango_layout_get_pixel_extents(layout, &ink, &logical);
@@ -1149,6 +1150,21 @@ void expose(dt_view_t *self,
   // hint shown while an external file drag hovers the darkroom
   if(_darkroom_dnd_active)
     _darkroom_draw_dnd_hint(cri, width, height, _("drop XMP sidecar files here to apply edits"));
+
+  // a shape of the mask manager waits for a module to be named (a drop on
+  // the "create" zone of the right panel): the darkroom is modal until it
+  // is, and the photograph says so. a click on it calls the wait off
+  // (button_pressed)
+  const char *pending = dt_dev_masks_pending_shape(dev);
+  if(pending)
+  {
+    gchar *text = g_strdup_printf(_("'%s'\nclick a module in the right panel"
+                                    " to add it there\n\n"
+                                    "click here or press escape to cancel"),
+                                  pending);
+    _darkroom_draw_dnd_hint(cri, width, height, text);
+    g_free(text);
+  }
 }
 
 void reset(dt_view_t *self)
@@ -4462,6 +4478,16 @@ int button_pressed(dt_view_t *self,
   dt_colorpicker_sample_t *const sample = darktable.lib->proxy.colorpicker.primary_sample;
 
   float zoom_x = FLT_MAX, zoom_y, zoom_scale;
+
+  // a shape waiting in the mask manager for a module: the photograph is
+  // veiled (expose), and a click on it is the wait called off -- nothing
+  // under the veil is reached
+  if(dt_dev_masks_pending_shape(dev))
+  {
+    if(which == GDK_BUTTON_PRIMARY && type == GDK_BUTTON_PRESS)
+      dt_dev_masks_pending_shape_cancel(dev);
+    return 1;
+  }
 
   if(darktable.develop->darkroom_skip_mouse_events)
   {
