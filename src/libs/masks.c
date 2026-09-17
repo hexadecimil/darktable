@@ -26,6 +26,7 @@
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/masks/object_recipe.h"
+#include "dtgtk/expander.h"
 #include "dtgtk/paint_cell.h"
 #include "gui/accelerators.h"
 #include "gui/drag_and_drop.h"
@@ -250,6 +251,28 @@ typedef struct dt_lib_masks_t
   dt_mask_id_t drag_formid;
   dt_mask_id_t drag_groupid;
   gint drag_x, drag_y;
+  // a library drag has the right panel turned into a list of headers, and
+  // "drag-end" has to put it back whatever the drag came to. its own flag
+  // and not drag_view: the pointer is let go before the end arrives, and
+  // one motion event over the list in between stands drag_view down.
+  // drop_module is the module that took the drag at the drop, read back
+  // by that same end -- the drop lands first, the end follows through the
+  // event queue -- so that it stays open and focused while every other
+  // header goes back to what it was. nothing else about the panel is
+  // written down: for the length of the drag the headers are collapsed on
+  // the widget only, module->expanded untouched, and
+  // dt_iop_gui_update_expanded() puts each back from it
+  gboolean panel_drag;
+  struct dt_iop_module_t *drop_module;
+  // a shape dropped on the "create" zone of libs/modulegroups.c, waiting
+  // for a module to be typed in the search box or clicked in the list.
+  // INVALID_MASKID when none; the image it was chosen on, as pick_imgid
+  dt_mask_id_t pending_formid;
+  dt_imgid_t pending_imgid;
+  // the module whose mask a drop just put on the photograph, and the timer
+  // that takes it off again. compared, never dereferenced
+  struct dt_iop_module_t *flash_module;
+  guint flash_timer;
   // the masks zone's operator column, and the whole of the click target: a
   // click is "on the operator" when GTK hands back THIS column, never when a
   // pixel offset falls inside a range. one field for both lists, and it only
@@ -4575,11 +4598,9 @@ static void _tree_context_menu(dt_lib_module_t *self,
   gdk_event_free(event);
 }
 
-// the one target of this panel's drag and drop. the payload never travels
-// through it -- both ends of the drag live in dt_lib_masks_t -- but the NAME
-// is what keeps a filmstrip image or a tag from being droppable here
-static const GtkTargetEntry _masks_dnd_target =
-  { "masks-shape-dnd", GTK_TARGET_SAME_APP, DND_TARGET_MASK_SHAPE };
+// the one target of this panel's drag and drop is target_list_mask_shape of
+// gui/drag_and_drop.h: the module headers and the module groups take it too,
+// and the payload never travels through it -- both ends read dt_lib_masks_t
 
 // defined below with the other tree walkers; the drag icon needs it early
 gboolean _find_mask_iter_by_values(GtkTreeModel *model,
@@ -4833,6 +4854,271 @@ static gboolean _tree_drag_drop_cb(GtkWidget *widget,
   return TRUE;
 }
 
+/* -------------------------------------------------------------------------
+   a library row over the right panel.
+
+   the drag that adds a shape to a mask row can go one panel further: onto
+   the header of the module itself, or onto the "create" zone the module
+   groups show under their search box while it lasts. the headers and the
+   zone ask this panel through dev->proxy.masks whether the drag can land
+   and tell it when it did; the module groups are told through
+   dev->proxy.modulegroups when it begins and ends. the payload stays
+   here: lm->drag_formid, as for the drop on the masks list.
+   ------------------------------------------------------------------------- */
+
+static void _modulegroups_shape_drag(const gboolean active)
+{
+  dt_develop_t *dev = darktable.develop;
+  if(dev->proxy.modulegroups.module && dev->proxy.modulegroups.shape_drag)
+    dev->proxy.modulegroups.shape_drag(dev->proxy.modulegroups.module, active);
+}
+
+static void _modulegroups_shape_pending(const char *name)
+{
+  dt_develop_t *dev = darktable.develop;
+  if(dev->proxy.modulegroups.module && dev->proxy.modulegroups.shape_pending)
+    dev->proxy.modulegroups.shape_pending(dev->proxy.modulegroups.module, name);
+}
+
+// the panel for the length of a library drag: every module listed, every
+// header collapsed, the ones that cannot take a shape dimmed. collapsed on
+// the widget only -- dt_iop_gui_set_expanded() would write the conf, move
+// the focus and take the selected shape off the photograph on its way, and
+// a drag let go over nothing must leave no trace
+static void _panel_drag_begin(dt_lib_masks_t *lm)
+{
+  lm->panel_drag = TRUE;
+  lm->drop_module = NULL;
+  _modulegroups_shape_drag(TRUE);
+
+  for(const GList *l = darktable.develop->iop; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *m = l->data;
+    if(!m->expander) continue;
+    dtgtk_expander_set_expanded(DTGTK_EXPANDER(m->expander), FALSE);
+    if(!_mask_target_ok(m) || !_mask_target_listed(m))
+      gtk_widget_set_opacity(m->expander, 0.35);
+  }
+}
+
+// ... and back, whatever the drag came to. the group's own list first,
+// switched to the group of the module that took the shape when the one on
+// screen does not list it -- it has the focus, and a header hidden under
+// the focus is a focus lost. the headers after, hidden ones before the
+// ones on screen and the module that took the shape last of all: the last
+// header dtgtk_expander_set_expanded() opens is the one the panel scrolls
+// to, and that has to be on screen
+static void _panel_drag_end(dt_lib_masks_t *lm)
+{
+  if(!lm->panel_drag) return;
+  lm->panel_drag = FALSE;
+  dt_iop_module_t *took = lm->drop_module;
+  lm->drop_module = NULL;
+
+  if(took && !dt_iop_shown_in_group(took, dt_dev_modulegroups_get(darktable.develop)))
+    dt_dev_modulegroups_switch(darktable.develop, took);
+  _modulegroups_shape_drag(FALSE);
+
+  for(int shown = 0; shown < 2; shown++)
+    for(const GList *l = darktable.develop->iop; l; l = g_list_next(l))
+    {
+      dt_iop_module_t *m = l->data;
+      if(!m->expander || m == took
+         || (gtk_widget_get_visible(m->expander) ? 1 : 0) != shown)
+        continue;
+      gtk_widget_set_opacity(m->expander, 1.0);
+      dt_iop_gui_update_expanded(m);
+    }
+
+  if(took)
+  {
+    gtk_widget_set_opacity(took->expander, 1.0);
+    dt_iop_gui_update_expanded(took);
+  }
+}
+
+// the mask a drop just filled leaves the photograph again. only if it is
+// still there to take off: the module can be gone -- instance removed,
+// image changed -- and the focus, which is what carries the display, can
+// have moved on, in which case dt_iop_gui_blending_lose_focus() already
+// put it out and calling again would take the focus back
+static gboolean _shape_flash_end(gpointer data)
+{
+  dt_lib_masks_t *lm = data;
+  dt_iop_module_t *module = lm->flash_module;
+  lm->flash_timer = 0;
+  lm->flash_module = NULL;
+
+  if(_mask_target_alive(module)
+     && darktable.develop->gui_module == module
+     && (module->request_mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK))
+    dt_iop_set_mask_display(module, FALSE);
+  return G_SOURCE_REMOVE;
+}
+
+// a shape lands in a module from a drop: added, and then shown -- the
+// module opens with the focus, its mask is on the photograph for a moment,
+// and a line says what went where. opened first, added after: the add
+// reselects the mask, and the selection puts the group on the photograph
+// for the module that has the focus by then. a module already open is
+// left as it is -- set_expanded with collapse_others would TOGGLE it shut
+// when every other header is closed, which is how the drag left them
+static gboolean _shape_land(dt_lib_masks_t *lm,
+                            dt_iop_module_t *module,
+                            const dt_mask_id_t formid)
+{
+  const dt_masks_form_t *form = dt_masks_get_from_id(darktable.develop, formid);
+  if(!form || !_mask_target_alive(module) || !_mask_target_ok(module))
+    return FALSE;
+  // the add writes history, and history rebuilds the forms
+  gchar *shape = g_strdup(form->name);
+
+  if(!module->expanded)
+    dt_iop_gui_set_expanded(module, TRUE,
+                            dt_conf_get_bool("darkroom/ui/single_module"));
+  else
+    dt_iop_gui_update_expanded(module);
+  dt_iop_request_focus(module);
+
+  if(!_shape_add_to_module(module, formid))
+  {
+    g_free(shape);
+    return FALSE;
+  }
+
+  dt_iop_set_mask_display(module, TRUE);
+  if(lm->flash_timer) g_source_remove(lm->flash_timer);
+  lm->flash_module = module;
+  lm->flash_timer = g_timeout_add(1500, _shape_flash_end, lm);
+
+  gchar *name = dt_history_item_get_name_plain(module);
+  dt_control_log(_("'%s' added to %s"), shape, name);
+  g_free(name);
+  g_free(shape);
+  return TRUE;
+}
+
+// can the drag in flight land on `module` -- NULL for the "create" zone,
+// which takes any shape. a drag out of the library only: a mask row dragged
+// over the panel keeps meaning what it means today, a reorder inside its
+// own group, and lands nowhere else. a mask that already holds the very
+// shape refuses, as the masks list does: the add would duplicate the row
+static gboolean _drop_shape_hover(dt_lib_module_t *self,
+                                  dt_iop_module_t *module)
+{
+  dt_lib_masks_t *lm = self->data;
+  if(lm->drag_view != lm->library || !dt_is_valid_maskid(lm->drag_formid))
+    return FALSE;
+  if(!module) return TRUE;
+
+  return _mask_target_alive(module) && _mask_target_ok(module)
+    && _group_point_index(dt_masks_get_from_id(darktable.develop,
+                                               module->blend_params->mask_id),
+                          lm->drag_formid) < 0;
+}
+
+// the shape stops waiting: the state, and the placeholder that showed it
+static void _pending_shape_cancel(dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
+  if(!dt_is_valid_maskid(lm->pending_formid)) return;
+  lm->pending_formid = INVALID_MASKID;
+  lm->pending_imgid = NO_IMGID;
+  _modulegroups_shape_pending(NULL);
+}
+
+// the drag landed: on a header, the shape goes to that module; on the
+// "create" zone, it waits for one to be named in the search box
+static gboolean _drop_shape(dt_lib_module_t *self,
+                            dt_iop_module_t *module)
+{
+  dt_lib_masks_t *lm = self->data;
+  if(!_drop_shape_hover(self, module)) return FALSE;
+  const dt_mask_id_t formid = lm->drag_formid;
+
+  if(!module)
+  {
+    const dt_masks_form_t *form =
+      dt_masks_get_from_id(darktable.develop, formid);
+    if(!form) return FALSE;
+    lm->pending_formid = formid;
+    lm->pending_imgid = darktable.develop->image_storage.id;
+    _modulegroups_shape_pending(form->name);
+    return TRUE;
+  }
+
+  if(!_shape_land(lm, module, formid)) return FALSE;
+  lm->drop_module = module;
+  return TRUE;
+}
+
+// a module named for the shape waiting since the "create" zone: clicked in
+// the list, or -- `module` NULL, enter in the search box -- the first one
+// on screen that can take a shape. a module whose mask already holds
+// shapes gets a new instance, default parameters, and the shape goes
+// there: "create" is the word on the zone. TRUE when the shape went
+// somewhere. a refusal says why and leaves the shape waiting: the wrong
+// name typed is retyped, and a click on a header that cannot take it
+// opens the module as any click does -- which takes the focus off the
+// search box, and the wait ends there
+static gboolean _pending_shape_take(dt_lib_module_t *self,
+                                    dt_iop_module_t *module)
+{
+  dt_lib_masks_t *lm = self->data;
+  if(!dt_is_valid_maskid(lm->pending_formid)) return FALSE;
+
+  const dt_mask_id_t formid = lm->pending_formid;
+  // the image can have changed under the wait, and a mask id of one image
+  // means nothing in the next
+  if(lm->pending_imgid != darktable.develop->image_storage.id
+     || !dt_masks_get_from_id(darktable.develop, formid))
+  {
+    _pending_shape_cancel(self);
+    return FALSE;
+  }
+
+  if(!module)
+  {
+    // top of the panel down: dev->iop is in pipe order, and the panel is
+    // stacked from its end
+    for(const GList *l = g_list_last(darktable.develop->iop);
+        l;
+        l = g_list_previous(l))
+    {
+      dt_iop_module_t *m = l->data;
+      if(m->expander && gtk_widget_get_visible(m->expander)
+         && _mask_target_ok(m))
+      {
+        module = m;
+        break;
+      }
+    }
+    if(!module)
+    {
+      dt_control_log(_("no module on screen can take a drawn shape"));
+      return FALSE;
+    }
+  }
+  else if(!_mask_target_alive(module) || !_mask_target_ok(module))
+  {
+    dt_control_log(_("this module cannot take a drawn shape"));
+    return FALSE;
+  }
+
+  // the wait is over before anything is written: the new instance and the
+  // add both rebuild the lists, and a rebuild finding the shape still
+  // waiting would call it off under us
+  _pending_shape_cancel(self);
+
+  if(_mask_target_shapes(module) > 0)
+  {
+    module = dt_iop_gui_duplicate(module, FALSE);
+    if(!module) return FALSE;
+  }
+
+  return _shape_land(lm, module, formid);
+}
+
 static void _tree_drag_begin_cb(GtkWidget *widget,
                                 GdkDragContext *context,
                                 dt_lib_module_t *self)
@@ -4845,6 +5131,10 @@ static void _tree_drag_begin_cb(GtkWidget *widget,
   // the operator menu makes before popping up
   GdkWindow *bin = gtk_tree_view_get_bin_window(GTK_TREE_VIEW(widget));
   if(bin) gdk_window_set_cursor(bin, NULL);
+
+  // a library row can land on a module header: the right panel turns into
+  // a list of headers for the length of the drag
+  if(widget == lm->library) _panel_drag_begin(lm);
 
   // the row itself as the drag icon, as libs/tagging.c does. resolved by id
   // and not by a stored path: first row carrying it -- for a shape worn by
@@ -4872,6 +5162,9 @@ static void _tree_drag_end_cb(GtkWidget *widget,
                               dt_lib_module_t *self)
 {
   dt_lib_masks_t *lm = self->data;
+  // whatever became of the drag -- dropped, refused, escaped -- the right
+  // panel goes back
+  _panel_drag_end(lm);
   // this can land after gui_update swapped the stores: touch nothing but
   // the drag state and the indicator
   lm->drag_view = NULL;
@@ -5067,7 +5360,8 @@ static void _tree_motion_cb(GtkEventControllerMotion *controller,
     else if(gtk_drag_check_threshold(view, lm->drag_x, lm->drag_y,
                                      (gint)x, (gint)y))
     {
-      GtkTargetList *targets = gtk_target_list_new(&_masks_dnd_target, 1);
+      GtkTargetList *targets = gtk_target_list_new(target_list_mask_shape,
+                                                   n_targets_mask_shape);
       GdkEvent *event = gtk_get_current_event();
       // LINK from the library -- adding a shape links it, F4's whole point,
       // and the copy cursor's "+" badge would promise the independent copy
@@ -6367,6 +6661,13 @@ void gui_update(dt_lib_module_t *self)
 static void _lib_masks_recreate_list(dt_lib_module_t *self)
 {
   dt_lib_masks_t *lm = self->data;
+  // a shape waiting on the "create" zone was chosen on an image, and the
+  // wait ends with it -- the test _mask_picked_target() makes on the
+  // module picked by hand, made here because this is where an image change
+  // lands first
+  if(dt_is_valid_maskid(lm->pending_formid)
+     && lm->pending_imgid != darktable.develop->image_storage.id)
+    _pending_shape_cancel(self);
   dt_lib_gui_queue_update(self);
 
   DT_TRY_GUI_UPDATE();
@@ -7006,7 +7307,7 @@ static void _build_masks_view(dt_lib_module_t *self,
                    G_CALLBACK(_tree_drag_data_get_cb), self);
   if(!library)
   {
-    gtk_drag_dest_set(view, 0, &_masks_dnd_target, 1,
+    gtk_drag_dest_set(view, 0, target_list_mask_shape, n_targets_mask_shape,
                       GDK_ACTION_MOVE | GDK_ACTION_LINK);
     g_signal_connect(view, "drag-motion",
                      G_CALLBACK(_tree_drag_motion_cb), self);
@@ -7505,6 +7806,12 @@ void gui_init(dt_lib_module_t *self)
   darktable.develop->proxy.masks.list_update = _lib_masks_update_list;
   darktable.develop->proxy.masks.list_remove = _lib_masks_remove_item;
   darktable.develop->proxy.masks.selection_change = _lib_masks_selection_change;
+  // the library drag over the right panel, for the module headers and the
+  // "create" zone of the module groups
+  darktable.develop->proxy.masks.drop_shape_hover = _drop_shape_hover;
+  darktable.develop->proxy.masks.drop_shape = _drop_shape;
+  darktable.develop->proxy.masks.pending_shape_take = _pending_shape_take;
+  darktable.develop->proxy.masks.pending_shape_cancel = _pending_shape_cancel;
   // the AI menu, for the ✦ of every blending panel: one menu for both
   // buttons, built here where the detectors and the session entry live
 #ifdef HAVE_AI
@@ -7519,6 +7826,8 @@ void gui_cleanup(dt_lib_module_t *self)
   dt_lib_masks_t *d = self->data;
   if(d && d->resize_timer)
     g_source_remove(d->resize_timer);
+  if(d && d->flash_timer)
+    g_source_remove(d->flash_timer);
   // the armament outlives the form on purpose; it must not outlive the panel
   // that is the only way to see it and the only way to put it down
   dt_masks_set_next_operator(DT_MASKS_STATE_NONE, NULL);

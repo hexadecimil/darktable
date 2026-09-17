@@ -2927,6 +2927,19 @@ static void _iop_plugin_header_released(GtkGestureSingle *gesture,
     }
     else
     {
+      // a shape is waiting in the mask manager for a module to be named,
+      // and a header was just clicked: that names it. refused -- the
+      // module cannot take a shape -- the click opens the module as ever
+      dt_develop_t *dev = darktable.develop;
+      if(dev->proxy.masks.module
+         && dev->proxy.masks.pending_shape_take
+         && dev->proxy.masks.pending_shape_take(dev->proxy.masks.module,
+                                                module))
+      {
+        gtk_widget_grab_focus(dt_ui_center(darktable.gui->ui));
+        return;
+      }
+
       const gboolean collapse_others =
         !dt_conf_get_bool("darkroom/ui/single_module")
         != (!dt_modifier_is(dt_key_modifier_state(), GDK_SHIFT_MASK));
@@ -3415,6 +3428,42 @@ GtkWidget *dt_iop_gui_header_button(dt_iop_module_t *module,
   return button;
 }
 
+// a shape of the mask manager over a header: the manager says whether this
+// module can take it, and takes it at the drop -- the pipe, the mask, the
+// history are its business. the frame is a css class of our own and not
+// dtgtk_expander_set_drag_hover(): that one parks its drop widget until the
+// "drag-end" of a HEADER puts it down, and this drag ends in the manager.
+// x == DND_DROP is the drop, as in _on_drag_motion
+static gboolean _on_drag_shape(GtkWidget *widget,
+                               GdkDragContext *dc,
+                               const gint x,
+                               const guint time,
+                               dt_iop_module_t *dest)
+{
+  dt_develop_t *dev = darktable.develop;
+  dt_lib_module_t *masks = dev->proxy.masks.module;
+  const gboolean ok = masks
+    && dev->proxy.masks.drop_shape_hover
+    && dev->proxy.masks.drop_shape_hover(masks, dest);
+
+  if(x != DND_DROP)
+  {
+    gdk_drag_status(dc, ok ? GDK_ACTION_LINK : 0, time);
+    if(ok)
+      dt_gui_add_class(widget, "module_drop_shape");
+    else
+      dt_gui_remove_class(widget, "module_drop_shape");
+    return TRUE;
+  }
+
+  // gtk sends the leave before the drop, so the frame is normally gone by
+  // now; one line makes sure of it
+  dt_gui_remove_class(widget, "module_drop_shape");
+  gtk_drag_finish(dc, ok, FALSE, time);
+  if(ok) dev->proxy.masks.drop_shape(masks, dest);
+  return TRUE;
+}
+
 static gboolean _on_drag_motion(GtkWidget *widget,
                                 GdkDragContext *dc,
                                 const gint x,
@@ -3422,6 +3471,10 @@ static gboolean _on_drag_motion(GtkWidget *widget,
                                 const guint time,
                                 dt_iop_module_t *dest)
 {
+  if(gtk_drag_dest_find_target(widget, dc, NULL)
+     == gdk_atom_intern_static_string(target_list_mask_shape[0].target))
+    return _on_drag_shape(widget, dc, x, time, dest);
+
   gdk_drag_status(dc, 0, time);
   dtgtk_expander_set_drag_hover(DTGTK_EXPANDER(widget), FALSE, TRUE, time);
 
@@ -3500,6 +3553,16 @@ static gboolean _on_drag_drop(GtkWidget *widget,
   return _on_drag_motion(widget, dc, DND_DROP, y, time, module);
 }
 
+// the shape frame goes with the pointer. the expander's own leave handler
+// only knows its reorder indicator
+static void _on_drag_leave(GtkWidget *widget,
+                           GdkDragContext *dc,
+                           const guint time,
+                           dt_iop_module_t *module)
+{
+  dt_gui_remove_class(widget, "module_drop_shape");
+}
+
 void dt_iop_gui_set_expander(dt_iop_module_t *module)
 {
   GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
@@ -3518,9 +3581,15 @@ void dt_iop_gui_set_expander(dt_iop_module_t *module)
   static const GtkTargetEntry target_list[] = { { "iop", GTK_TARGET_SAME_APP, DND_TARGET_IOP } };
 
   gtk_drag_source_set(header_evb, GDK_BUTTON1_MASK, target_list, 1, GDK_ACTION_COPY);
-  gtk_drag_dest_set(expander, GTK_DEST_DEFAULT_DROP | GTK_DEST_DEFAULT_HIGHLIGHT, target_list, 1, GDK_ACTION_COPY);
+  gtk_drag_dest_set(expander, GTK_DEST_DEFAULT_DROP | GTK_DEST_DEFAULT_HIGHLIGHT, target_list, 1,
+                    GDK_ACTION_COPY | GDK_ACTION_LINK);
+  // ... and a shape out of the mask manager, added to the module's mask at
+  // the drop. the header stays a source of "iop" only
+  gtk_target_list_add_table(gtk_drag_dest_get_target_list(expander),
+                            target_list_mask_shape, n_targets_mask_shape);
   g_signal_connect(expander, "drag-motion", G_CALLBACK(_on_drag_motion), module);
   g_signal_connect(expander, "drag-drop", G_CALLBACK(_on_drag_drop), module);
+  g_signal_connect(expander, "drag-leave", G_CALLBACK(_on_drag_leave), module);
 
   module->header = header;
 

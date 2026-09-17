@@ -284,6 +284,17 @@ typedef struct dt_develop_t
       gboolean (*basics_module_toggle)(struct dt_lib_module_t *self,
                                        GtkWidget *widget,
                                        const gboolean doit);
+      /* a shape of the mask manager is being dragged over the right
+         panel (TRUE) or no longer is (FALSE): every module is listed
+         meanwhile, whatever the group, and the "create" drop zone
+         shows under the search box */
+      void (*shape_drag)(struct dt_lib_module_t *self,
+                         const gboolean active);
+      /* a shape dropped on that zone waits for a module to be typed:
+         the search box takes the focus, empty, and says so in its
+         placeholder. NULL puts the placeholder back */
+      void (*shape_pending)(struct dt_lib_module_t *self,
+                            const char *name);
     } modulegroups;
 
     // masks plugin hooks
@@ -309,6 +320,23 @@ typedef struct dt_develop_t
       void (*object_menu)(struct dt_lib_module_t *self,
                           struct dt_iop_module_t *module,
                           GtkWidget *anchor);
+      /* a shape dragged out of the manager's library, over the right
+         panel. drop_shape_hover: can `module` take it right now --
+         `module` NULL asks for the "create" zone of the module groups,
+         which takes any shape. drop_shape: it was dropped there; TRUE
+         when it landed. pending_shape_take: a shape left waiting on
+         the "create" zone goes to `module` -- or, NULL, to the first
+         module on screen that can take it; TRUE when it went, FALSE
+         when nothing waited or the module was refused, and the
+         gesture then means what it always meant. pending_shape_cancel:
+         it stops waiting */
+      gboolean (*drop_shape_hover)(struct dt_lib_module_t *self,
+                                   struct dt_iop_module_t *module);
+      gboolean (*drop_shape)(struct dt_lib_module_t *self,
+                             struct dt_iop_module_t *module);
+      gboolean (*pending_shape_take)(struct dt_lib_module_t *self,
+                                     struct dt_iop_module_t *module);
+      void (*pending_shape_cancel)(struct dt_lib_module_t *self);
     } masks;
   } proxy;
 

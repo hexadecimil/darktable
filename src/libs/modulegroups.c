@@ -29,6 +29,7 @@
 #include "dtgtk/button.h"
 #include "dtgtk/icon.h"
 #include "gui/accelerators.h"
+#include "gui/drag_and_drop.h"
 #include "gui/gtk.h"
 #include "gui/presets.h"
 #include "libs/lib.h"
@@ -146,6 +147,13 @@ typedef struct dt_lib_modulegroups_t
   GtkWidget *mod_vbox_basic;
 
   dt_iop_module_t *force_show_module;
+
+  // a shape of the mask manager is being dragged over the right panel:
+  // every module is listed for it, and shape_drop -- the "create" zone
+  // under the search box, a drop target of its own -- is shown. set and
+  // cleared by the manager through the shape_drag proxy
+  gboolean shape_drag;
+  GtkWidget *shape_drop;
 } dt_lib_modulegroups_t;
 
 typedef enum dt_lib_modulegroup_iop_visibility_type_t
@@ -230,6 +238,89 @@ static void _text_entry_changed_callback(GtkEntry *entry, dt_lib_module_t *self)
 {
   DT_GUARD_GUI_UPDATE();
   _lib_modulegroups_update_iop_visibility(self);
+}
+
+// enter in the search box: a shape waiting since a drop on the "create"
+// zone goes to the first module on screen that can take it, and the focus
+// leaves the box as it does after a click on a header. the manager answers
+// FALSE when nothing waits or nothing on screen fits -- it says which --
+// and the box keeps the focus for the next try
+static void _text_entry_activate_callback(GtkEntry *entry, dt_lib_module_t *self)
+{
+  dt_develop_t *dev = darktable.develop;
+  if(dev->proxy.masks.module
+     && dev->proxy.masks.pending_shape_take
+     && dev->proxy.masks.pending_shape_take(dev->proxy.masks.module, NULL))
+    gtk_widget_grab_focus(dt_ui_center(darktable.gui->ui));
+}
+
+// ... and the focus leaving the box -- escape, a click on the photograph, on
+// another panel -- is the shape no longer waiting. a click on a module
+// header is not that: the header takes no focus, and its own handler asks
+// the manager first
+static gboolean _text_entry_focus_out_callback(GtkWidget *entry,
+                                               GdkEventFocus *event,
+                                               dt_lib_module_t *self)
+{
+  dt_develop_t *dev = darktable.develop;
+  if(dev->proxy.masks.module && dev->proxy.masks.pending_shape_cancel)
+    dev->proxy.masks.pending_shape_cancel(dev->proxy.masks.module);
+  return FALSE;
+}
+
+// the "create" zone: shown under the search box for the length of a shape
+// drag, it takes the shape and hands the question "which module?" to the
+// search box. the manager owns the drag, so both answers are its; the
+// zone only draws the frame and finishes the drop
+static gboolean _shape_drop_ok(void)
+{
+  dt_develop_t *dev = darktable.develop;
+  return dev->proxy.masks.module
+    && dev->proxy.masks.drop_shape_hover
+    && dev->proxy.masks.drop_shape_hover(dev->proxy.masks.module, NULL);
+}
+
+static gboolean _shape_drop_motion(GtkWidget *widget,
+                                   GdkDragContext *dc,
+                                   const gint x,
+                                   const gint y,
+                                   const guint time,
+                                   GtkWidget *label)
+{
+  const gboolean ok = _shape_drop_ok();
+  gdk_drag_status(dc, ok ? GDK_ACTION_LINK : 0, time);
+  if(ok)
+    dt_gui_add_class(label, "module_drop_shape");
+  else
+    dt_gui_remove_class(label, "module_drop_shape");
+  return TRUE;
+}
+
+static void _shape_drop_leave(GtkWidget *widget,
+                              GdkDragContext *dc,
+                              const guint time,
+                              GtkWidget *label)
+{
+  dt_gui_remove_class(label, "module_drop_shape");
+}
+
+static gboolean _shape_drop_drop(GtkWidget *widget,
+                                 GdkDragContext *dc,
+                                 const gint x,
+                                 const gint y,
+                                 const guint time,
+                                 GtkWidget *label)
+{
+  const gboolean ok = _shape_drop_ok();
+  dt_gui_remove_class(label, "module_drop_shape");
+  // finish first, act after, as the module headers do: what the finish
+  // tells the manager ends in its "drag-end", and that must find the
+  // shape already waiting
+  gtk_drag_finish(dc, ok, FALSE, time);
+  if(ok)
+    darktable.develop->proxy.masks.drop_shape(darktable.develop->proxy.masks.module,
+                                              NULL);
+  return TRUE;
 }
 
 static DTGTKCairoPaintIconFunc _buttons_get_icon_fct(const gchar *icon)
@@ -878,6 +969,17 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
         continue;
       }
 
+      // a shape of the mask manager is on its way: every module the drop
+      // could land on, whatever the group -- a deprecated one only if this
+      // edit already uses it, the rule the search below applies
+      if(d->shape_drag)
+      {
+        if(w)
+          gtk_widget_set_visible(w, module->enabled
+                                    || !(module->flags() & IOP_FLAGS_DEPRECATED));
+        continue;
+      }
+
       // if we have a module that should be forced shown
       if(d->force_show_module)
       {
@@ -975,8 +1077,11 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
 
   }
 
-  // we show eventual basic panel but only if no text in the search box
-  if(d->current == DT_MODULEGROUP_BASICS && !(text_entered && text_entered[0] != '\0')) _basics_show(self);
+  // we show eventual basic panel but only if no text in the search box,
+  // and no shape on its way: the drop wants headers
+  if(d->current == DT_MODULEGROUP_BASICS && !(text_entered && text_entered[0] != '\0')
+     && !d->shape_drag)
+    _basics_show(self);
 }
 
 static void _lib_modulegroups_toggle(GtkWidget *button, dt_lib_module_t *self)
@@ -1096,6 +1201,43 @@ static uint32_t _lib_modulegroups_get(dt_lib_module_t *self)
 {
   dt_lib_modulegroups_t *d = self->data;
   return d->current;
+}
+
+// the mask manager's shape drag, begun or over. the group itself is not
+// touched: with the flag down the next update lists the group again, and
+// the manager switches group afterwards if the module that took the shape
+// is not in it
+static void _lib_modulegroups_shape_drag(dt_lib_module_t *self,
+                                         const gboolean active)
+{
+  dt_lib_modulegroups_t *d = self->data;
+  if(d->shape_drag == active) return;
+  d->shape_drag = active;
+  gtk_widget_set_visible(d->shape_drop, active);
+  _lib_modulegroups_update_iop_visibility(self);
+}
+
+// a shape dropped on the "create" zone: the search box asks for the
+// module, and the list filters as the name is typed, the way it always
+// has. NULL is the question withdrawn or answered
+static void _lib_modulegroups_shape_pending(dt_lib_module_t *self,
+                                            const char *name)
+{
+  dt_lib_modulegroups_t *d = self->data;
+  if(!name)
+  {
+    gtk_entry_set_placeholder_text(GTK_ENTRY(d->text_entry),
+                                   _("search modules by name or tag"));
+    return;
+  }
+
+  gchar *hint = g_strdup_printf(_("type a module for '%s'..."), name);
+  gtk_entry_set_placeholder_text(GTK_ENTRY(d->text_entry), hint);
+  g_free(hint);
+  // the box may be hidden by the layout; the focus needs it on screen
+  gtk_widget_show(d->hbox_search_box);
+  gtk_entry_set_text(GTK_ENTRY(d->text_entry), "");
+  gtk_widget_grab_focus(d->text_entry);
 }
 
 static dt_lib_modulegroup_iop_visibility_type_t _preset_retrieve_old_search_pref(gchar **ret)
@@ -3038,6 +3180,10 @@ void gui_init(dt_lib_module_t *self)
   g_signal_connect_data(G_OBJECT(d->text_entry), "focus-in-event",
                         G_CALLBACK(gtk_widget_show),
                         d->hbox_search_box, NULL, G_CONNECT_AFTER | G_CONNECT_SWAPPED);
+  g_signal_connect(G_OBJECT(d->text_entry), "activate",
+                   G_CALLBACK(_text_entry_activate_callback), self);
+  g_signal_connect(G_OBJECT(d->text_entry), "focus-out-event",
+                   G_CALLBACK(_text_entry_focus_out_callback), self);
 
   GtkWidget *visibility_wrapper = gtk_event_box_new(); // extra layer prevents disabling shortcuts when hidden
   gtk_container_add(GTK_CONTAINER(visibility_wrapper), d->text_entry);
@@ -3049,6 +3195,26 @@ void gui_init(dt_lib_module_t *self)
 
   gtk_box_pack_start(GTK_BOX(self->widget), d->hbox_buttons, TRUE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(self->widget), d->hbox_search_box, TRUE, TRUE, 0);
+
+  // the "create" zone, under the search box. an event box takes the drop,
+  // the label wears the frame. no GTK_DEST_DEFAULT_*: the answer comes
+  // from the manager on every motion, as on the module headers
+  {
+    GtkWidget *label = gtk_label_new(_("create: drop here, then type the module"));
+    gtk_widget_set_name(label, "modulegroups-shape-drop");
+    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    d->shape_drop = gtk_event_box_new();
+    gtk_container_add(GTK_CONTAINER(d->shape_drop), label);
+    gtk_drag_dest_set(d->shape_drop, 0, target_list_mask_shape,
+                      n_targets_mask_shape, GDK_ACTION_LINK);
+    g_signal_connect(d->shape_drop, "drag-motion",
+                     G_CALLBACK(_shape_drop_motion), label);
+    g_signal_connect(d->shape_drop, "drag-leave",
+                     G_CALLBACK(_shape_drop_leave), label);
+    g_signal_connect(d->shape_drop, "drag-drop",
+                     G_CALLBACK(_shape_drop_drop), label);
+    gtk_box_pack_start(GTK_BOX(self->widget), d->shape_drop, TRUE, TRUE, 0);
+  }
 
   // deprecated message
   d->deprecated
@@ -3066,6 +3232,9 @@ void gui_init(dt_lib_module_t *self)
   gtk_widget_set_no_show_all(d->deprecated, TRUE);
   gtk_widget_set_no_show_all(d->hbox_buttons, TRUE);
   gtk_widget_set_no_show_all(d->hbox_search_box, TRUE);
+  // the zone shows for the length of a shape drag and at no other time
+  gtk_widget_hide(d->shape_drop);
+  gtk_widget_set_no_show_all(d->shape_drop, TRUE);
 
   /*
    * set the proxy functions
@@ -3079,6 +3248,8 @@ void gui_init(dt_lib_module_t *self)
   darktable.develop->proxy.modulegroups.switch_group = _lib_modulegroups_switch_group;
   darktable.develop->proxy.modulegroups.test_visible = _lib_modulegroups_test_visible;
   darktable.develop->proxy.modulegroups.basics_module_toggle = _lib_modulegroups_basics_module_toggle;
+  darktable.develop->proxy.modulegroups.shape_drag = _lib_modulegroups_shape_drag;
+  darktable.develop->proxy.modulegroups.shape_pending = _lib_modulegroups_shape_pending;
 
   // check for autoapplypresets on image change
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_IMAGE_CHANGED, _dt_dev_image_changed_callback);
@@ -3093,6 +3264,8 @@ void gui_cleanup(dt_lib_module_t *self)
   darktable.develop->proxy.modulegroups.get_activated = NULL;
   darktable.develop->proxy.modulegroups.test = NULL;
   darktable.develop->proxy.modulegroups.switch_group = NULL;
+  darktable.develop->proxy.modulegroups.shape_drag = NULL;
+  darktable.develop->proxy.modulegroups.shape_pending = NULL;
 
   g_free(self->data);
   self->data = NULL;

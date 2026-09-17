@@ -2009,6 +2009,31 @@ treeview.view:drop(active).into
    border-top: 2.4em solid @plugin_bg_color;
 }
 
+/* a shape of the mask manager over a module header: the header framed,
+   the shape lands inside it -- the same frame, in the same accent, as the
+   masks list draws on the row a library drag is about to fill. a shadow
+   and not a border: the header already carries one edge, and a border
+   appearing on the other three would shift it under the pointer */
+#iop-expander.module_drop_shape #module-header
+{
+  box-shadow: inset 0 0 0 1px @masks_row_on_fg;
+}
+
+/* ... and the "create" zone the module groups show under their search box
+   for the length of that drag: dashed while the shape is elsewhere, solid
+   while it hovers, so that the two targets read as the same offer */
+#modulegroups-shape-drop
+{
+  border: 1px dashed @masks_row_on_fg;
+  padding: 0.5em;
+  margin: 0.3em 0.5em;
+}
+
+#modulegroups-shape-drop.module_drop_shape
+{
+  border-style: solid;
+}
+
 
 /*** --- Thumbtable css part ---
 

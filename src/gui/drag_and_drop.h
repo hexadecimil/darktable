@@ -56,6 +56,15 @@ static const GtkTargetEntry target_list_tags_dest[]
         { "tags-dnd", GTK_TARGET_SAME_WIDGET, DND_TARGET_TAG } };
 static const guint n_targets_tags_dest = G_N_ELEMENTS(target_list_tags_dest);
 
+/* drag & drop for a shape of the mask manager: the manager's two lists are
+   the source, and the masks list, the module headers and the "create" zone
+   of the module groups take it. the payload never travels through it --
+   both ends read the manager -- but the name is what keeps an image or a
+   tag from being droppable on any of them */
+static const GtkTargetEntry target_list_mask_shape[]
+    = { { "masks-shape-dnd", GTK_TARGET_SAME_APP, DND_TARGET_MASK_SHAPE } };
+static const guint n_targets_mask_shape = G_N_ELEMENTS(target_list_mask_shape);
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
