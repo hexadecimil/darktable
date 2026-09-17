@@ -5240,6 +5240,20 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
     {
       gtk_tree_selection_unselect_all(selection);
     }
+    // a plain click on the one selected row: the shape leaves the
+    // photograph. this is the click the row's own selection put it there
+    // with, read the other way round -- the way out of a shape shown from
+    // the library, which no module's edit toggle covers. the gesture is
+    // claimed, or the treeview's own would select the row again on release;
+    // a double click (rename) is not this, n_press says so
+    else if(hit == DT_MASKS_OP_HIT_NONE && n_press == 1
+            && dt_modifier_is(mods, 0)
+            && gtk_tree_selection_count_selected_rows(selection) == 1
+            && gtk_tree_selection_path_is_selected(selection, mouse_path))
+    {
+      gtk_tree_selection_unselect_all(selection);
+      dt_gui_claim(gesture);
+    }
   }
   else if(button == GDK_BUTTON_SECONDARY)
   {

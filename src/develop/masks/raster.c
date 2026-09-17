@@ -25,6 +25,7 @@
 #include "develop/masks.h"
 #include "develop/masks/object_recipe.h"
 #include "gui/draw.h"
+#include "views/view.h"
 
 // the raster shape: a persistent mask form whose content is not a geometry
 // but a reference to a raster mask file (see dt_masks_point_raster_t in
@@ -1467,6 +1468,20 @@ static int _raster_events_mouse_scrolled(dt_iop_module_t *module,
   return 0;
 }
 
+// GUI idle: the shape shown from the library leaves the photograph and
+// its row -- see _raster_events_button_pressed
+static gboolean _raster_put_away_idle(gpointer data)
+{
+  (void)data;
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->form_visible || dt_view_get_current() != DT_VIEW_DARKROOM)
+    return G_SOURCE_REMOVE;
+  dt_masks_change_form_gui(NULL);
+  dt_dev_masks_selection_change(dev, NULL, NO_MASKID);
+  dt_control_queue_redraw_center();
+  return G_SOURCE_REMOVE;
+}
+
 static int _raster_events_button_pressed(dt_iop_module_t *module,
                                          float pzx,
                                          float pzy,
@@ -1479,6 +1494,19 @@ static int _raster_events_button_pressed(dt_iop_module_t *module,
                                          dt_masks_form_gui_t *gui,
                                          const int index)
 {
+  // shown from the library -- the form itself is what is visible, not a
+  // module's group -- a raster shape has nothing to drag: a plain click on
+  // the photograph puts it away, the click the row put it up with read the
+  // other way round. a group member keeps its module's session untouched
+  if(which == 1 && type == GDK_BUTTON_PRESS && !gui->creation
+     && darktable.develop->form_visible == form)
+  {
+    // the dispatcher holds the history mutex around this call and the
+    // panel's deselection rebuilds through it: from an idle, on the GUI
+    // thread, once the click has returned
+    g_idle_add(_raster_put_away_idle, NULL);
+    return 1;
+  }
   return 0;
 }
 
@@ -1537,7 +1565,7 @@ static void _raster_events_post_expose(cairo_t *cr,
   {
     cairo_save(cr);
     cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
-    dt_draw_set_color_overlay(cr, TRUE, selected ? 0.35 : 0.25);
+    dt_draw_set_color_overlay(cr, TRUE, selected ? 0.24 : 0.16);
     cairo_fill_preserve(cr);
     cairo_restore(cr);
     dt_masks_line_stroke(cr, FALSE, FALSE, selected, zoom_scale);
