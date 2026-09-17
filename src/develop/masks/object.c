@@ -5653,6 +5653,32 @@ static void _detect_download_progress(const char *model_id,
 // derive the content-addressed target of a complete recipe under the
 // local mask root, exactly as the replay does from ITS loaded dev.
 // NULL when the folder cannot be created (reported by a toast)
+// below this share of the frame a one-shot answer counts as empty: the
+// bench-selected detector saying "no subject" on a frame the lighter
+// one still reads (see _detect_job_run)
+#define DETECT_EMPTY_FRAC 0.002
+
+// another installed model of the detector's task, to try when the
+// active one answers nothing. the environment lists what is installed;
+// the first id that is not the active one is the fallback -- with two
+// models of the task installed, that is the other one
+static const char *_detector_fallback_model(dt_ai_environment_t *env,
+                                            const dt_detector_t *detector,
+                                            const char *active_id)
+{
+  if(!env || !detector || !active_id) return NULL;
+  const int n = dt_ai_get_model_count(env);
+  for(int i = 0; i < n; i++)
+  {
+    const dt_ai_model_info_t *info = dt_ai_get_model_info_by_index(env, i);
+    if(!info || !info->id || !info->task_type) continue;
+    if(g_strcmp0(info->task_type, detector->task) != 0) continue;
+    if(g_strcmp0(info->id, active_id) == 0) continue;
+    return info->id;
+  }
+  return NULL;
+}
+
 static gchar *_detect_outpath(const dt_develop_t *dev,
                               const dt_rf_recipe_t *recipe)
 {
@@ -5915,11 +5941,72 @@ static int32_t _detect_job_run(dt_job_t *job)
     goto cleanup;
   }
 
+  // the salient-subject detector selected on the bench is the stricter
+  // one: on a frame with no clear subject -- a lake, a railing, a pole --
+  // it answers next to nothing where the lighter model of the same task
+  // still picks the most object-like thing, which is what a photographer
+  // reaching for "select subject" expects to get. so a near-empty answer
+  // falls back to the other installed detector of the task, and the
+  // recipe records the model that actually answered: the replay loads by
+  // id, the file name follows the recipe, nothing else changes
+  if(!via_points)
+  {
+    const float thresh = CLAMP(recipe.threshold, 0.3f, 0.9f);
+    const size_t npix = (size_t)out_w * out_h;
+    size_t lit = 0;
+    for(size_t k = 0; k < npix; k++) lit += hint[k] >= thresh;
+    const double frac = (double)lit / (double)npix;
+    if(frac < DETECT_EMPTY_FRAC)
+    {
+      const char *fallback = _detector_fallback_model(env, j->detector,
+                                                      j->model_id);
+      if(fallback)
+      {
+        dt_print(DT_DEBUG_AI,
+                 "[object mask] detect: %s lit %.2f%% of the frame,"
+                 " trying %s",
+                 j->model_id, 100.0 * frac, fallback);
+        // the first detector has answered: off the card before the
+        // second one loads, or the two would not fit together
+        dt_detect_free(det);
+        det = NULL;
+        dt_detect_context_t *alt = dt_detect_load(env, fallback,
+                                                  j->detector->task);
+        float *alt_hint = alt
+          ? g_try_malloc(npix * sizeof(float)) : NULL;
+        if(alt_hint && dt_detect_run(alt, rgb, out_w, out_h, alt_hint))
+        {
+          size_t alt_lit = 0;
+          for(size_t k = 0; k < npix; k++) alt_lit += alt_hint[k] >= thresh;
+          if(alt_lit > lit)
+          {
+            g_free(hint);
+            hint = alt_hint;
+            alt_hint = NULL;
+            g_strlcpy(recipe.seg_model, fallback, sizeof(recipe.seg_model));
+            const char *v = dt_ai_model_get_version(fallback);
+            g_strlcpy(recipe.seg_model_version, v ? v : "",
+                      sizeof(recipe.seg_model_version));
+            recipe.detect_input = dt_detect_get_side(alt);
+            g_free(outpath);
+            outpath = _detect_outpath(&dev, &recipe);
+            if(!outpath) goto cleanup;
+            dt_print(DT_DEBUG_AI,
+                     "[object mask] detect: %s lit %.2f%%, answering with it",
+                     fallback, 100.0 * (double)alt_lit / (double)npix);
+          }
+        }
+        g_free(alt_hint);
+        if(alt) dt_detect_free(alt);
+      }
+    }
+  }
+
   // the detector is done; release it before the heavy native pass, which
   // loads its own refinement context (the replay's VRAM rule) -- and,
   // for a via_points row, before the segmentation model takes its place
   // on the card. the environment stays for that model
-  dt_detect_free(det);
+  if(det) dt_detect_free(det);
   det = NULL;
   if(!via_points)
   {
