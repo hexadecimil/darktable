@@ -1388,14 +1388,15 @@ static void _raster_modify_property(dt_masks_form_t *const form,
 static void _raster_set_form_name(dt_masks_form_t *const form,
                                   const size_t nb)
 {
-  // a detection-made shape takes its detector's label ("subject", later
-  // "sky"), resolved from the shape's own recipe through the detectors
-  // table -- the single authority on that mapping; the clicked gesture
-  // keeps its historical name. the caller's nb counts EVERY raster shape
-  // (and retries it upward until the name is unique), so subtract the
-  // shapes under other names to keep the label's own numbering dense:
-  // "subject", then "subject 2" -- still strictly increasing in nb, so
-  // the caller's uniqueness loop terminates as before
+  // a detection-made shape takes its detector's label ("subject",
+  // "background", later "sky"), resolved from the shape's own recipe
+  // through the detectors table -- the single authority on that mapping;
+  // the clicked gesture's shapes are "object". the caller's nb counts
+  // EVERY raster shape (and retries it upward until the name is unique),
+  // so subtract the shapes under other labels to keep each label's own
+  // numbering dense: "subject", then "subject 2", "object", "object 2"
+  // -- still strictly increasing in nb, so the caller's uniqueness loop
+  // terminates as before
   const dt_masks_point_raster_t *pt = dt_masks_raster_point(form);
   const dt_detector_t *detector =
     (pt && dt_rf_recipe_valid(&pt->recipe)
@@ -1403,28 +1404,22 @@ static void _raster_set_form_name(dt_masks_form_t *const form,
     ? dt_detector_find_side(pt->recipe.prompt_kind, pt->recipe.class_bits,
                             (pt->flags & DT_MASKS_RASTER_FLAG_INVERT) != 0)
     : NULL;
-  if(detector)
-  {
-    const char *label = _(detector->label);
-    size_t other = 0;
-    if(darktable.develop)
-      for(GList *l = darktable.develop->forms; l; l = g_list_next(l))
-      {
-        const dt_masks_form_t *f = l->data;
-        if(f != form && f->type == form->type
-           && strncmp(f->name, label, strlen(label)) != 0)
-          other++;
-      }
-    const size_t label_nb = nb > other ? nb - other : 1;
-    if(label_nb <= 1)
-      g_strlcpy(form->name, label, sizeof(form->name));
-    else
-      snprintf(form->name, sizeof(form->name), "%s %d", label,
-               (int)label_nb);
-  }
+  const char *label = detector ? _(detector->label) : _("object");
+  size_t other = 0;
+  if(darktable.develop)
+    for(GList *l = darktable.develop->forms; l; l = g_list_next(l))
+    {
+      const dt_masks_form_t *f = l->data;
+      if(f != form && f->type == form->type
+         && strncmp(f->name, label, strlen(label)) != 0)
+        other++;
+    }
+  const size_t label_nb = nb > other ? nb - other : 1;
+  if(label_nb <= 1)
+    g_strlcpy(form->name, label, sizeof(form->name));
   else
-    snprintf(form->name, sizeof(form->name), _("object %d"),
-             (int)nb);
+    snprintf(form->name, sizeof(form->name), "%s %d", label,
+             (int)label_nb);
 }
 
 static void _raster_duplicate_points(dt_develop_t *const dev,

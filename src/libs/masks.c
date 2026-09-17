@@ -1751,7 +1751,10 @@ static void _target_row_update(dt_lib_masks_t *d)
     // same arrow, so the line reads the same way whichever answer it gives.
     // the tooltip says both what will happen and the two ways to a module,
     // since this is the state a fresh image opens in
-    gtk_label_set_text(GTK_LABEL(d->target_label), _("→ shape library"));
+    // the arrow carries no msgid, as the module line above it
+    gchar *text = g_strdup_printf("→ %s", _("shape library"));
+    gtk_label_set_text(GTK_LABEL(d->target_label), text);
+    g_free(text);
     gtk_widget_set_tooltip_text
       (d->target_label,
        _("the next shape goes to the shape library, linked to no module\n"
@@ -2611,7 +2614,7 @@ static void _new_mask_target_header(GtkMenuShell *menu,
     g_free(name);
   }
   else
-    header = g_strdup(_("→ shape library"));
+    header = g_strdup_printf("→ %s", _("shape library"));
 
   GtkWidget *item = gtk_menu_item_new_with_label(header);
   g_free(header);
