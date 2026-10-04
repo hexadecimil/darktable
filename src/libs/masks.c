@@ -4603,6 +4603,17 @@ static void _tree_context_menu(dt_lib_module_t *self,
 
   gtk_widget_show_all(GTK_WIDGET(menu));
 
+  // the menu goes away with its closing, as dt_gui_menu_popup() makes every
+  // other menu of this panel do: the floating reference taken now, dropped
+  // on "deactivate" -- the activated item's handler has run by then, GTK
+  // holds the shell and the item for its length. never destroyed, a closed
+  // menu kept its hidden popup window among the toplevels, and under
+  // Wayland GTK could still report that window active: the next dialog
+  // parented on "the active window" (dt_gui_show_yes_no_dialog) walked a
+  // transient-for chain into a window destroyed since, and crashed
+  g_object_ref_sink(menu);
+  g_signal_connect(G_OBJECT(menu), "deactivate", G_CALLBACK(g_object_unref), NULL);
+
   GdkEvent *event = gtk_get_current_event();
 
   // a key press carries no pointer. gtk_menu_popup_at_pointer() would then

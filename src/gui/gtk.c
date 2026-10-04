@@ -3568,14 +3568,26 @@ gboolean dt_gui_show_yes_no_dialog(const char *title,
   gchar *question = g_strdup_vprintf(format, ap);
   va_end(ap);
 
+  // the parent is the window the question is asked from: the active one,
+  // among the windows a dialog can stand over -- shown, and of the normal
+  // kind. a popup window (a menu's, a combobox's) is never a parent: a
+  // closed menu keeps its hidden popup window, which GTK under Wayland can
+  // still report active, and the transient-for chain GTK then walks from
+  // it can lead into a window destroyed since. the main window when no
+  // other fits
   GtkWindow *win = NULL;
   for(GList *wins = gtk_window_list_toplevels();
       wins;
       wins = g_list_delete_link(wins, wins))
   {
-    if(gtk_window_is_active(wins->data))
-      win = wins->data;
+    GtkWindow *w = wins->data;
+    if(gtk_window_is_active(w)
+       && gtk_widget_get_visible(GTK_WIDGET(w))
+       && gtk_window_get_window_type(w) == GTK_WINDOW_TOPLEVEL)
+      win = w;
   }
+  if(!win && darktable.gui && darktable.gui->ui)
+    win = GTK_WINDOW(dt_ui_main_window(darktable.gui->ui));
 
   GtkWidget *dialog = gtk_message_dialog_new(win,
                                              GTK_DIALOG_DESTROY_WITH_PARENT,
