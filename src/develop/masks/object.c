@@ -4012,37 +4012,49 @@ static gboolean _launch_native_finalize(_object_data_t *d,
 // shared by the clicked replay (which encodes the render) and the
 // promptless replay (which runs the detector on it directly). NULL on
 // failure, reported inside
-static uint8_t *_replay_render_rgb8(dt_develop_t *dev,
-                                    dt_dev_pixelpipe_t *pipe,
-                                    const dt_rf_recipe_t *recipe,
-                                    const int enc_w,
-                                    const int enc_h)
+// the scale the encoding render of `enc_w` x `enc_h` takes from the
+// processed frame of `pipe`: the encode-thread formula under the recorded
+// cap when it lands on those dims, else the plain dim ratio. 0 when the
+// frame cannot reach them at all -- another aspect, the photograph turned
+// or cropped otherwise -- the ratio truncates, so the accepted one-pixel
+// slack is allowed and no more
+static double _replay_scale(const dt_dev_pixelpipe_t *pipe,
+                            const dt_rf_recipe_t *recipe,
+                            const int enc_w,
+                            const int enc_h)
 {
   const int render_cap = MAX(recipe->render_size, 1024);
   const double e_scale
     = fmin((double)render_cap / (double)pipe->processed_width,
            (double)render_cap / (double)pipe->processed_height);
   double final_scale = fmin(e_scale, 1.0);
-  if((int)(final_scale * pipe->processed_width) != enc_w
-     || (int)(final_scale * pipe->processed_height) != enc_h)
+  if((int)(final_scale * pipe->processed_width) == enc_w
+     && (int)(final_scale * pipe->processed_height) == enc_h)
+    return final_scale;
+
+  final_scale = fmin((double)enc_w / (double)pipe->processed_width,
+                     (double)enc_h / (double)pipe->processed_height);
+  if((int)(final_scale * pipe->processed_width) + 1 < enc_w
+     || (int)(final_scale * pipe->processed_height) + 1 < enc_h)
+    return 0.0;
+  return final_scale;
+}
+
+static uint8_t *_replay_render_rgb8(dt_develop_t *dev,
+                                    dt_dev_pixelpipe_t *pipe,
+                                    const dt_rf_recipe_t *recipe,
+                                    const int enc_w,
+                                    const int enc_h)
+{
+  // reject a recipe whose dims the render cannot reach -- the prompts
+  // would land on the wrong grid anyway
+  const double final_scale = _replay_scale(pipe, recipe, enc_w, enc_h);
+  if(final_scale <= 0.0)
   {
-    final_scale = fmin((double)enc_w / (double)pipe->processed_width,
-                       (double)enc_h / (double)pipe->processed_height);
-    // bound the requested ROI to the scaled extent of the processed
-    // frame: the ratio truncates, so allow the accepted one-pixel slack,
-    // but reject a recipe whose dims the render cannot reach -- the
-    // prompts would land on the wrong grid anyway
-    if((int)(final_scale * pipe->processed_width) + 1 < enc_w
-       || (int)(final_scale * pipe->processed_height) + 1 < enc_h)
-    {
-      dt_print(DT_DEBUG_AI,
-               "[object mask] replay: recorded dims %dx%d not reachable"
-               " from the processed frame, rejecting", enc_w, enc_h);
-      return NULL;
-    }
     dt_print(DT_DEBUG_AI,
-             "[object mask] replay: recorded dims %dx%d do not match the "
-             "recorded render cap, using the dim ratio", enc_w, enc_h);
+             "[object mask] replay: recorded dims %dx%d not reachable"
+             " from the processed frame, rejecting", enc_w, enc_h);
+    return NULL;
   }
 
   dt_print(DT_DEBUG_AI,
@@ -4341,8 +4353,8 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
     od.seg = seg;
   }
 
-  const int enc_w = recipe->encode_w;
-  const int enc_h = recipe->encode_h;
+  int enc_w = recipe->encode_w;
+  int enc_h = recipe->encode_h;
   if(enc_w <= 0 || enc_h <= 0)
   {
     dt_print(DT_DEBUG_AI, "[object mask] replay: invalid encode dimensions");
@@ -4380,6 +4392,33 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
   {
     dt_print(DT_DEBUG_AI, "[object mask] replay: empty processed dimensions");
     goto cleanup;
+  }
+
+  // a promptless recipe carries no geometry: the detector reads whatever
+  // frame it is handed, and the recorded dims only make the replay on the
+  // photograph it was made on render exactly what that detection saw. a
+  // frame they do not fit -- the photograph turned or cropped otherwise
+  // since, or another photograph the edit was pasted onto -- is detected
+  // at the dims the detection itself would pick for it, under the
+  // recorded cap: a subject is the subject of the frame at hand. the file
+  // name carries the photograph's own identity, so this never writes
+  // under the name of the original's file
+  if(promptless && _replay_scale(&pipe, recipe, enc_w, enc_h) <= 0.0)
+  {
+    const int render_cap = MAX(recipe->render_size, 1024);
+    const double fs
+      = fmin(fmin((double)render_cap / (double)pipe.processed_width,
+                  (double)render_cap / (double)pipe.processed_height), 1.0);
+    const int w = (int)(fs * pipe.processed_width);
+    const int h = (int)(fs * pipe.processed_height);
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: recorded dims %dx%d do not fit this"
+             " frame (%dx%d), detecting at %dx%d",
+             enc_w, enc_h, pipe.processed_width, pipe.processed_height, w, h);
+    enc_w = w;
+    enc_h = h;
+    if(enc_w < 8 || enc_h < 8)
+      goto cleanup;
   }
 
   // the recipe travels in the XMP and is untrusted input: the encode
