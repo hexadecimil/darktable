@@ -274,6 +274,15 @@ typedef struct dt_lib_masks_t
   dt_mask_id_t reclick_formid;
   dt_mask_id_t reclick_groupid;
   guint reclick_idle;
+  // a double click renames -- on its release, not its second press: the
+  // second press of a click followed at once by a grab is a double click
+  // to gtk, and the grab has to stay a drag. "row-activated" files the row
+  // here, the release starts the editor, a drag leaving the press drops
+  // it. the path as a string with the model it is a path of: a store
+  // swapped meanwhile makes it nothing
+  GtkWidget *rename_view;
+  GtkTreeModel *rename_model;
+  gchar *rename_path;
   struct dt_iop_module_t *drop_module;
   // a shape dropped on the "create" zone of libs/modulegroups.c, waiting
   // for a module to be typed in the search box or clicked in the list.
@@ -5514,6 +5523,15 @@ static dt_masks_op_hit_t _op_cell_at_bin(dt_lib_masks_t *lm,
 // module is off: nothing there acts.
 // three zones now, one cursor: the operator glyph, the power switch and the
 // show-mask cell. they are the only cells in either list a click acts on
+// a filed double-click rename, forgotten -- see rename_view
+static void _tree_rename_drop(dt_lib_masks_t *lm)
+{
+  g_free(lm->rename_path);
+  lm->rename_path = NULL;
+  lm->rename_view = NULL;
+  lm->rename_model = NULL;
+}
+
 static void _tree_motion_cb(GtkEventControllerMotion *controller,
                             double x,
                             double y,
@@ -5541,6 +5559,10 @@ static void _tree_motion_cb(GtkEventControllerMotion *controller,
     else if(gtk_drag_check_threshold(view, lm->drag_x, lm->drag_y,
                                      (gint)x, (gint)y))
     {
+      // the press was the second of a double click: it is a drag now, and
+      // the rename it filed is called off -- before gtk_drag_begin, whose
+      // grab cancels the click gesture, which reports a release
+      _tree_rename_drop(lm);
       GtkTargetList *targets = gtk_target_list_new(target_list_mask_shape,
                                                    n_targets_mask_shape);
       GdkEvent *event = gtk_get_current_event();
@@ -5692,7 +5714,10 @@ static void _tree_button_pressed_cb(GtkGestureSingle *gesture,
   if(dview >= 0)
     g_object_get(lm->name_cell[dview], "editable", &editing, NULL);
 
-  if(button == GDK_BUTTON_PRIMARY && n_press == 1 && mouse_path && !editing
+  // any press count: a click followed at once by a grab is a double click
+  // to gtk, and it is still a grab. the rename a double click asks for waits
+  // for the release, and the drag, if one leaves this press, calls it off
+  if(button == GDK_BUTTON_PRIMARY && mouse_path && !editing
      && dview >= 0 && mouse_col == lm->name_col[dview]
      && dt_modifier_is(dt_gui_current_state(gesture), 0)
      && gtk_tree_path_get_depth(mouse_path) >= (dview == 1 ? 1 : 2))
@@ -5958,7 +5983,35 @@ static void _tree_row_activated_cb(GtkTreeView *view,
 
   // the same pinning every other entry point does before acting on a list
   lm->active_view = widget;
-  _tree_start_rename(self, widget, path);
+  // on the release of this press, unless a drag leaves it: see rename_view
+  _tree_rename_drop(lm);
+  lm->rename_view = widget;
+  lm->rename_model = gtk_tree_view_get_model(view);
+  lm->rename_path = gtk_tree_path_to_string(path);
+}
+
+// the release of a press on either list: a double click's rename, filed by
+// _tree_row_activated_cb, starts now -- if it is still the row it was, in
+// the store it was in
+static void _tree_button_released_cb(GtkGestureSingle *gesture,
+                                     int n_press,
+                                     double x,
+                                     double y,
+                                     dt_lib_module_t *self)
+{
+  dt_lib_masks_t *lm = self->data;
+  GtkWidget *view = dt_gui_get_widget(gesture);
+  if(!lm->rename_path || lm->rename_view != view)
+    return;
+  GtkTreePath *path = NULL;
+  if(lm->rename_model == gtk_tree_view_get_model(GTK_TREE_VIEW(view)))
+    path = gtk_tree_path_new_from_string(lm->rename_path);
+  _tree_rename_drop(lm);
+  if(path)
+  {
+    _tree_start_rename(self, view, path);
+    gtk_tree_path_free(path);
+  }
 }
 
 static gboolean _tree_restrict_select(GtkTreeSelection *selection,
@@ -7548,7 +7601,8 @@ static void _build_masks_view(dt_lib_module_t *self,
   // never match there, the handler returns at once -- but the drag of one of
   // its rows starts from this very handler
   dt_gui_connect_motion(view, _tree_motion_cb, NULL, _tree_leave_cb, self);
-  dt_gui_connect_click_all(view, _tree_button_pressed_cb, NULL, self);
+  dt_gui_connect_click_all(view, _tree_button_pressed_cb,
+                           _tree_button_released_cb, self);
   // the double click, on both lists. it is emitted by the tree view's own
   // gesture, which our handler above never claims -- see the note there
   g_signal_connect(view, "row-activated",
@@ -8123,6 +8177,7 @@ void gui_cleanup(dt_lib_module_t *self)
     g_source_remove(d->flash_timer);
   if(d && d->reclick_idle)
     g_source_remove(d->reclick_idle);
+  if(d) g_free(d->rename_path);
   // the armament outlives the form on purpose; it must not outlive the panel
   // that is the only way to see it and the only way to put it down
   dt_masks_set_next_operator(DT_MASKS_STATE_NONE, NULL);
