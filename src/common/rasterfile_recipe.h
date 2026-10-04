@@ -141,7 +141,13 @@ typedef struct dt_rf_recipe_t
   // prompt count: 1..DT_RF_RECIPE_MAX_POINTS when prompt_kind replays
   // points (POINTS, SKY), exactly 0 for the promptless kinds
   int32_t n_points;
-  int32_t _pad0;         // explicit, keep zeroed
+  // the photograph a detector's prompts were chosen on, as
+  // dt_object_recipe_source_id() names it -- 0 when not recorded (every
+  // clicked recipe, every recipe written before the field had a use; the
+  // slot was explicit zeroed padding, so the layout and those blobs are
+  // unchanged). a replay on another photograph chooses the prompts afresh
+  // on that frame: the recorded ones point at the original's content
+  uint32_t source_id;
   dt_rf_recipe_point_t points[DT_RF_RECIPE_MAX_POINTS];
   // ---- extension block: carved out of the 64 bytes version 1 reserved
   // as zero-filled headroom, so the struct size, the layout of every

@@ -746,6 +746,25 @@ static uint8_t *_backbuf_to_rgb8(const dt_dev_pixelpipe_t *pipe,
 // on a failed reload *seg is NULL on return. shared by the interactive
 // encode thread and the headless recipe replay -- keep both callers'
 // behaviour identical when touching this
+// the identity of a photograph for a detector's recipe: its file name,
+// its sensor dimensions and the time it was taken -- the tuple the mask
+// file name already carries, so a virtual copy is the same photograph and
+// another card's DSC00001 is not. FNV-1a, never 0 (0 is "not recorded")
+static uint32_t _source_id(const dt_image_t *img)
+{
+  gchar *key = g_strdup_printf("%s|%d|%d|%" G_GINT64_FORMAT,
+                               img->filename, img->width, img->height,
+                               (gint64)img->exif_datetime_taken);
+  uint32_t h = 2166136261u;
+  for(const unsigned char *c = (const unsigned char *)key; *c; c++)
+  {
+    h ^= *c;
+    h *= 16777619u;
+  }
+  g_free(key);
+  return h ? h : 1u;
+}
+
 static gboolean _seg_encode_cpu_fallback(dt_seg_context_t **seg,
                                          dt_ai_environment_t *env,
                                          const char *model_id,
@@ -2285,6 +2304,8 @@ static gboolean _capture_recipe(_object_data_t *d,
     recipe->version = DT_RF_RECIPE_VERSION_EXT;
     recipe->prompt_kind = d->edit_detector->prompt_kind;
     recipe->class_bits = d->edit_detector->class_bits;
+    // its points, the detector's and the clicks, belong to this photograph
+    recipe->source_id = _source_id(&darktable.develop->image_storage);
   }
   // the matting stage LAST, over an otherwise finished version-1 blob: it
   // is the only field group whose presence moves the recipe to version
@@ -4083,6 +4104,17 @@ static uint8_t *_replay_render_rgb8(dt_develop_t *dev,
   return rgb;
 }
 
+static float *_replay_rederive(dt_ai_environment_t *env,
+                               _object_data_t *od,
+                               dt_seg_context_t **seg,
+                               const dt_detector_t *detector,
+                               const char *seg_model,
+                               const uint8_t *rgb,
+                               const int w,
+                               const int h,
+                               const dt_imgid_t imgid,
+                               const dt_hash_t distort_hash);
+
 static dt_object_recipe_status_t
 _recipe_compute_locked(const dt_rf_recipe_t *recipe,
                        const dt_imgid_t imgid,
@@ -4394,16 +4426,29 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
     goto cleanup;
   }
 
-  // a promptless recipe carries no geometry: the detector reads whatever
-  // frame it is handed, and the recorded dims only make the replay on the
-  // photograph it was made on render exactly what that detection saw. a
-  // frame they do not fit -- the photograph turned or cropped otherwise
-  // since, or another photograph the edit was pasted onto -- is detected
-  // at the dims the detection itself would pick for it, under the
-  // recorded cap: a subject is the subject of the frame at hand. the file
-  // name carries the photograph's own identity, so this never writes
-  // under the name of the original's file
-  if(promptless && _replay_scale(&pipe, recipe, enc_w, enc_h) <= 0.0)
+  // the recorded dims only make the replay on the photograph and the
+  // frame the recipe was made on render exactly what that session saw.
+  // three cases leave them behind:
+  //  - a promptless recipe carries no geometry: the detector reads
+  //    whatever frame it is handed, a subject is the subject of the frame
+  //    at hand;
+  //  - a detector's prompts (sky, water, ...) chosen on ANOTHER photograph
+  //    -- an edit pasted -- point at that photograph's content: they are
+  //    chosen afresh on this frame (rederive), as the detection job does.
+  //    a recipe that does not name its photograph (written before it
+  //    could) is taken for another's when its dims do not fit;
+  //  - recorded prompts on THIS photograph, a frame turned or cropped
+  //    since: the points live in input space and map through the current
+  //    distortions, so they replay -- clicks kept -- on the grid this
+  //    frame gives under the recorded cap.
+  // the file name carries the photograph's own identity, so none of this
+  // writes under the name of the original's file
+  const gboolean fits = _replay_scale(&pipe, recipe, enc_w, enc_h) > 0.0;
+  const gboolean foreign = recipe->source_id != 0
+    && recipe->source_id != _source_id(&dev.image_storage);
+  const gboolean rederive = !promptless && detector
+    && (foreign || (recipe->source_id == 0 && !fits));
+  if(!fits || rederive)
   {
     const int render_cap = MAX(recipe->render_size, 1024);
     const double fs
@@ -4412,9 +4457,14 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
     const int w = (int)(fs * pipe.processed_width);
     const int h = (int)(fs * pipe.processed_height);
     dt_print(DT_DEBUG_AI,
-             "[object mask] replay: recorded dims %dx%d do not fit this"
-             " frame (%dx%d), detecting at %dx%d",
-             enc_w, enc_h, pipe.processed_width, pipe.processed_height, w, h);
+             "[object mask] replay: recorded dims %dx%d, frame %dx%d%s:"
+             " %s at %dx%d",
+             enc_w, enc_h, pipe.processed_width, pipe.processed_height,
+             foreign ? " of another photograph" : "",
+             promptless ? "detecting"
+                        : rederive ? "choosing the prompts afresh"
+                                   : "replaying the points",
+             w, h);
     enc_w = w;
     enc_h = h;
     if(enc_w < 8 || enc_h < 8)
@@ -4441,8 +4491,9 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
   // (which uses no pixel-centre offset either). the normalised coordinates
   // are scale-invariant, so the preview pipe of the capture and this export
   // pipe agree by the same convention every stored mask form relies on.
-  // a promptless recipe has no points to map
-  if(!promptless)
+  // a promptless recipe has no points to map, a rederived one maps none
+  // of the recorded ones
+  if(!promptless && !rederive)
   {
     const int n = recipe->n_points;
     enc_pts = g_new(float, (size_t)n * 2);
@@ -4485,6 +4536,20 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
     }
     g_free(rgb);
     rgb = NULL;
+  }
+  else if(rederive)
+  {
+    rgb = _replay_render_rgb8(&dev, &pipe, recipe, enc_w, enc_h);
+    if(!rgb)
+      goto cleanup;
+    hint = _replay_rederive(env, &od, &seg, detector, recipe->seg_model,
+                            rgb, enc_w, enc_h, imgid, cur_hash);
+    g_free(rgb);
+    rgb = NULL;
+    if(!hint)
+      goto cleanup;
+    hint_w = enc_w;
+    hint_h = enc_h;
   }
   else
   {
@@ -4558,7 +4623,7 @@ _recipe_compute_locked(const dt_rf_recipe_t *recipe,
   // a per-boundary job -- zero duplicated logic, zero divergence. prev_mask
   // is never reset between decodes, as in the interactive session; the
   // context is freshly loaded, so the first decode starts clean anyway
-  for(int i = 0; i <= last_decode; i++)
+  for(int i = 0; !rederive && i <= last_decode; i++)
   {
     if(!recipe->points[i].decode_after)
       continue;
@@ -5778,6 +5843,121 @@ static float *_sky_decode(_object_data_t *od,
   return mask;
 }
 
+// a detector's prompts chosen afresh on the replay's frame -- the
+// detection job's steps, on the replay's render and its segmentation
+// model: the map, the pass-1 prompts, their decode, the pass-2
+// corrections and theirs, the row's component rule. the decodes run on
+// the prompts as chosen (no input-space round trip: nothing is recorded,
+// the shape keeps its recipe). the mask on the w x h grid, caller frees;
+// NULL when the map holds none of the class or anything fails
+static float *_replay_rederive(dt_ai_environment_t *env,
+                               _object_data_t *od,
+                               dt_seg_context_t **seg,
+                               const dt_detector_t *detector,
+                               const char *seg_model,
+                               const uint8_t *rgb,
+                               const int w,
+                               const int h,
+                               const dt_imgid_t imgid,
+                               const dt_hash_t distort_hash)
+{
+  const char *what = detector->label;   // the journal's, untranslated
+  const double t0 = dt_get_wtime();
+
+  // the map: the model the task has active -- a recipe of this family
+  // records its segmentation model, not the map's
+  char *map_model = dt_ai_models_get_active_for_task(detector->task);
+  dt_detect_context_t *det = map_model
+    ? dt_detect_load(env, map_model, detector->task, detector->prompt_index)
+    : NULL;
+  float *pmap = det ? g_try_malloc((size_t)w * h * sizeof(float)) : NULL;
+  const gboolean mapped = pmap && dt_detect_run(det, rgb, w, h, pmap);
+  if(det) dt_detect_free(det);
+  if(!mapped)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: %s map unavailable (model '%s')",
+             what, map_model ? map_model : "none active");
+    g_free(map_model);
+    g_free(pmap);
+    return NULL;
+  }
+  g_free(map_model);
+
+  dt_seg_point_t pts[DT_RF_RECIPE_MAX_POINTS];
+  float max_p = 0.0f;
+  int n1 = _sky_prompts_pass1(pmap, w, h, detector, pts, &max_p);
+  if(n1 == 0)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[object mask] replay: %s: map peak %.3f, none in this frame",
+             what, max_p);
+    g_free(pmap);
+    return NULL;
+  }
+  if(!dt_seg_supports_box(*seg) && n1 >= 2
+     && pts[n1 - 2].label == 2 && pts[n1 - 1].label == 3)
+    n1 -= 2;
+
+  // the encoding: the per-image cache when it holds this very grid, else
+  // the render at hand -- never clobbering a slot a session owns
+  gboolean encoded = FALSE;
+  if(dt_seg_disk_cache_load(*seg, imgid, distort_hash))
+  {
+    int cw = 0, ch = 0;
+    dt_seg_get_encoded_rgb(*seg, &cw, &ch);
+    if(cw == w && ch == h)
+      encoded = TRUE;
+    else
+      dt_seg_reset_encoding(*seg);
+  }
+  if(!encoded)
+  {
+    encoded = _seg_encode_cpu_fallback(seg, env, seg_model, rgb, w, h);
+    if(encoded && !dt_seg_disk_cache_exists(imgid))
+      dt_seg_disk_cache_save(*seg, imgid, distort_hash, rgb, w, h);
+  }
+  od->seg = *seg;
+  if(!encoded)
+  {
+    dt_print(DT_DEBUG_AI, "[object mask] replay: %s: encoding failed", what);
+    g_free(pmap);
+    return NULL;
+  }
+
+  int mw = 0, mh = 0;
+  float *mask = _sky_decode(od, pts, n1, -1.0f, &mw, &mh);
+  if(!mask || mw != w || mh != h)
+  {
+    g_free(mask);
+    g_free(pmap);
+    return NULL;
+  }
+  int n_pos2 = 0, n_neg2 = 0;
+  const int n2 = _sky_prompts_pass2(pmap, mask, w, h, detector,
+                                    DT_RF_RECIPE_MAX_POINTS - n1, pts + n1,
+                                    &n_pos2, &n_neg2);
+  g_free(pmap);
+  if(n2 > 0)
+  {
+    g_free(mask);
+    mask = _sky_decode(od, pts, n1 + n2, detector->cc_ratio, &mw, &mh);
+    if(!mask || mw != w || mh != h)
+    {
+      g_free(mask);
+      return NULL;
+    }
+  }
+  else
+    _keep_major_components(mask, w, h, SKY_THRESHOLD, detector->cc_ratio,
+                           FALSE);
+
+  dt_print(DT_DEBUG_AI,
+           "[object mask] replay: %s chosen afresh on %dx%d: %d + %d"
+           " prompt(s) (%.2fs)", what, w, h, n1, n2, dt_get_wtime() - t0);
+  return mask;
+}
+
 // ------------------------ one-shot detection job ----------------------------
 //
 // "select subject", "select sky" and their siblings: a detection as a
@@ -6030,6 +6210,10 @@ static int32_t _detect_job_run(dt_job_t *job)
   // via_points recipe replays no detector, so it records none
   recipe.detect_input = via_points ? 0 : dt_detect_get_side(det);
   recipe.class_bits = j->detector->class_bits;
+  // the prompts a map chooses are this photograph's: elsewhere the replay
+  // chooses its own
+  if(via_points)
+    recipe.source_id = _source_id(&dev.image_storage);
   // the decode chain of the sky: one decoder pass per recorded boundary,
   // no peak points or box of its own (the recorded points carry the
   // box), no CRF, no per-decode contour refinement -- the native pass
@@ -7486,7 +7670,7 @@ static gboolean _edit_derive_recipe(const dt_masks_form_t *form,
   out->crf_w_bilateral = 0.0f;
   out->ai_refine = 0;
   out->n_points = n;
-  out->_pad0 = 0;
+  out->source_id = 0;
   memset(out->points, 0, sizeof(out->points));
   for(int k = 0; k < n; k++)
   {
@@ -7581,7 +7765,13 @@ gboolean dt_object_mask_edit_begin(struct dt_iop_module_t *target_module,
   // keeps its headless recompute
   dt_rf_recipe_t recipe = target->recipe;
   const dt_detector_t *detector = NULL;
-  if(!dt_rf_prompt_replays_points(recipe.prompt_kind))
+  // a detector's prompts chosen on another photograph -- an edit pasted
+  // here -- are not this photograph's: the session starts, as for a
+  // promptless detection, from the mask file this photograph has
+  const gboolean foreign = dt_rf_prompt_detected(recipe.prompt_kind)
+    && recipe.source_id != 0
+    && recipe.source_id != _source_id(&darktable.develop->image_storage);
+  if(!dt_rf_prompt_replays_points(recipe.prompt_kind) || (foreign && shape))
   {
     if(!shape)
     {
